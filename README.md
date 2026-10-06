@@ -53,7 +53,14 @@ React UI (src/)  ──►  Electron main (electron/)  ──►  native runtime
   - An NVIDIA GPU with a CUDA build of PyTorch, for faster training. The setup script installs the CPU build.
   - An OCR language installed in Windows (Settings › Time & language › Language & region), to read text from the screen.
 
-## Getting started
+## Download
+
+Get the Windows installer, `FireFly-Setup-<version>.exe`, from the [latest release](https://github.com/AndrewAhn1000/FireFly/releases/latest), and run it. It includes everything FireFly needs: the native runtime, ONNX Runtime with DirectML, and a bundled Python with PyTorch for training.
+
+- **Windows SmartScreen may warn you** the first time, because the installer isn't code-signed. Choose **More info › Run anyway**.
+- **Training runs on the CPU** in the installed app, since it bundles the CPU build of PyTorch. Models still run on the GPU through DirectML. For GPU training, build from source with a CUDA build of PyTorch.
+
+## Building from source
 
 Install the JavaScript dependencies, then set up and build the native runtime:
 

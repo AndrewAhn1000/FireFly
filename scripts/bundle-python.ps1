@@ -17,10 +17,14 @@ if (Test-Path $BundleDir) { Remove-Item $BundleDir -Recurse -Force }
 Write-Host "    Extracting..."
 Expand-Archive -Path $ZipPath -DestinationPath $BundleDir
 
-# 3. Enable site-packages (required for pip to work)
+# 3. Enable site-packages (required for pip to work), and put the workers on the path: embedded Python
+#    ignores a script's own folder, and the workers import each other by name (from review import ...).
+#    Paths here are relative to the ._pth file: the app's resources/python-bundle, so ..\worker is
+#    resources/worker.
 $PthFile = Get-Item "$BundleDir\python312._pth"
 $content = Get-Content $PthFile.FullName -Raw
 $content = $content -replace '#import site', 'import site'
+$content = $content.TrimEnd() + "`r`n..\worker`r`n"
 Set-Content $PthFile.FullName $content -NoNewline
 
 # 4. Bootstrap pip
@@ -30,15 +34,13 @@ Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $GetPip
 & "$BundleDir\python.exe" $GetPip --no-warn-script-location
 Remove-Item $GetPip
 
-# 5. Install ML packages (CPU PyTorch — GPU users upgrade in-app)
+# 5. Install the workers' packages, the same locked versions as the development .venv (CPU PyTorch)
 Write-Host "    Installing packages (this may take a few minutes)..."
 & "$BundleDir\python.exe" -m pip install `
-    torch torchvision `
-    --index-url https://download.pytorch.org/whl/cpu `
+    -r (Join-Path $Root 'worker\requirements.lock.txt') `
+    --extra-index-url https://download.pytorch.org/whl/cpu `
     --no-warn-script-location
-& "$BundleDir\python.exe" -m pip install `
-    Pillow numpy `
-    --no-warn-script-location
+if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
 # 6. Clean up download cache to save space
 $Cache = Join-Path $BundleDir 'Scripts\..\..\pip-cache' # not usually here

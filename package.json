@@ -58,6 +58,7 @@
   "build": {
     "appId": "com.firefly.app",
     "productName": "FireFly",
+    "afterPack": "scripts/after-pack.cjs",
     "directories": {
       "output": "release"
     },
@@ -67,8 +68,21 @@
     ],
     "extraResources": [
       {
+        "from": "build/native/Release",
+        "to": "native",
+        "filter": [
+          "firefly-runtime.exe",
+          "firefly-input.exe",
+          "*.dll"
+        ]
+      },
+      {
         "from": "worker",
-        "to": "worker"
+        "to": "worker",
+        "filter": [
+          "*.py",
+          "!test_*.py"
+        ]
       },
       {
         "from": "python-bundle",
@@ -79,6 +93,7 @@
       "target": "nsis"
     },
     "nsis": {
+      "artifactName": "FireFly-Setup-${version}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
     }

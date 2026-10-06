@@ -11,9 +11,11 @@ const datasetPreview = require('./datasetPreview.cjs');
 const isDev = process.env.NODE_ENV === 'development';
 
 // In dev:       paths are relative to the project root
-// In packaged:  python-bundle and worker are extraResources → process.resourcesPath
+// In packaged:  python-bundle, worker and the native runtime (with its DLLs, in native/) are
+//               extraResources → process.resourcesPath
 const _resRoot   = () => app.isPackaged ? process.resourcesPath : path.join(__dirname, '..');
-const RUNTIME_EXE   = path.join(__dirname, '..', 'build', 'native', 'Release', 'firefly-runtime.exe');
+const NATIVE_DIR    = app.isPackaged ? path.join(process.resourcesPath, 'native') : path.join(__dirname, '..', 'build', 'native', 'Release');
+const RUNTIME_EXE   = path.join(NATIVE_DIR, 'firefly-runtime.exe');
 const PYTHON_EXE    = () => app.isPackaged
   ? path.join(process.resourcesPath, 'python-bundle', 'python.exe')
   : path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe');
@@ -197,7 +199,7 @@ function runtimeInvoke(op, params) {
 // touches the keyboard or mouse, the window loses focus, or an observation is too old to act on.
 
 const WORKER_SCRIPT = () => path.join(_resRoot(), 'worker', 'worker.py');
-const GUARD_EXE = path.join(__dirname, '..', 'build', 'native', 'Release', 'firefly-input.exe');
+const GUARD_EXE = path.join(NATIVE_DIR, 'firefly-input.exe');
 
 function lineProcess(exe, args, options, onEvent, onExit) {
   const proc = spawn(exe, args, { stdio: ['pipe', 'pipe', 'pipe'], ...options });
