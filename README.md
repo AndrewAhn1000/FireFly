@@ -2,7 +2,7 @@
 
 **Teach an agent to play a game by playing it yourself.**
 
-FireFly is a Windows desktop tool that turns a game window into structured observations, records them alongside the buttons you press, and trains small policies that can play the game back. It works with any game: everything game-specific lives in your own data (model outputs, regions, Lua scripts and graphs), not in FireFly's code.
+FireFly is a Windows desktop tool that turns a game window into structured observations, records them alongside the buttons you press, and trains small neural networks based on behavior cloning that can learn how to play the game like you. It works with any game: everything game-specific lives in your own data (model outputs, regions, Lua scripts and graphs), not in FireFly's code.
 
 > **Status:** under active development. Windows only. Expect rough edges.
 
@@ -23,7 +23,7 @@ FireFly is a Windows desktop tool that turns a game window into structured obser
 - **Shape the outputs** with editable flows of generic steps (clean up, trace lines, keep runs, filter, count, and more), so turning a mask into "platforms" and "ladders" is data you edit, not code.
 - **Read regions of the screen:** a bar's fill, a colour, or text and numbers through Windows' built-in OCR.
 - **Follow objects** with template matching: masks, grayscale or edge matching, every instance at once, and boxes that resize with the object. You also get position and velocity.
-- **Read game memory and run Lua:** States read memory addresses or run sandboxed Lua scripts (no file or network access) that can read memory, regions and other States.
+- **Read  memory and run Lua:** States read memory addresses or run sandboxed Lua scripts (no file or network access) that can read memory, regions and other States.
 
 **Record and learn**
 - **Record** chosen observations with your button presses at a fixed rate. You choose the buttons on a full on-screen keyboard.
@@ -98,20 +98,11 @@ $env:NODE_ENV='development'; npx electron .
 4. **Record.** In the **Recordings** tab, choose the buttons on the keyboard and what to record, press **Start recording**, then click into the game and play.
 5. **Train a policy.** In **Graphs**, drag your States into a Policy Graph, add formulas and a Recordings node, then press **Train** on the Policy node, and **Play**.
 
-## Safety and responsible use
-
-FireFly can press keys in the game for you, so it does that carefully:
-- It only sends input to the window being captured, and only while that window is in front.
-- It stops at once when you press a key or click in the game, the game loses focus, the observations it acts on are older than 250 ms, or a modifier key is held. With **Record my corrections** on, taking over doesn't stop play: it records your correction and hands back once you've been idle for 1.5 s.
-- It never presses Ctrl, Alt, Shift or the Windows key, and it has no general way to send input to other windows.
-
-**Check the rules of the game you use it with.** Many online games forbid automation and reading game memory in their terms of service, and use anti-cheat software that can ban accounts. Use FireFly with games, servers and accounts where that's allowed: single-player games, your own servers, or ones whose rules permit it.
-
 ## Project layout
 
 | Path | What's there |
 |---|---|
-| `src/` | The React UI: Game View, Inspector, Policy Graph, panels |
+| `src/` | The React UI: Window View, Inspector, Policy Graph, panels |
 | `electron/` | The main process: windows, the model library, training, play loop |
 | `native/` | The C++ runtime: capture, observation graph, models, template matching, recording, input guard |
 | `worker/` | Python: datasets, formulas, policy training and prediction, UNet and YOLO training |
