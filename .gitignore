@@ -1,0 +1,20 @@
+build/
+*.log
+.tools/
+vcpkg_installed/
+.venv/
+__pycache__/
+*.pyc
+python-bundle/
+python-embed.zip
+release/
+native/libs/
+runs/
+dist/
+node_modules/
+
+# Your own data: collected datasets (game screenshots and labels), graph exports and scratch work
+dataset/
+hunt-graph.json
+monsters-npcs-collection-graph.json
+scratch/

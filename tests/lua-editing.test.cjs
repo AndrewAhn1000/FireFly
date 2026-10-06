@@ -1,0 +1,42 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+test('Lua Tab and Shift+Tab preserve selected lines and caret positions',async()=>{
+ const {indentLua}=await import('../src/luaEditing.ts');
+ assert.deepEqual(indentLua('return 1',0,0,false),{text:'    return 1',start:4,end:4});
+ assert.deepEqual(indentLua('    return 1',4,4,true),{text:'return 1',start:0,end:0});
+ const text='a\nb\nc',edit=indentLua(text,0,4,false);
+ assert.equal(edit.text,'    a\n    b\nc');assert.equal(edit.end,12);
+ const back=indentLua(edit.text,0,edit.end,true);assert.equal(back.text,text);
+ assert.equal(indentLua('\ta\n  b',0,6,true).text,'a\nb');
+ assert.deepEqual(indentLua('a',0,0,true),{text:'a',start:0,end:0});
+ assert.equal(indentLua('\na',0,2,false).text,'    \n    a');
+});
+test('Region name completion uses valid Lua expressions and ignores strings and comments',async()=>{
+ const {regionCompletion:complete,regionExpression:expression}=await import('../src/luaEditing.ts');
+ const regions=[{id:'a',label:'Minimap'},{id:'b',label:'Mini Map'},{id:'c',label:'end'},{id:'d',label:'怪物'}];
+ assert.equal(expression('Minimap'),'regions.Minimap');
+ assert.equal(expression('Mini Map'),'regions["Mini Map"]');
+ assert.equal(expression('end'),'regions["end"]');
+ assert.equal(expression('怪物'),'regions["怪物"]');
+ assert.equal(expression('a\0b'),'regions["a\\u{0000}b"]');
+ const text='local boxes = regions.Mi';
+ assert.deepEqual(complete(text,text.length,regions).options.map(r=>r.label),['Minimap','Mini Map']);
+ assert.equal(complete('regions.',8,regions,'a').options.length,3);
+ assert.equal(complete('regions.',8,[...regions,{id:'dupe',label:'Minimap'}]).options.some(r=>r.label==='Minimap'),false);
+ for(const text of ['-- regions.','"regions.',"'regions.",'[=[regions.','--[[regions.','object.regions.'])assert.equal(complete(text,text.length,regions),null,text);
+ assert.ok(complete('-- comment\nregions.',19,regions));
+ const quoted='regions["Mini Map"]';
+ assert.equal(complete(quoted,12,regions).end,quoted.length);
+ assert.equal(complete('regions.Minimap',10,regions).end,15);
+ assert.ok(complete('regions.#Mi',11,regions));
+});
+test('State name completion suggests states.Name like regions, leaving out the State being edited',async()=>{
+ const {nameCompletion}=await import('../src/luaEditing.ts');
+ const states=[{id:'c',label:'Camera',detail:'Lua State · vector'},{id:'p',label:'Player HP',detail:'Memory State · number'}];
+ const text='local cam = states.C';
+ assert.deepEqual(nameCompletion('states',text,text.length,states).options.map(s=>[s.expression,s.detail]),[['states.Camera','Lua State · vector']]);
+ assert.deepEqual(nameCompletion('states','states.',7,states,'c').options.map(s=>s.expression),['states["Player HP"]']);
+ assert.equal(nameCompletion('states','regions.',8,states),null);
+ assert.equal(nameCompletion('regions','states.',7,states),null);
+ assert.equal(nameCompletion('states','-- states.',10,states),null);
+});

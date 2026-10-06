@@ -1,0 +1,86 @@
+{
+  "name": "firefly",
+  "version": "0.7.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test:templates": "node --test tests/template-matching.test.cjs",
+    "test:play": "node --test tests/play.test.cjs",
+    "test:collection": "node --test tests/collection.test.cjs",
+    "test:graph-library-ui": "electron tests/graph-library-ui.cjs",
+    "test:table-node-ui": "electron tests/table-node-ui.cjs",
+    "test:dataset-preview": "node --test tests/dataset-preview.test.cjs",
+    "test:dataset-viewer-ui": "electron tests/dataset-viewer-ui.cjs",
+    "test:train-tab-ui": "electron tests/train-tab-ui.cjs",
+    "test:detector-ui": "electron tests/detector-ui.cjs",
+    "test:multi-model-ui": "electron tests/multi-model-ui.cjs",
+    "test:keyboard-ui": "electron tests/keyboard-ui.cjs",
+    "test:state-folders-ui": "electron tests/state-folders-ui.cjs",
+    "test:state-edit-ui": "electron tests/state-edit-ui.cjs",
+    "test:region-edit-ui": "electron tests/region-edit-ui.cjs",
+    "test:script-regions": "node --test tests/script-regions.test.cjs",
+    "test:lua-editing": "node --test tests/lua-editing.test.cjs",
+    "test:collection-runtime": "electron tests/collection-runtime.cjs",
+    "test:template-ui": "electron tests/template-ui.cjs",
+    "test:recordings-ui": "electron tests/recordings-ui.cjs",
+    "test:inference-ui": "electron tests/inference-ui.cjs",
+    "test:runtime-preview": "electron tests/runtime-preview.cjs",
+    "start": "electron .",
+    "native:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-native.ps1",
+    "native:configure": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/configure-native.ps1",
+    "native:build": "cmake --build build/native --config Release",
+    "native:test": "ctest --test-dir build/native -C Release --output-on-failure",
+    "native:onnxruntime": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-onnxruntime.ps1",
+    "native:onnxruntime:gpu": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-onnxruntime-directml.ps1",
+    "python:setup": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/setup-python.ps1",
+    "python:bundle": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bundle-python.ps1",
+    "test:python": ".venv\\Scripts\\python.exe -m unittest discover -s worker -p test_*.py",
+    "package": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.12.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "electron": "^44.4.3",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.8.0",
+    "vite": "^6.3.0"
+  },
+  "build": {
+    "appId": "com.firefly.app",
+    "productName": "FireFly",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "worker",
+        "to": "worker"
+      },
+      {
+        "from": "python-bundle",
+        "to": "python-bundle"
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

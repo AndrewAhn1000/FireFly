@@ -1,0 +1,151 @@
+"""Convert FireFly data collection dataset into YOLO object detection format.
+
+Usage:
+    python scripts/export_yolo.py --input dataset --output dataset_yolo --split 0.2
+
+Each collected image with an accompanying .json metadata file will be copied
+to images/ (train/val) and corresponding YOLO label .txt files will be written
+to labels/ (train/val), along with a data.yaml ready for YOLOv8/v9/v10/v11 training.
+"""
+import argparse
+import json
+import os
+import random
+import shutil
+from pathlib import Path
+from PIL import Image
+
+def clamp(val, low=0.0, high=1.0):
+    return max(low, min(high, val))
+
+def convert_box(box, img_w, img_h):
+    # FireFly bounding boxes from Lua: {x, y, w, h} in frame pixels
+    x = float(box.get('x', 0))
+    y = float(box.get('y', 0))
+    w = float(box.get('w', 0))
+    h = float(box.get('h', 0))
+    if w <= 0 or h <= 0 or img_w <= 0 or img_h <= 0:
+        return None
+    cx = (x + w / 2.0) / img_w
+    cy = (y + h / 2.0) / img_h
+    nw = w / img_w
+    nh = h / img_h
+    return (clamp(cx), clamp(cy), clamp(nw), clamp(nh))
+
+def main():
+    parser = argparse.ArgumentParser(description="Export FireFly collection to YOLO format")
+    parser.add_argument("--input", default="dataset", help="Input dataset folder")
+    parser.add_argument("--output", default="dataset_yolo", help="Output YOLO folder")
+    parser.add_argument("--val-split", type=float, default=0.2, help="Validation set fraction (default: 0.2)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for split")
+    args = parser.parse_args()
+
+    input_dir = Path(args.input).resolve()
+    output_dir = Path(args.output).resolve()
+
+    if not input_dir.exists():
+        print(f"Input directory {input_dir} does not exist.")
+        return
+
+    # Find all image files with matching JSON metadata
+    samples = []
+    for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for img_path in input_dir.rglob(ext):
+            json_path = img_path.with_suffix(img_path.suffix + ".json")
+            if not json_path.exists():
+                json_path = img_path.with_suffix(".json")
+            if json_path.exists():
+                samples.append((img_path, json_path))
+
+    if not samples:
+        print(f"No collected images with metadata found in {input_dir}")
+        return
+
+    print(f"Found {len(samples)} samples to export.")
+
+    random.seed(args.seed)
+    random.shuffle(samples)
+
+    val_count = int(len(samples) * args.val_split) if args.val_split > 0 else 0
+    splits = {
+        'val': samples[:val_count],
+        'train': samples[val_count:]
+    }
+
+    # Prepare directories
+    for split in ('train', 'val'):
+        (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    class_mapping = {
+        'monsters': 0,
+        'npcs': 1
+    }
+
+    total_boxes = {0: 0, 1: 0}
+
+    for split, items in splits.items():
+        for img_path, json_path in items:
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+
+                # Get image dimensions
+                img_size = meta.get('imageSize')
+                if img_size and len(img_size) == 2:
+                    img_w, img_h = img_size
+                else:
+                    with Image.open(img_path) as im:
+                        img_w, img_h = im.size
+
+                # Extract boxes
+                lines = []
+                states = meta.get('states', {})
+
+                for state_name, class_id in class_mapping.items():
+                    state_obj = states.get(state_name, {})
+                    if state_obj.get('valid', True):
+                        boxes = state_obj.get('value', [])
+                        if isinstance(boxes, list):
+                            for b in boxes:
+                                if isinstance(b, dict):
+                                    norm = convert_box(b, img_w, img_h)
+                                    if norm:
+                                        lines.append(f"{class_id} {norm[0]:.6f} {norm[1]:.6f} {norm[2]:.6f} {norm[3]:.6f}")
+                                        total_boxes[class_id] += 1
+
+                # Destination file names
+                dest_stem = f"{img_path.parent.name}_{img_path.stem}" if img_path.parent != input_dir else img_path.stem
+                dest_img = output_dir / "images" / split / f"{dest_stem}{img_path.suffix}"
+                dest_txt = output_dir / "labels" / split / f"{dest_stem}.txt"
+
+                shutil.copy2(img_path, dest_img)
+                dest_txt.write_text("\n".join(lines) + ("\n" if lines else ""), encoding='utf-8')
+
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+
+    # Write data.yaml for YOLO
+    yaml_content = f"""# YOLO dataset configuration generated by FireFly export_yolo.py
+path: {output_dir.as_posix()}
+train: images/train
+val: images/val
+
+names:
+  0: monster
+  1: npc
+nc: 2
+"""
+    (output_dir / "data.yaml").write_text(yaml_content, encoding='utf-8')
+
+    print(f"\nExport complete to: {output_dir}")
+    print(f"  Train images: {len(splits['train'])}")
+    print(f"  Val images:   {len(splits['val'])}")
+    print(f"  Monsters:     {total_boxes[0]} boxes")
+    print(f"  NPCs:         {total_boxes[1]} boxes")
+    print(f"  Config:       {output_dir / 'data.yaml'}")
+    print("\nTo train with YOLO:")
+    print(f"  yolo detect train data=\"{output_dir / 'data.yaml'}\" model=yolov8n.pt epochs=50 imgsz=640")
+
+if __name__ == '__main__':
+    main()

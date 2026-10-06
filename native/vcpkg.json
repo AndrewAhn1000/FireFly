@@ -1,0 +1,11 @@
+{
+  "name": "firefly-native",
+  "version-string": "0.2.0",
+  "builtin-baseline": "319504a5326aa870edde46438c5455fa76305a56",
+  "dependencies": [
+    { "name": "opencv4", "default-features": false, "features": ["png"] },
+    "nlohmann-json",
+    "sqlite3",
+    "lua"
+  ]
+}
