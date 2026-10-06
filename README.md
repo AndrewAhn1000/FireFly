@@ -6,6 +6,11 @@ FireFly is a Windows desktop tool that turns a game window into structured obser
 
 > **Status:** under active development. Windows only. Expect rough edges.
 
+<p align="center">
+  <img src="docs/media/models-running.gif" width="100%" alt="The FireFly window: the Trained Models tab starts a detector and then a segmentation model, and the Game View shows boxes around each monster, green lines along the platforms and yellow lines down the ladders, while the Inspector's States update live">
+</p>
+<p align="center"><em>Running two models at once from the Trained Models tab: a YOLO detector boxing the monsters, and a segmentation model whose outputs trace the platforms (green) and ladders (yellow). The States on the right update live.</em></p>
+
 ---
 
 ## What it does
