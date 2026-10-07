@@ -14,7 +14,7 @@ FireFly is a Windows desktop tool that turns a game window into structured obser
 <p align="center">
   <img src="docs/media/policy-playing.gif" width="100%" alt="A trained policy playing: the game window comes to the front and the character moves by itself, while behind it the Policy Graph shows the policy's live status (actions, keys held, how old the frames it acts on are), its grid of nearby platforms, and the States updating">
 </p>
-<p align="center"><em>A policy trained in the Policy Graph playing the game by itself. The banner shows what it's pressing and how fresh the frames it acts on are, and it stops the moment you press a key or click in the game.</em></p>
+<p align="center"><em>A policy trained in the Policy Graph playing the game by itself. The banner shows what it's pressing and how fresh the frames it acts on are, and it stops the moment you press a key or click in the game, allows you to correct the action, and resumes playing.</em></p>
 
 ---
 
