@@ -11,6 +11,11 @@ FireFly is a Windows desktop tool that turns a game window into structured obser
 </p>
 <p align="center"><em>Running two models at once from the Trained Models tab: a YOLO detector boxing the monsters, and a segmentation model whose outputs trace the platforms (green) and ladders (yellow). The States on the right update live.</em></p>
 
+<p align="center">
+  <img src="docs/media/policy-playing.gif" width="100%" alt="A trained policy playing: the game window comes to the front and the character moves by itself, while behind it the Policy Graph shows the policy's live status (actions, keys held, how old the frames it acts on are), its grid of nearby platforms, and the States updating">
+</p>
+<p align="center"><em>A policy trained in the Policy Graph playing the game by itself. The banner shows what it's pressing and how fresh the frames it acts on are, and it stops the moment you press a key or click in the game.</em></p>
+
 ---
 
 ## What it does
@@ -103,7 +108,8 @@ $env:NODE_ENV='development'; npx electron .
    - Add **States**: the values you care about, such as the player's position, HP, or a list of monsters. A State can read a region, a model output, a memory address or a Lua script. Folders keep them organised, and any State can be switched off.
 3. **Run models** (optional). Train or import one in the **Train** and **Trained Models** tabs, press **Run**, and decide what it outputs in the **Outputs** tab.
 4. **Record.** In the **Recordings** tab, choose the buttons on the keyboard and what to record, press **Start recording**, then click into the game and play.
-5. **Train a policy.** In **Graphs**, drag your States into a Policy Graph, add formulas and a Recordings node, then press **Train** on the Policy node, and **Play**.
+5. **Train a policy.** In **Graphs**, drag your States into a Policy Graph, add formulas and a Recordings node, then press **Train** on the Policy node.
+6. **Play it.** In the **Play** tab, pick a version and press **Play**, or **Play and record my corrections**: take over whenever it goes wrong, and once you've corrected it, **Train a new version with my corrections**.
 
 ## Project layout
 
