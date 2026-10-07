@@ -495,13 +495,13 @@ class Worker:
             raise
 
     def list_models(self):
-        models = []
-        for file in sorted((self.root/'models').glob('*/metadata.json'), reverse=True)[:100]:
-            metadata = json.loads(file.read_text(encoding='utf8'))
+        """The newest 100 versions, newest first: their numbers (v1 the oldest) count by this order."""
+        models = [json.loads(file.read_text(encoding='utf8')) for file in (self.root/'models').glob('*/metadata.json')]
+        models.sort(key=lambda m: m.get('created', 0), reverse=True)
+        for metadata in models[:100]:
             metadata.pop('metrics', None)
             metadata['observationSchema'].pop('definition', None)
-            models.append(metadata)
-        return models
+        return models[:100]
 
     def deleted_models(self):
         """Deleted versions, each by the policy it was a version of: their corrections are still that

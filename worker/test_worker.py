@@ -34,6 +34,30 @@ class LearningTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_versions_listed_newest_first(self):
+        # By when they were trained, not by their folder (a random id), which version numbers count by
+        for name, created in (('a', 3), ('b', 1), ('c', 2)):
+            (self.root/'models'/name).mkdir()
+            (self.root/'models'/name/'metadata.json').write_text(json.dumps({'id': name, 'created': created, 'observationSchema': {}}), encoding='utf8')
+        self.assertEqual([m['id'] for m in self.worker.list_models()], ['a', 'c', 'b'])
+
+    def test_a_version_trains_again_from_what_it_saved(self):
+        # The Play tab trains a version again (with corrections) from its saved config, without its graph
+        # (retrainRequest in src/policyPlay.ts): the same values, labels, step, history and policy
+        first = self.worker.train({'recordingIds': ['0', '1'], 'epochs': 3, 'history': 1, 'stepMs': 66, 'buttons': ['right'],
+                                   'formulas': [{'name': 'twice', 'source': 'error * 2'}], 'columns': ['twice'],
+                                   'policy': {'id': 'node-9', 'name': 'Walker'}})
+        c = first['config']
+        again = self.worker.train({'recordingIds': c['recordingIds'] + ['2'], 'formulas': c['formulas'], 'columns': c['columns'],
+                                   'derived': c['derived'], 'grids': first['features']['grids'], 'buttons': c['buttons'],
+                                   'stepMs': c['stepMs'], 'history': c['history'], 'actionDelayMs': c['actionDelayMs'],
+                                   'anchor': c['anchor'], 'surface': c['surface'], 'nearPx': c['nearPx'], 'epochs': c['epochs'],
+                                   'policy': first['policy']})
+        self.assertEqual(again['config']['columns'], c['columns'])
+        self.assertEqual(again['config']['buttons'], ['right'])
+        self.assertEqual(again['policy'], {'id': 'node-9', 'name': 'Walker'})
+        self.assertEqual(again['config']['recordingIds'], ['0', '1', '2'])
+
     def test_train_checkpoint_and_actual_inference(self):
         metrics = []
         self.worker.emit = metrics.append

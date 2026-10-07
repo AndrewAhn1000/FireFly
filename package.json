@@ -20,6 +20,7 @@
     "test:multi-model-ui": "electron tests/multi-model-ui.cjs",
     "test:keyboard-ui": "electron tests/keyboard-ui.cjs",
     "test:state-folders-ui": "electron tests/state-folders-ui.cjs",
+    "test:play-tab-ui": "electron tests/play-tab-ui.cjs",
     "test:state-edit-ui": "electron tests/state-edit-ui.cjs",
     "test:region-edit-ui": "electron tests/region-edit-ui.cjs",
     "test:script-regions": "node --test tests/script-regions.test.cjs",

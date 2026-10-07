@@ -5,6 +5,7 @@ import ModelsPanel from './ModelsPanel';
 import OutputsPanel, { type FlowError } from './OutputsPanel';
 import ValuesPanel from './ValuesPanel';
 import RecordingsPanel from './RecordingsPanel';
+import PlayPanel from './PlayPanel';
 import { inferenceChoice, type InferenceDevice } from './inference';
 import Keyboard, { BUTTONS, MAX_BUTTONS } from './Keyboard';
 import Transport from './Transport';
@@ -453,7 +454,7 @@ export default function App() {
   const stopping       = useRef(false);                      // capture is being stopped on purpose
 
   // ── Training ──────────────────────────────────────────────────────────────
-  const [bottomTab, setBottomTab]     = useState<'train' | 'models' | 'outputs' | 'values' | 'recordings' | 'region'>('train');
+  const [bottomTab, setBottomTab]     = useState<'train' | 'models' | 'outputs' | 'values' | 'recordings' | 'play' | 'region'>('train');
   const [trainStatus, setTrainStatus] = useState<'idle' | 'running' | 'paused' | 'done' | 'error'>('idle');
   const [exportState, setExportState] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [exportError, setExportError] = useState('');
@@ -2988,8 +2989,13 @@ export default function App() {
               <span className={`panel-tab ${bottomTab === 'values' ? 'active' : ''}`} onClick={() => setBottomTab('values')} style={{ cursor: 'pointer' }}>Values</span>
               <span role="tab" aria-selected={bottomTab === 'region'} className={`panel-tab ${bottomTab === 'region' ? 'active' : ''}`} onClick={() => setBottomTab('region')} style={{ cursor: 'pointer' }}>Region</span>
               <span role="tab" aria-selected={bottomTab === 'recordings'} className={`panel-tab ${bottomTab === 'recordings' ? 'active' : ''}`} onClick={() => setBottomTab('recordings')} style={{ cursor: 'pointer' }}>Recordings{isRecording && <span className="rec-dot-sm anim" />}</span>
+              <span role="tab" aria-selected={bottomTab === 'play'} className={`panel-tab ${bottomTab === 'play' ? 'active' : ''}`} onClick={() => setBottomTab('play')} style={{ cursor: 'pointer' }}>Play</span>
             </div>
             <RecordingsPanel active={bottomTab === 'recordings'} online={ready} recording={recording} setup={recordingSetup}/>
+            {/* Mounted while hidden, so it keeps up with a policy playing from the Policy Graph too */}
+            <div className="play-tab" hidden={bottomTab !== 'play'}>
+              <PlayPanel active={bottomTab === 'play'} online={ready} capturing={captureActive} windowId={selectedId} recording={isRecording} />
+            </div>
             {bottomTab === 'region' && (
               <div className="region-tab">
                 {regionEditor ?? <div className="region-tab-empty">Click a region in the Game View, or one under Regions in the Inspector, to edit it here. Draw a box on the Game View to make one.</div>}

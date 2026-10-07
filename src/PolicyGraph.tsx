@@ -6,6 +6,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import AliasInput from './FormulaAliasInput';
 import { buttonLabel } from './Keyboard';
+import { cleanError, correctionsOf, deleteVersions, meanF1, newestFirst, percent, playingText, POLICY_VERSION, type PlayStatus, type PolicyVersion, type Schema } from './policyPlay';
 import { NEW_INPUT, aliasFrom, renameIn } from './formulaInputs';
 import { PreservedTextarea, PreservedInput } from './PreservedInputs';
 import {
@@ -20,16 +21,9 @@ import {
 // exported. The worker (worker/worker.py) checks formulas, previews and trains; this only edits the graph
 // and shows what it says. The graph is kept per captured window, like its regions and States.
 
-interface Schema { identity: string; fields?: { name: string; type: string }[]; buttons?: { id: string; vk: number }[]; }
 interface Recording {
   id: string; name: string; status: string; samples: number; invalidSamples: number; durationMs: number;
   metadata: { started: number; hz?: number; observationSchema?: Schema; actionSchema?: Schema; correction?: boolean; policyId?: string };
-}
-interface ButtonStats { button: string; precision: number; recall: number; f1: number; pressed: number; }
-interface PolicyVersion {
-  id: string; created: number; version?: number; trainingSamples: number; validationSamples: number; stepMs?: number;
-  observationSchema: Schema; actionSchema: Schema; buttons?: ButtonStats[]; policy?: { id: string; name: string } | null;
-  config: { recordingIds: string[]; history?: number; skippedReasons?: Record<string, number> };
 }
 interface Preview {
   samples: number; stepMs: number; recordings: { id: string; rows: number }[]; skipped: string[];
@@ -37,19 +31,8 @@ interface Preview {
 }
 // What the worker says about a grid: its cells in the latest sample, for the Grid node's picture
 interface GridCheck { name: string; cols?: number; rows?: number; values: number[] | null; screen?: [number, number] | null; centred?: boolean; error: string | null; }
-interface Latency { ageMs: number | null; sentAgeMs: number | null; arrivedAgeMs?: number | null; askedAgeMs?: number | null; graphMs: number | null; waitMs: number | null; predictMs: number | null; }
-interface PlayStatus { playing: boolean; waiting?: boolean; correcting?: boolean; corrected?: number; modelId?: string; actions?: number; released?: number; missed?: string | null; holding?: string[]; pressed?: Record<string, number>; keyboardFocus?: boolean | null; reason?: string | null; latency?: Latency | null; }
-// How old the frames a policy acts on are when their buttons are pressed, and what takes the time
-const latencyText = (l?: Latency | null) => {
-  if (!l || l.ageMs === null) return '';
-  const ms = (v: number | null) => v === null ? '?' : `${Math.round(v)}`;
-  return ` · acting on frames ${ms(l.ageMs)} ms old (graph ${ms(l.graphMs)} · waiting for matching ${ms(l.waitMs)} · sent at ${ms(l.sentAgeMs)} · reached FireFly at ${ms(l.arrivedAgeMs ?? null)} · policy ${ms(l.predictMs)}; limit 250)`;
-};
 interface Epoch { epoch: number; validationLoss: number; buttonF1?: number; }
 
-const POLICY_VERSION = 3; // what the worker plays (worker.py VERSION)
-const percent = (v: number) => `${Math.round(v * 100)}%`;
-const cleanError = (e: unknown) => String(e).replace(/^Error: (Error invoking remote method '[^']*': )?(Error: )?/, '');
 const fmt = (v: number) => Number.isInteger(v) ? String(v) : v.toFixed(Math.abs(v) < 10 ? 3 : 1);
 const skipText = (skips?: Record<string, number>) => {
   const entries = Object.entries(skips ?? {}).filter(([, n]) => n > 0);
@@ -61,7 +44,8 @@ const skipText = (skips?: Record<string, number>) => {
 interface Ctx {
   fields: Map<string, string>; recordedAnywhere: Set<string>; labels: Record<string, string>; recordings: Recording[]; checks: Map<string, FormulaCheck>; gridChecks: Map<string, GridCheck>;
   compiled: Record<string, Compiled>; previews: Record<string, Preview | { error: string } | 'loading'>;
-  versions: PolicyVersion[]; deleteVersion(v: PolicyVersion, n: number, corrections: number): void; status: PlayStatus; training: { nodeId: string; progress: Epoch | null } | null;
+  versions: PolicyVersion[]; deleteVersion(v: PolicyVersion, n: number, corrections: number): void;
+  deleteAll(versions: PolicyVersion[], name: string, corrections: number): void; status: PlayStatus; training: { nodeId: string; progress: Epoch | null } | null;
   capturing: boolean; windowId: string | null; recordingNow: boolean; corrections: boolean;
   setCorrections(on: boolean): void;
   update(id: string, patch: Record<string, unknown>): void; removeNode(id: string): void; removeInput(id: string, alias: string): void;
@@ -227,8 +211,7 @@ function PolicyNode({ id, data, selected }: NodeProps<GraphNode>) {
   const versions = g.versions.filter(v => v.policy?.id === id);
   const [allVersions, setAllVersions] = useState(false);
   // Corrections of its versions, deleted ones too: they're still this policy's
-  const own = new Set(versions.map(v => v.id));
-  const corrections = g.recordings.filter(r => r.metadata.correction && own.has(r.metadata.policyId ?? ''));
+  const corrections = correctionsOf(versions, g.recordings);
   const training = g.training?.nodeId === id;
   const setColumn = (cols: string[], on: boolean) => {
     const next = new Set(d.off);
@@ -291,10 +274,17 @@ function PolicyNode({ id, data, selected }: NodeProps<GraphNode>) {
       {g.exported?.nodeId === id && <div className="pg-hint">{g.exported.text}{g.exported.path &&
         <> <a href="#" className="nodrag" onClick={e => { e.preventDefault(); void window.bridge.policy.reveal(g.exported!.path!); }}>Show in folder</a></>}</div>}
       {versions.length > 0 && <>
-        <div className="pg-section-hd">Versions</div>
+        <div className="pg-section-hd pg-versions-hd">Versions
+          {(() => {
+            const playingOne = g.status.playing && versions.some(v => v.id === g.status.modelId);
+            return <button className="nodrag pg-link pg-delete-all" disabled={playingOne || training}
+              title={playingOne ? 'Stop the version playing first' : training ? 'Wait for training to finish' : `Delete all ${versions.length} versions${corrections.length ? `, and their ${corrections.length} corrections` : ''}`}
+              onClick={() => g.deleteAll(versions, d.name || 'this policy', corrections.length)}>Delete all</button>;
+          })()}
+        </div>
         {(allVersions ? versions : versions.slice(0, 5)).map((v, i) => {
           const playing = g.status.playing && g.status.modelId === v.id;
-          const f1 = v.buttons?.length ? v.buttons.reduce((n, b) => n + b.f1, 0) / v.buttons.length : null;
+          const f1 = meanF1(v);
           const fixes = corrections.filter(r => r.metadata.policyId === v.id).length; // recorded while it played
           return <div key={v.id} className="pg-version">
             <span><b>v{versions.length - i}</b> {new Date(v.created * 1000).toLocaleString()}
@@ -371,19 +361,20 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
         setRecordings(((await window.bridge.invoke('dataset.list')) as { recordings: Recording[] }).recordings.filter(r => r.status === 'complete'));
         setRecordingsRead(true);
       }
-      setVersions(await window.bridge.policy.invoke('models') as PolicyVersion[]);
+      setVersions(newestFirst(await window.bridge.policy.invoke('models') as PolicyVersion[]));
     } catch (e) { setError(cleanError(e)); }
   }, [online]);
   // A version and the corrections recorded while it played go together
   const deleteVersion = useCallback(async (v: PolicyVersion, n: number, count: number) => {
     if (!window.confirm(`Delete v${n} (${new Date(v.created * 1000).toLocaleString()})? It can't be played again${count ? `, and its ${count} correction${count > 1 ? 's are' : ' is'} deleted with it` : ''}.`)) return;
-    try {
-      await window.bridge.policy.invoke('models.delete', { modelId: v.id });
-      const all = ((await window.bridge.invoke('dataset.list')) as { recordings: Recording[] }).recordings;
-      for (const r of all.filter(r => r.metadata.correction && r.metadata.policyId === v.id))
-        await window.bridge.invoke('dataset.delete', { recordingId: r.id }).catch(() => {}); // not the one recording now
-      await refresh();
-    } catch (e) { setError(cleanError(e)); }
+    try { await deleteVersions([v]); await refresh(); }
+    catch (e) { setError(cleanError(e)); }
+  }, [refresh]);
+  // Every version of a policy at once, with all of their corrections
+  const deleteAll = useCallback(async (vs: PolicyVersion[], name: string, count: number) => {
+    if (!window.confirm(`Delete all ${vs.length} version${vs.length > 1 ? 's' : ''} of ${name}? ${vs.length > 1 ? 'They' : 'It'} can't be played again${count ? `, and the ${count} correction${count > 1 ? 's' : ''} recorded while they played ${count > 1 ? 'are' : 'is'} deleted with them` : ''}. Its graph and recordings are kept.`)) return;
+    try { await deleteVersions(vs); await refresh(); }
+    catch (e) { setError(cleanError(e)); await refresh(); }
   }, [refresh]);
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
@@ -627,7 +618,7 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
   };
 
   const unassigned = versions.filter(v => !v.policy && v.version === POLICY_VERSION);
-  const ctx: Ctx = { fields, recordedAnywhere, labels: stateLabels, recordings, checks, gridChecks, compiled, previews, versions, deleteVersion, status, training, capturing, windowId, recordingNow: recording,
+  const ctx: Ctx = { fields, recordedAnywhere, labels: stateLabels, recordings, checks, gridChecks, compiled, previews, versions, deleteVersion, deleteAll, status, training, capturing, windowId, recordingNow: recording,
     corrections, setCorrections, update, removeNode, removeInput, train, exportDataset, play, stop: () => void window.bridge.policy.stop(), exported,
     wiredInto: (nodeId, handle) => nameOf(nodes.find(n => n.id === edges.find(e => e.target === nodeId && e.targetHandle === handle)?.source)) ?? null,
     addInput, renameInput, inputChoices, hot };
@@ -659,8 +650,7 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     </aside>
     <div className="pg-canvas" onDragOver={e => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }} onDrop={onDrop}>
       {(error || status.reason) && <div className="pg-banner">{error || `Stopped: ${status.reason}`}<button className="pg-x" onClick={() => { setError(''); setStatus(s => ({ ...s, reason: null })); }}>✕</button></div>}
-      {status.playing && <div className="pg-banner pg-banner-live">{status.waiting ? 'Switch to the game to start (10 s)'
-        : status.correcting ? '✋ You’re in control: recording your correction' : `● Playing${status.keyboardFocus === false ? ' · ⚠ the game is in front but doesn’t have the keyboard, so its keys go nowhere: click in the game once' : ''} · ${status.actions ?? 0} actions · holding ${status.holding?.length ? status.holding.join(' + ') : 'nothing'}${Object.keys(status.pressed ?? {}).length ? ` (pressed so far: ${Object.entries(status.pressed!).map(([b, n]) => `${b} ${n}×`).join(', ')})` : ' (nothing pressed yet)'}${status.released ? ` · ${status.released} frames it couldn’t act on (let go), lately: ${status.missed ?? '?'}` : ''}${latencyText(status.latency)}`}
+      {status.playing && <div className="pg-banner pg-banner-live">{playingText(status)}
         <button className="modal-btn" onClick={ctx.stop}>Stop</button></div>}
       <ReactFlow nodes={nodes} edges={shownEdges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
         isValidConnection={isValidConnection} nodeTypes={nodeTypes} colorMode="dark" fitView={!localStorage.getItem(storageKey + '-view')} defaultViewport={JSON.parse(localStorage.getItem(storageKey + '-view') ?? 'null') ?? undefined} minZoom={0.3} maxZoom={1.5}
