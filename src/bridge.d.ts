@@ -1,6 +1,17 @@
 import type { Flow } from './flows';
 import type { TrainedModel } from './models';
 
+// Whether training can use the graphics card (electron/gpu.cjs): what nvidia-smi says, the CUDA build of PyTorch
+// that suits the card and driver (plan.variant) or why there's none, the build the installed app downloaded, and
+// whether PyTorch as training loads it can calculate on the card (available, else error)
+export interface GpuInfo {
+  available: boolean; name: string | null; error?: string | null; torch?: string | null; vision?: string | null;
+  nvidiaSmiOk?: boolean; driverCuda?: string | null; gpuName?: string | null; computeCap?: string | null; driverVersion?: string | null;
+  plan?: { variant?: string; cuda?: string; aboutGb?: number; reason?: 'no-driver' | 'card' | 'driver'; need?: string; driverVersion?: number; capability?: number };
+  packaged?: boolean; installed?: { variant: string; name: string | null } | null;
+  wheel?: string | null;
+}
+
 interface Bridge {
   invoke(op: string, params?: Record<string, unknown>): Promise<unknown>;
   pickFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null>;
@@ -38,7 +49,11 @@ interface Bridge {
     // kind: which model the dataset or training is for, the segmentation UNet (default) or a YOLO detector
     checkDataset(dir: string, kind?: 'unet' | 'yolo'): Promise<{ ok: boolean; error?: string; result?: DatasetCheckResult; gridDataUrl?: string }>;
     checkCheckpoint(outDir: string, kind?: 'unet' | 'yolo'): Promise<{ found: boolean; epoch?: number; totalEpochs?: number; valIou?: number; map50?: number; best?: string }>;
-    gpuCheck(): Promise<{ available: boolean; name: string | null; nvidiaSmiOk?: boolean; driverCuda?: string | null; wheel?: string | null }>;
+    gpuCheck(): Promise<GpuInfo>;
+    // The installed app downloads the CUDA build of PyTorch for the card (progress as training:gpu-progress)
+    gpuInstall(): Promise<{ ok: boolean; error?: string; variant?: string; name?: string | null }>;
+    gpuCancel(): Promise<void>;
+    gpuRemove(): Promise<{ ok: boolean; error?: string }>;
     start(params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }>;
     exportOnnx(outDir: string, size: { width: number; height: number } | { kind: 'yolo' }, dataDir?: string): Promise<{ ok: boolean; path?: string; error?: string; model?: TrainedModel; existing?: boolean; modelError?: string }>;
     stop(): Promise<void>;

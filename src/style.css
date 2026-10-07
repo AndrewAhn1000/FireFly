@@ -678,6 +678,10 @@ html, body, #root {
 .train-gpu-checking { color: var(--text-muted); background: rgba(255,255,255,0.06); }
 .train-gpu-ok       { color: #69f0ae; background: rgba(105,240,174,0.12); }
 .train-gpu-none     { color: var(--text-muted); background: rgba(255,255,255,0.06); }
+.train-gpu-note { font-size: 11px; color: var(--text-dim); margin: -2px 0 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.train-gpu-bar { height: 6px; margin: 6px 0; border-radius: 3px; background: var(--bg-dark); border: 1px solid var(--border); overflow: hidden; }
+.train-gpu-bar div { height: 100%; background: var(--green); transition: width 0.3s; }
+.train-gpu-install .train-btn-sm { margin-top: 6px; }
 .train-gpu-install  { margin-top: 6px; font-size: 11px; color: var(--text-muted); line-height: 1.5; }
 .train-gpu-cmd      { display: block; margin-top: 4px; padding: 6px 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; font-family: ui-monospace, monospace; font-size: 10.5px; color: #e0e0e0; user-select: all; white-space: pre-wrap; word-break: break-all; }
 .train-error { font-size: 11px; color: #ef5350; }

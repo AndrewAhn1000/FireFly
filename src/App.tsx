@@ -5,6 +5,7 @@ import ModelsPanel from './ModelsPanel';
 import OutputsPanel, { type FlowError } from './OutputsPanel';
 import ValuesPanel from './ValuesPanel';
 import RecordingsPanel from './RecordingsPanel';
+import type { GpuInfo } from './bridge';
 import PlayPanel from './PlayPanel';
 import { inferenceChoice, type InferenceDevice } from './inference';
 import Keyboard, { BUTTONS, MAX_BUTTONS } from './Keyboard';
@@ -483,7 +484,10 @@ export default function App() {
   const [yoloBest, setYoloBest] = useState<string | null>(null); // a finished YOLO training's best weights
   const sizeInput = (n: number) => Math.min(2048, Math.max(64, Math.round((+n || 64) / 8) * 8));
   const [checkpointInfo, setCheckpointInfo] = useState<{ found: boolean; epoch?: number; totalEpochs?: number; valIou?: number; map50?: number; best?: string } | null>(null);
-  const [gpuInfo, setGpuInfo] = useState<{ available: boolean; name: string | null; nvidiaSmiOk?: boolean; driverCuda?: string | null; wheel?: string | null } | null>(null);
+  const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
+  // Downloading GPU support (the installed app): where it is, and what went wrong
+  const [gpuDownload, setGpuDownload] = useState<{ phase: 'download' | 'install' | 'test'; done?: number; total?: number } | null>(null);
+  const [gpuError, setGpuError] = useState('');
   const [trainProgress, setTrainProgress] = useState<TrainProgress[]>([]);
   const [trainBatch,    setTrainBatch]    = useState<TrainBatch | null>(null);
   const [datasetCheck,  setDatasetCheck]  = useState<null | 'checking' | { ok: boolean; error?: string; result?: DatasetCheckResult; gridDataUrl?: string }>(null);
@@ -1371,13 +1375,30 @@ export default function App() {
     window.bridge.training.checkCheckpoint(trainJob.outDir, trainConfig.kind).then(info => setCheckpointInfo(info));
   }, [trainJob.outDir, trainConfig.kind]);
 
-  // ── GPU detection (once on mount) ────────────────────────────────
-  useEffect(() => {
-    window.bridge.training.gpuCheck().then(info => {
-      setGpuInfo(info);
-      if (!info.available) setTrainConfig(c => ({ ...c, useGpu: false }));
-    });
+  // ── GPU detection (on mount, and again on Check again or after GPU support is downloaded) ──
+  const checkGpu = useCallback(async () => {
+    setGpuInfo(null);
+    const info = await window.bridge.training.gpuCheck();
+    setGpuInfo(info);
+    if (!info.available) setTrainConfig(c => ({ ...c, useGpu: false }));
+    return info;
   }, []);
+  useEffect(() => { void checkGpu(); }, [checkGpu]);
+  useEffect(() => window.bridge.on('training:gpu-progress', (p: unknown) => setGpuDownload(p as typeof gpuDownload)), []);
+  const downloadGpu = async () => {
+    setGpuError(''); setGpuDownload({ phase: 'download' });
+    const res = await window.bridge.training.gpuInstall();
+    setGpuDownload(null);
+    if (!res.ok) { if (res.error !== 'Cancelled') setGpuError(res.error ?? 'Could not download GPU support'); return; }
+    const info = await checkGpu();
+    if (info.available) setTrainConfig(c => ({ ...c, useGpu: true })); // downloaded to be used
+  };
+  const removeGpu = async () => {
+    if (!window.confirm('Remove GPU support? Training goes back to the CPU, and the download (about 2.5 GB) is deleted.')) return;
+    const res = await window.bridge.training.gpuRemove();
+    if (!res.ok) setGpuError(res.error ?? 'Could not remove GPU support');
+    await checkGpu();
+  };
 
   // ── Recording timer ───────────────────────────────────────────────
   useEffect(() => {
@@ -3230,21 +3251,31 @@ export default function App() {
                         Use GPU (CUDA)
                         {gpuInfo === null && <span className="train-gpu-status train-gpu-checking">detecting…</span>}
                         {gpuInfo?.available && <span className="train-gpu-status train-gpu-ok">{gpuInfo.name ?? 'GPU detected'}</span>}
-                        {gpuInfo?.available === false && <span className="train-gpu-status train-gpu-none">no CUDA GPU found</span>}
+                        {gpuInfo?.available === false && <span className="train-gpu-status train-gpu-none">training on the CPU</span>}
                       </label>
-                      {gpuInfo?.available === false && gpuInfo.nvidiaSmiOk && (() => {
-                        const wheel = gpuInfo.wheel;
-                        if (!wheel) return (
-                          <div className="train-gpu-install">
-                            Your NVIDIA driver (CUDA {gpuInfo.driverCuda}) is too old for current PyTorch. Update your drivers first.
-                          </div>
-                        );
-                        return (
-                          <div className="train-gpu-install">
-                            PyTorch is installed without CUDA support. Run this in a terminal, then restart:
-                            <code className="train-gpu-cmd">{`.venv\\Scripts\\pip install torch torchvision --index-url https://download.pytorch.org/whl/${wheel} --force-reinstall`}</code>
-                          </div>
-                        );
+                      {/* Why the card isn't used, and what would make it: the GPU is never needed, training runs on the CPU without it */}
+                      {gpuInfo && (() => {
+                        const card = gpuInfo.gpuName ?? 'graphics card', plan = gpuInfo.plan ?? {};
+                        const again = <button className="train-btn-sm" disabled={isActive || !!gpuDownload} onClick={() => void checkGpu()}>Check again</button>;
+                        const remove = gpuInfo.installed && <button className="train-btn-sm" disabled={isActive || !!gpuDownload} onClick={() => void removeGpu()}>Remove GPU support</button>;
+                        if (gpuInfo.available) return gpuInfo.installed
+                          ? <div className="train-gpu-note">Training on your {card} with the GPU support FireFly downloaded (PyTorch {gpuInfo.torch}). {remove}</div> : null;
+                        let body: React.ReactNode;
+                        if (gpuInfo.installed) body = <>FireFly downloaded GPU support for your {card}, but PyTorch couldn’t calculate on it{gpuInfo.error ? <>: <i>{gpuInfo.error}</i></> : ''}. Training runs on the CPU. If you’ve changed your graphics card or driver since, remove it and download it again. {again} {remove}</>;
+                        else if (plan.reason === 'no-driver') body = <>No NVIDIA graphics card was found, or its driver isn’t installed, so training runs on the CPU. Training on the GPU needs an NVIDIA card. {again}</>;
+                        else if (plan.reason === 'card') body = <>Your {card} is too old for PyTorch’s GPU builds (compute capability {plan.capability}; they need 5.0 or newer), so training runs on the CPU.</>;
+                        else if (plan.reason === 'driver') body = <>Training runs on the CPU for now. Your NVIDIA driver supports CUDA {gpuInfo.driverCuda}, and training on your {card} needs CUDA {plan.need}: driver {plan.driverVersion} or newer{gpuInfo.driverVersion ? ` (you have ${gpuInfo.driverVersion})` : ''}. Windows Update usually doesn’t install NVIDIA’s newest driver: get it from <b>nvidia.com/drivers</b> or the NVIDIA App, restart, then {again}</>;
+                        else if (gpuInfo.packaged) body = gpuDownload
+                          ? <>{gpuDownload.phase === 'download'
+                                ? <>Downloading GPU support{gpuDownload.total ? `: ${(gpuDownload.done! / 2 ** 30).toFixed(2)} of ${(gpuDownload.total / 2 ** 30).toFixed(2)} GB` : '…'}
+                                    <div className="train-gpu-bar"><div style={{ width: `${gpuDownload.total ? Math.round(gpuDownload.done! / gpuDownload.total * 100) : 0}%` }} /></div></>
+                                : gpuDownload.phase === 'install' ? 'Installing GPU support…' : `Testing it on your ${card}…`}
+                              {gpuDownload.phase === 'download' && <button className="train-btn-sm" onClick={() => void window.bridge.training.gpuCancel()}>Cancel</button>}</>
+                          : <>Training runs on the CPU. FireFly can download PyTorch’s GPU build for your {card} (CUDA {plan.cuda}, about {plan.aboutGb} GB, kept with FireFly’s data) and train on it, many times faster.{' '}
+                              <button className="train-btn-sm train-gpu-download" disabled={isActive} onClick={() => void downloadGpu()}>Download GPU support</button></>;
+                        else body = <>PyTorch in <code>.venv</code> has no CUDA support, so training runs on the CPU. For your {card}, run this in a terminal, then restart FireFly:
+                          <code className="train-gpu-cmd">{`.venv\\Scripts\\pip install torch==${(gpuInfo.torch ?? '').split('+')[0]}+${plan.variant} torchvision==${(gpuInfo.vision ?? '').split('+')[0]}+${plan.variant} --index-url https://download.pytorch.org/whl/${plan.variant} --no-deps --force-reinstall`}</code></>;
+                        return <div className="train-gpu-install">{body}{gpuError && <div className="train-error">{gpuError}</div>}</div>;
                       })()}
                       {trainError && <div className="train-error">{trainError}</div>}
                       <div className="train-actions">

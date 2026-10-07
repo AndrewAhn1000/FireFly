@@ -1,0 +1,95 @@
+# Builds the FireFly Windows installer and publishes it as a GitHub Release.
+# Run it by pushing a version tag (git tag v0.7.1 && git push origin v0.7.1), or from the Actions tab with a version.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 0.7.1)"
+        required: true
+
+permissions:
+  contents: write # create the release and its tag
+
+jobs:
+  release:
+    runs-on: windows-latest # has Git, CMake and the MSVC build tools preinstalled
+    timeout-minutes: 120 # the first run builds OpenCV through vcpkg; later runs reuse the binary cache
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
+      CSC_IDENTITY_AUTO_DISCOVERY: "false" # no code-signing certificate: build an unsigned installer
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        run: |
+          $version = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ github.event.inputs.version }}' } else { '${{ github.ref_name }}'.TrimStart('v') }
+          if ($version -notmatch '^\d+\.\d+\.\d+([-+].+)?$') { throw "'$version' is not a version like 1.2.3" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          Write-Host "Releasing FireFly $version"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set package version
+        run: npm version $env:VERSION --no-git-tag-version --allow-same-version
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('native/vcpkg.json', 'scripts/setup-native.ps1') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Build native runtime
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          npm run native:setup;      if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run native:onnxruntime; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run native:configure;  if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run native:build;      if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Save vcpkg binary cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('native/vcpkg.json', 'scripts/setup-native.ps1') }}
+
+      - name: Test native runtime
+        run: npm run native:test
+
+      - name: Bundle Python
+        run: npm run python:bundle
+
+      - name: Package installer
+        run: npm run package -- --publish never # this workflow uploads the installer itself
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FireFly-Setup-${{ env.VERSION }}
+          path: release/FireFly-Setup-*.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: FireFly ${{ env.VERSION }}
+          files: release/FireFly-Setup-*.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: true

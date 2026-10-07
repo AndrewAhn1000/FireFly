@@ -7,6 +7,7 @@ const models = require('./models.cjs');
 const { createPlay } = require('./play.cjs');
 const { createCollection } = require('./collection.cjs');
 const datasetPreview = require('./datasetPreview.cjs');
+const gpu = require('./gpu.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -28,6 +29,17 @@ const YOLO_DIR = path.join(app.getPath('userData'), 'yolo');
 const YOLO_MODELS = ['yolo11n', 'yolo11s', 'yolo11m', 'yolo11l', 'yolo11x'];
 const DATA_DIR = path.join(app.getPath('userData'), 'data');
 const MODELS_DIR = path.join(app.getPath('userData'), 'models');
+// A CUDA build of PyTorch FireFly downloaded for training on the card (electron/gpu.cjs), kept with the data
+const GPU_DIR = path.join(app.getPath('userData'), 'gpu');
+// What Python runs with: UTF-8 output, and the downloaded CUDA build when there is one, which training loads
+// before the bundled CPU build (worker/sitecustomize.py)
+const pythonEnv = ({ withGpu = true } = {}) => {
+  const env = { ...process.env, PYTHONIOENCODING: 'utf-8' };
+  delete env.FIREFLY_GPU_TORCH;
+  const cuda = withGpu && gpu.installed(GPU_DIR);
+  if (cuda) env.FIREFLY_GPU_TORCH = cuda.dir;
+  return env;
+};
 
 // --- Crashes: kept, so there's something to read afterwards ---
 // Electron handles its processes' crashes itself (Windows keeps no report of them) and keeps no dump
@@ -467,7 +479,7 @@ ipcMain.handle('training:start', (_e, params) => {
     if (decodeOnce) args.push('--cache');
   }
 
-  trainProc = spawn(PYTHON_EXE(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
+  trainProc = spawn(PYTHON_EXE(), args, { stdio: ['ignore', 'pipe', 'pipe'], env: pythonEnv() });
 
   let buf = '';
   trainProc.stdout.setEncoding('utf8');
@@ -614,65 +626,56 @@ ipcMain.handle('training:check-checkpoint', (_e, outDir, kind) => {
   } catch { return { found: false }; }
 });
 
-ipcMain.handle('training:gpu-check', () => {
-  // Detect CUDA version from nvidia-smi (works without Python)
-  const nvidiaSmi = 'nvidia-smi';
-  const cudaWheelForDriver = (driverCuda) => {
-    // Map driver-reported CUDA version to the latest compatible PyTorch wheel
-    const [major, minor] = driverCuda.split('.').map(Number);
-    const ver = major * 100 + (minor ?? 0);
-    if (ver >= 1300) return 'cu128';
-    if (ver >= 1200) return 'cu124';
-    if (ver >= 1100) return 'cu118';
-    return null; // too old for current PyTorch
+// Whether training can run on the card: what nvidia-smi says about it and its driver, the CUDA build that
+// suits them (or why there's none), the downloaded build if any, and whether PyTorch as training loads it can
+// really calculate on the card. Training runs on the CPU otherwise.
+ipcMain.handle('training:gpu-check', async () => {
+  const smi = await gpu.readSmi();
+  const plan = gpu.planFor(smi);
+  const cuda = gpu.installed(GPU_DIR);
+  const test = fs.existsSync(PYTHON_EXE()) ? await gpu.testTorch(PYTHON_EXE(), pythonEnv()) : { available: false, error: 'Python not found' };
+  return {
+    available: !!test.available, name: test.name ?? null, error: test.available ? null : test.error ?? null, torch: test.torch ?? null, vision: test.vision ?? null,
+    ...smi, plan, packaged: app.isPackaged, installed: cuda ? { variant: cuda.variant, name: cuda.name ?? null } : null,
+    wheel: plan.variant ?? null,
   };
+});
 
-  const smiCheck = new Promise(resolve => {
-    const proc = spawn(nvidiaSmi, ['--query-gpu=name', '--query', 'cuda_version', '--format=csv,noheader'],
-      { stdio: ['ignore', 'pipe', 'ignore'], shell: true });
-    // Simpler: just parse the header line from plain nvidia-smi output
-    const proc2 = spawn(nvidiaSmi, [], { stdio: ['ignore', 'pipe', 'ignore'], shell: true });
+// Downloads and tests the CUDA build for the card, into GPU_DIR (the installed app only: a development
+// setup installs it into its .venv with pip, as the Train tab says). One at a time; progress as
+// training:gpu-progress events.
+let gpuInstall = null;
+ipcMain.handle('training:gpu-install', async () => {
+  if (!app.isPackaged) return { ok: false, error: 'In a development setup, install the CUDA build into .venv with the command the Train tab shows' };
+  if (gpuInstall) return { ok: false, error: 'Already downloading' };
+  const plan = gpu.planFor(await gpu.readSmi());
+  if (!plan.variant) return { ok: false, error: 'There is no CUDA build of PyTorch for this card and driver' };
+  try {
+    const { bavail, bsize } = await fs.promises.statfs(app.getPath('userData'));
+    if (bavail * bsize < 6 * 2 ** 30) return { ok: false, error: `It needs about 6 GB free on the drive FireFly keeps its data on, while it downloads (${(bavail * bsize / 2 ** 30).toFixed(1)} GB free)` };
+  } catch { /* the download says so if it runs out */ }
+  // The CUDA build of the same versions as the bundled ones, so everything else that needs them still fits
+  const versions = await new Promise(resolve => {
     let out = '';
-    proc2.stdout.setEncoding('utf8');
-    proc2.stdout.on('data', d => { out += d; });
-    proc2.on('exit', code => {
-      if (code !== 0) return resolve({ nvidiaSmiOk: false });
-      const match = out.match(/CUDA Version:\s*([\d.]+)/);
-      resolve({ nvidiaSmiOk: true, driverCuda: match ? match[1] : null });
-    });
-    proc.kill?.();
+    const p = spawn(PYTHON_EXE(), ['-c', 'import torch, torchvision; print(torch.__version__, torchvision.__version__)'], { stdio: ['ignore', 'pipe', 'ignore'], env: pythonEnv({ withGpu: false }) });
+    p.stdout.on('data', d => { out += d; });
+    p.on('exit', () => resolve(out.trim().split(/\s+/)));
   });
-
-  if (!fs.existsSync(PYTHON_EXE())) {
-    return smiCheck.then(({ nvidiaSmiOk, driverCuda }) => ({
-      available: false, name: null,
-      nvidiaSmiOk, driverCuda,
-      wheel: driverCuda ? cudaWheelForDriver(driverCuda) : null,
-    }));
-  }
-
-  return Promise.all([
-    smiCheck,
-    new Promise(resolve => {
-      const script = 'import torch,sys; a=torch.cuda.is_available(); n=torch.cuda.get_device_name(0) if a else ""; print(f"GPU:{a}:{n}"); sys.exit(0)';
-      const proc = spawn(PYTHON_EXE(), ['-c', script],
-                         { stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, PYTHONIOENCODING: 'utf-8' } });
-      let out = '';
-      proc.stdout.setEncoding('utf8');
-      proc.stdout.on('data', d => { out += d; });
-      proc.on('exit', () => {
-        const line = out.split('\n').find(l => l.startsWith('GPU:'));
-        if (!line) return resolve({ available: false, name: null });
-        const parts = line.split(':');
-        resolve({ available: parts[1] === 'True', name: parts.slice(2).join(':').trim() || null });
-      });
-    }),
-  ]).then(([smi, gpu]) => ({
-    ...gpu,
-    nvidiaSmiOk: smi.nvidiaSmiOk,
-    driverCuda: smi.driverCuda,
-    wheel: smi.driverCuda ? cudaWheelForDriver(smi.driverCuda) : null,
-  }));
+  if (versions.length < 2) return { ok: false, error: 'Could not read the bundled PyTorch version' };
+  const send = progress => win?.webContents.send('training:gpu-progress', { variant: plan.variant, ...progress });
+  gpuInstall = gpu.install({ root: GPU_DIR, pythonExe: PYTHON_EXE(), env: pythonEnv({ withGpu: false }), variant: plan.variant,
+    torchVersion: versions[0], visionVersion: versions[1], onProgress: send });
+  send({ phase: 'download', done: 0, total: 0 });
+  const result = await gpuInstall.done;
+  gpuInstall = null;
+  return result.ok ? { ok: true, variant: plan.variant, name: result.test?.name ?? null } : { ok: false, error: result.error };
+});
+ipcMain.handle('training:gpu-cancel', () => { gpuInstall?.cancel(); });
+// Back to the bundled CPU build: deletes the download
+ipcMain.handle('training:gpu-remove', () => {
+  if (gpuInstall) return { ok: false, error: 'Wait for the download to finish, or cancel it' };
+  if (trainProc) return { ok: false, error: 'Stop training first' };
+  try { gpu.remove(GPU_DIR); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
 });
 
 ipcMain.handle('training:check-dataset', (_e, dataDir, kind) => {
