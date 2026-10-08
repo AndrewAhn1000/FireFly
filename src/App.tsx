@@ -451,6 +451,8 @@ export default function App() {
   const liveFrameT     = useRef<number | null>(null);        // when the runtime captured it
   const frozenOverlay  = useRef<FrameOverlay | null>(null);  // overlay of the frame a paused view shows
   const liveFrameOverlay = useRef<FrameOverlay | null>(null);
+  // Boxes moved or resized while paused: they stay where they were put, whichever frame is shown, until going live
+  const pausedEdits    = useRef<Record<string, LiveBox>>({});
   const showToken      = useRef(0);
   const stopping       = useRef(false);                      // capture is being stopped on purpose
 
@@ -711,11 +713,21 @@ export default function App() {
     setTrackedIds(ids => new Set(ids).add(regionId));
   }, [syncTemplates, setTrackedIds]);
 
+  // Where a region's box is on screen, which is what it's grabbed, drawn and cut a template by: paused, where it
+  // was when that frame was captured, or where it's been put since; live, where its object was followed to
+  const shownAt = useCallback((r: Region): Region => {
+    const frozen = frozenOverlay.current;
+    if (!frozen) return placedAt(r, liveBoxesRef.current);
+    const box = pausedEdits.current[r.id] ?? frozen.boxes[r.id];
+    return box ? { ...r, ...box } : r; // made after that frame: where it was put
+  }, []);
+
   const addTemplate = useCallback((regionId: string, boundsOverride?: { x: number; y: number; w: number; h: number }) => {
     const region = regionsRef.current.find(r => r.id === regionId);
     const url    = frameUrlRef.current;
     if (!region || !url) return;
-    const bounds = region.source === 'script' ? boundsOverride : boundsOverride ?? placedAt(region, liveBoxesRef.current);
+    // The box as it's shown over the frame on screen, which is the frame the template is cut from
+    const bounds = region.source === 'script' ? boundsOverride : boundsOverride ?? shownAt(region);
     if (!bounds || bounds.w <= 0 || bounds.h <= 0) return;
     const img = new Image();
     img.onload = () => {
@@ -737,7 +749,7 @@ export default function App() {
       startTracking(regionId);
     };
     img.src = url;
-  }, [setRegions, startTracking]);
+  }, [setRegions, startTracking, shownAt]);
 
   // Template matching makes a region follow its object; off, the box stays where it was put. Any
   // number of regions can follow their objects at once.
@@ -761,7 +773,7 @@ export default function App() {
   // a patch has to look the same at every size the object takes.
   const snapCorners = useCallback((regionId: string, size?: number) => {
     const saved = regionsRef.current.find(r => r.id === regionId);
-    const region = saved && placedAt(saved, liveBoxesRef.current);
+    const region = saved && shownAt(saved);
     const url = frameUrlRef.current;
     if (!region || !url) return;
     const img = new Image();
@@ -801,7 +813,7 @@ export default function App() {
       startTracking(regionId);
     };
     img.src = url;
-  }, [setRegions, startTracking, forgetMatches]);
+  }, [setRegions, startTracking, forgetMatches, shownAt]);
 
   // Lets the box of a region that follows its object grow and shrink with it, by its corners; off, it keeps its template's size
   const setRegionFit = useCallback((regionId: string, on: boolean) => {
@@ -1456,6 +1468,7 @@ export default function App() {
       setBufSpan({ oldest: 0, newest: 0 });
       setStreamLive(null);
       liveUrlRef.current = null; liveFrameT.current = null; frozenOverlay.current = null; liveFrameOverlay.current = null;
+      pausedEdits.current = {};
       showToken.current++;
       setView({ mode: 'live' });
       return;
@@ -1464,7 +1477,7 @@ export default function App() {
     // Rewind images belong to one view; never reuse raw images as processed frames.
     frameBuf.clear(); setBufSpan({ oldest: 0, newest: 0 });
     setFrameUrl(null); liveUrlRef.current = null; liveFrameT.current = null;
-    frozenOverlay.current = null; liveFrameOverlay.current = null; showToken.current++; setView({ mode: 'live' });
+    frozenOverlay.current = null; liveFrameOverlay.current = null; pausedEdits.current = {}; showToken.current++; setView({ mode: 'live' });
     let running = true;
     let rafId = 0;
     let lastT: number | undefined;
@@ -1656,8 +1669,7 @@ export default function App() {
           drawBox({ ...r, ...box, label: `${r.label} ${i + 1}` }, isSel);
         });
       } else {
-        const box = frozen ? frozen.boxes[r.id] : placedAt(r, liveBoxesRef.current);
-        if (box) drawBox({ ...r, ...box }, r.id === selId);
+        drawBox(shownAt(r), r.id === selId);
       }
     });
     if (working && (mode === 'moving' || mode === 'resizing')) drawBox(working, true);
@@ -1680,7 +1692,7 @@ export default function App() {
     }
 
     ctx.restore();
-  }, [getImgBounds, regionScriptBoxes, hiddenSubBoxes, templateMatchBoxes]);
+  }, [getImgBounds, regionScriptBoxes, hiddenSubBoxes, templateMatchBoxes, shownAt]);
   const redrawRef = useRef(redraw);
   redrawRef.current = redraw;
 
@@ -1734,7 +1746,7 @@ export default function App() {
   const goLive = useCallback(() => {
     if (viewRef.current.mode === 'live') return;
     showToken.current++;
-    frozenOverlay.current = null;
+    frozenOverlay.current = null; pausedEdits.current = {};
     setView({ mode: 'live' });
     if (liveUrlRef.current) setFrameUrl(liveUrlRef.current);
     redraw();
@@ -1781,24 +1793,25 @@ export default function App() {
     const fw = img?.naturalWidth || frameSize?.w, fh = img?.naturalHeight || frameSize?.h;
     const r = sid ? regionsRef.current.find(x => x.id === sid) : undefined;
     if (!sid || !r || r.source === 'script' || !fw || !fh || ix.current.mode !== 'idle') return false;
-    const placed = placedAt(r, liveBoxesRef.current);
+    const placed = shownAt(r);
     const MIN_PX = 4; // the smallest a box can be made
     const w0 = Math.round(placed.w * fw), h0 = Math.round(placed.h * fh);
     // Moving keeps the size and stops at the frame's edges; resizing keeps the top-left and stops there too
     const px = Math.max(0, Math.min(fw - w0, Math.round(placed.x * fw) + dx)), py = Math.max(0, Math.min(fh - h0, Math.round(placed.y * fh) + dy));
     const w = Math.max(Math.min(MIN_PX, w0), Math.min(fw - px, w0 + dw)), h = Math.max(Math.min(MIN_PX, h0), Math.min(fh - py, h0 + dh));
-    liveBoxesRef.current = { ...liveBoxesRef.current, [sid]: { x: px / fw, y: py / fh, w: w / fw, h: h / fh } };
+    const box = { x: px / fw, y: py / fh, w: w / fw, h: h / fh };
+    // Paused, it stays where it's put over every frame stepped to; live, it's held there until it's saved
+    if (frozenOverlay.current) pausedEdits.current = { ...pausedEdits.current, [sid]: box };
+    else liveBoxesRef.current = { ...liveBoxesRef.current, [sid]: box };
     redraw();
     if (nudgeTimer.current !== null) clearTimeout(nudgeTimer.current);
     nudgeTimer.current = window.setTimeout(() => {
       nudgeTimer.current = null;
-      const box = liveBoxesRef.current[sid];
-      if (!box) return;
       liveBoxesRef.current = without(liveBoxesRef.current, sid);
       setRegions(regs => regs.map(x => x.id === sid ? { ...x, ...box } : x));
     }, 300);
     return true;
-  }, [frameSize, redraw]);
+  }, [frameSize, redraw, shownAt]);
 
   // The transport keys act on the Game View, so they wait while it's hidden
   useEffect(() => {
@@ -1870,7 +1883,7 @@ export default function App() {
     }
     const state = ix.current;
 
-    const onScreen = regionsRef.current.filter(r => r.source !== 'script' && r.visible !== false).map(r => placedAt(r, liveBoxesRef.current));
+    const onScreen = regionsRef.current.filter(r => r.source !== 'script' && r.visible !== false).map(shownAt);
     if (state.selId) {
       const sel = onScreen.find(r => r.id === state.selId);
       if (sel) {
@@ -1907,7 +1920,7 @@ export default function App() {
 
     if (state.mode === 'idle' && canvas) {
       let cursor = 'crosshair';
-      const onScreen = regionsRef.current.filter(r => r.source !== 'script' && r.visible !== false).map(r => placedAt(r, liveBoxesRef.current));
+      const onScreen = regionsRef.current.filter(r => r.source !== 'script' && r.visible !== false).map(shownAt);
       if (state.selId) {
         const sel = onScreen.find(r => r.id === state.selId);
         if (sel && hitHandle(px, py, sel)) cursor = 'nwse-resize';
@@ -1948,8 +1961,9 @@ export default function App() {
     const state = ix.current;
     if ((state.mode === 'moving' || state.mode === 'resizing') && state.working) {
       const w = state.working; const sid = state.selId!;
-      // Moved by hand, the box is where it was put until its object is found again
+      // Moved by hand, the box is where it was put until its object is found again; paused, over every frame
       liveBoxesRef.current = without(liveBoxesRef.current, sid);
+      if (frozenOverlay.current) pausedEdits.current = { ...pausedEdits.current, [sid]: { x: w.x, y: w.y, w: w.w, h: w.h } };
       setRegions(regs => regs.map(r => r.id === sid ? { ...w, templates: r.templates } : r));
       state.mode = 'idle'; state.working = null; redraw(); return;
     }
@@ -2346,7 +2360,7 @@ export default function App() {
                       const isScriptReg = reg.source === 'script';
                       const subIdx = selSubBox?.regionId === reg.id ? selSubBox.idx : null;
                       const subBox = isScriptReg ? (visibleScriptBoxes[reg.id]?.[subIdx ?? 0] ?? null) : null;
-                      const activeBox = isScriptReg ? subBox : paused ? historical?.boxes[reg.id] : placedAt(reg, liveBoxes);
+                      const activeBox = isScriptReg ? subBox : paused ? shownAt(reg) : placedAt(reg, liveBoxes);
                       const subLabel = subIdx !== null ? `${reg.label} ${subIdx + 1}` : reg.label;
                       const matching = !isScriptReg && reg.match === true;
                       // Templates can be added, removed or taken again whether or not the region follows its object: they're kept, and used once it does

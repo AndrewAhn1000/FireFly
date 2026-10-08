@@ -63,7 +63,7 @@ React UI (src/)  ──►  Electron main (electron/)  ──►  native runtime
 Get the Windows installer, `FireFly-Setup-<version>.exe`, from the [latest release](https://github.com/AndrewAhn1000/FireFly/releases/latest), and run it. It includes everything FireFly needs: the native runtime, ONNX Runtime with DirectML, and a bundled Python with PyTorch for training.
 
 - **Windows SmartScreen may warn you** the first time, because the installer isn't code-signed. Choose **More info › Run anyway**.
-- **Training runs on the CPU** in the installed app, since it bundles the CPU build of PyTorch. Models still run on the GPU through DirectML. For GPU training, build from source with a CUDA build of PyTorch.
+- **Training runs on the CPU** out of the box. With an NVIDIA graphics card, the **Train** tab offers **Download GPU support** (about 2.5 GB, the PyTorch build that suits your card and driver) to train on the card instead. If it says your driver is too old, get the newest one from [NVIDIA](https://www.nvidia.com/drivers): Windows Update usually doesn't install it. Models run on the GPU through DirectML either way.
 
 ## Building from source
 

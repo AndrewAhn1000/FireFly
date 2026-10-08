@@ -59,6 +59,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           npm run native:setup;      if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm run native:onnxruntime; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The DirectML runtime too, which CMake then prefers: models run on the GPU as well as the CPU
+          npm run native:onnxruntime:gpu; if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm run native:configure;  if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm run native:build;      if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
