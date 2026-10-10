@@ -85,6 +85,23 @@ app.whenReady().then(async()=>{
   await js(`(()=>{const i=document.querySelector('[aria-label="How far from where it was to look"]');
    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,'250');i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(350);
   assert.equal(configured['region-2'].reach,250);assert.equal((await savedSecond()).searchReach,250);
+  // When the object isn't near where it was: the same frame searched until it's found unless chosen, or
+  // widened a step each frame, which is sent to the runtime and kept
+  const widen=label=>`[...document.querySelectorAll('[aria-label="When it isn\\'t near where it was"] label')].find(l=>l.textContent.includes(${JSON.stringify(label)})).querySelector('input')`;
+  assert.equal(configured['region-2'].widenEachFrame,false);
+  assert.equal(await js(`${widen("Search the frame until it's found")}.checked`),true,'searching the frame until found is the default');
+  await js(`${widen('Widen the search a step each frame')}.click()`);await wait(150);
+  assert.equal(configured['region-2'].widenEachFrame,true,'widening each frame wasn\'t sent');
+  assert.equal((await savedSecond()).searchWiden,'frames');
+  await js(`${widen("Search the frame until it's found")}.click()`);await wait(150);
+  assert.equal(configured['region-2'].widenEachFrame,false);
+  // How much further each step looks: twice unless chosen, for either way of widening
+  assert.equal(configured['region-2'].widenBy,2);
+  await js(`(()=>{const i=document.querySelector('[aria-label="How much further each step looks"]');
+   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,'3.5');i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(350);
+  assert.equal(configured['region-2'].widenBy,3.5,'the step wasn\'t sent');
+  assert.equal((await savedSecond()).searchWidenBy,3.5);
+  assert.ok(await js(`document.body.textContent.includes('3.5× as far')`),'the step isn\'t shown');
   win.webContents.invalidate();await wait(150);fs.writeFileSync(path.join(root,'build/template-region-editor.png'),(await win.webContents.capturePage()).toPNG());
   await shownX(0);assert.equal(await js(`!!${nearToggle}`),false,'Multi-match finds every instance, so it has no search area');
   const weaker={x:.2,y:.2,w:.1,h:.1,confidence:.8,templateId:'t1'},best={...weaker,x:.6,confidence:.97,templateId:'t2'};

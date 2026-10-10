@@ -28,14 +28,16 @@ export const BUTTONS: ButtonDef[] = [
   ...Array.from({ length: 10 }, (_, i) => ({ id: `num${i}`, label: `Num ${i}`, vk: 96 + i })),
   { id: 'nummultiply', label: 'Num *', vk: 106 }, { id: 'numadd', label: 'Num +', vk: 107 }, { id: 'numsubtract', label: 'Num -', vk: 109 },
   { id: 'numdecimal', label: 'Num .', vk: 110 }, { id: 'numdivide', label: 'Num /', vk: 111 },
+  // Either side's; the input guard never presses them into a Windows shortcut (session.cpp withoutShortcuts)
+  { id: 'shift', label: 'Shift', vk: 16 }, { id: 'ctrl', label: 'Ctrl', vk: 17 }, { id: 'alt', label: 'Alt', vk: 18 },
 ];
-export const MAX_BUTTONS = 24; // what one recording can hold (actionSchema)
+export const MAX_BUTTONS = BUTTONS.length; // every key at once (actionSchema takes up to 128)
 const BY_ID = new Map(BUTTONS.map(b => [b.id, b]));
 // A button's name as people know it ('k1' is “1”), or its id if it isn't one of these
 export const buttonLabel = (id: string) => BY_ID.get(id)?.label ?? id;
 
 // Why a key can't be chosen: the runtime refuses it (actionSchema)
-const MODIFIER = 'Ctrl, Alt, Shift and the Windows key can’t be recorded or pressed: with other keys they make system shortcuts. Bind the game’s action to another key to use it.';
+const WINDOWS = 'The Windows key opens Windows’ Start menu, outside the game, so it can’t be recorded or pressed. Bind the game’s action to another key to use it.';
 const TOGGLE = 'A lock key stays switched on for the whole system, so a policy can’t be allowed to press it.';
 const SYSTEM = 'Opens something of Windows’ outside the game, so it can’t be recorded or pressed.';
 
@@ -63,14 +65,15 @@ const BOARD: Key[] = [
     ['[', 'bracketleft'], [']', 'bracketright'], ['\\', 'backslash', 1.5]]),
   blocked({ x: 0, y: Y + 2, w: 1.75, label: 'Caps' }, TOGGLE),
   ...row(Y + 2, 1.75, [...'ASDFGHJKL'.split('').map(l => [l, l.toLowerCase()] as [string, string]), [';', 'semicolon'], ['\'', 'quote'], ['Enter', 'enter', 2.25]]),
-  blocked({ x: 0, y: Y + 3, w: 2.25, label: 'Shift' }, MODIFIER),
+  // Shift, Ctrl and Alt: either side's key is the same button, as both Enters are
+  { x: 0, y: Y + 3, w: 2.25, label: 'Shift', id: 'shift' },
   ...row(Y + 3, 2.25, [...'ZXCVBNM'.split('').map(l => [l, l.toLowerCase()] as [string, string]), [',', 'comma'], ['.', 'period'], ['/', 'slash']]),
-  blocked({ x: 12.25, y: Y + 3, w: 2.75, label: 'Shift' }, MODIFIER),
-  blocked({ x: 0, y: Y + 4, w: 1.25, label: 'Ctrl' }, MODIFIER), blocked({ x: 1.25, y: Y + 4, w: 1.25, label: 'Win' }, MODIFIER),
-  blocked({ x: 2.5, y: Y + 4, w: 1.25, label: 'Alt' }, MODIFIER),
+  { x: 12.25, y: Y + 3, w: 2.75, label: 'Shift', id: 'shift' },
+  { x: 0, y: Y + 4, w: 1.25, label: 'Ctrl', id: 'ctrl' }, blocked({ x: 1.25, y: Y + 4, w: 1.25, label: 'Win' }, WINDOWS),
+  { x: 2.5, y: Y + 4, w: 1.25, label: 'Alt', id: 'alt' },
   { x: 3.75, y: Y + 4, w: 6.25, label: 'Space', id: 'space' },
-  blocked({ x: 10, y: Y + 4, w: 1.25, label: 'Alt' }, MODIFIER), blocked({ x: 11.25, y: Y + 4, w: 1.25, label: 'Win' }, MODIFIER),
-  blocked({ x: 12.5, y: Y + 4, w: 1.25, label: 'Menu' }, SYSTEM), blocked({ x: 13.75, y: Y + 4, w: 1.25, label: 'Ctrl' }, MODIFIER),
+  { x: 10, y: Y + 4, w: 1.25, label: 'Alt', id: 'alt' }, blocked({ x: 11.25, y: Y + 4, w: 1.25, label: 'Win' }, WINDOWS),
+  blocked({ x: 12.5, y: Y + 4, w: 1.25, label: 'Menu' }, SYSTEM), { x: 13.75, y: Y + 4, w: 1.25, label: 'Ctrl', id: 'ctrl' },
   // Navigation and arrows
   ...row(Y, 15.25, [['Ins', 'insert'], ['Home', 'home'], ['PgUp', 'pageup']]),
   ...row(Y + 1, 15.25, [['Del', 'delete'], ['End', 'end'], ['PgDn', 'pagedown']]),
@@ -95,6 +98,7 @@ const CODES: Record<string, string> = {
   Quote: 'quote', Comma: 'comma', Period: 'period', Slash: 'slash', Space: 'space', Insert: 'insert', Delete: 'delete', Home: 'home',
   End: 'end', PageUp: 'pageup', PageDown: 'pagedown', ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
   NumpadDivide: 'numdivide', NumpadMultiply: 'nummultiply', NumpadSubtract: 'numsubtract', NumpadAdd: 'numadd', NumpadDecimal: 'numdecimal',
+  ShiftLeft: 'shift', ShiftRight: 'shift', ControlLeft: 'ctrl', ControlRight: 'ctrl', AltLeft: 'alt', AltRight: 'alt',
 };
 const codeToId = (code: string): string | undefined => {
   if (CODES[code]) return CODES[code];
@@ -119,7 +123,9 @@ export default function Keyboard({ selected, onToggle, disabled, listen }: Props
   useEffect(() => {
     if (!listen || disabled) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.code === 'Escape' || e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+      // A modifier pressed on its own chooses it; held with another key, that key isn't chosen
+      const alone = /^(Shift|Control|Alt)(Left|Right)$/.test(e.code);
+      if (e.code === 'Escape' || e.repeat || e.metaKey || (!alone && (e.ctrlKey || e.altKey))) return;
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
       const id = codeToId(e.code);

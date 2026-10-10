@@ -25,6 +25,15 @@ torch.set_num_threads(2)
 MAX_SAMPLES = 300000  # samples loaded at once, over the chosen recordings
 PREVIEW_ROWS = 300    # grid rows a formula is tried on, to show what it gives
 VERSION = 3           # of a policy: what its inputs are and how they're made
+# How much of each epoch corrections make up, however short they are beside the recordings: as plain rows,
+# a few seconds of corrections among minutes of play were a few percent of what a policy learned from, and
+# it went on doing what the recordings did there. The player can choose it (correctionShare), 0 being as
+# plain rows; this is when they don't.
+CORRECTION_SHARE = .4
+MAX_CORRECTION_SHARE = .9  # the recordings still teach it everything the corrections don't show
+# A correction ends once the player has let go for this long (play.cjs correctionIdleMs): that wait isn't
+# something they showed the policy, and weighted as a correction it would teach it to stand still
+CORRECTION_IDLE_MS = 1500
 
 
 def hidden_for(inputs):
@@ -57,16 +66,17 @@ def button_stats(logits, labels, buttons):
     return stats
 
 
-def split_sequences(sequences):
+def split_sequences(sequences, whole=()):
     """Training and validation rows: the last quarter of every recording is for validation, after a gap
     (neighbouring rows are nearly the same, and would make validation look better than it is). Taking
     the last recording whole left validation without whatever it didn't do: a correction of only walking
-    scored every jump and climb of the recordings before it as never pressed."""
+    scored every jump and climb of the recordings before it as never pressed. The sequences numbered in
+    `whole` (corrections, each a few seconds) are trained on whole: a quarter and a gap was most of one."""
     training, validation = [], []
-    for sequence in sequences:
+    for n, sequence in enumerate(sequences):
         boundary = int(len(sequence) * .75)
         gap = max(5, int(len(sequence) * .05))
-        if boundary - gap < 10:
+        if n in whole or boundary - gap < 10:
             training += sequence  # too short to split
             continue
         training += sequence[:boundary-gap]
@@ -164,6 +174,9 @@ class Worker:
             raise ValueError('History must be 0..4 steps and the action delay 0..1000 ms')
         with self.db() as db:
             loaded, observation_schema, action_schema = self._recordings(db, ids)
+            # Recorded while a version played, as the player corrected it (play.cjs)
+            corrections = {rid for (rid,) in db.execute(
+                f"SELECT id FROM recordings WHERE json_extract(metadata,'$.correction') AND id IN ({','.join('?' * len(ids))})", ids)}
         featurize = Featurizer(observation_schema, anchor, surface, near_px, request.get('columns'),
                                request.get('derived'), request.get('formulas'), request.get('grids'))
         inputs = featurize.size + history * len(featurize.history_keep)
@@ -188,6 +201,12 @@ class Worker:
                 sequence += self._rows(samples, grid, samples[0]['timestamp'] + offset, step, featurize, history,
                                        delay_steps, delay_ms, buttons, reasons, current)
             sequence.sort(key=lambda row: row[0])
+            if recording_id in corrections:
+                # The wait for the player to let go, at its end
+                idle_from = timestamps[-1] - CORRECTION_IDLE_MS
+                while sequence and sequence[-1][0] >= idle_from and not any(sequence[-1][2]):
+                    sequence.pop()
+                    reasons['Waiting for the player to let go, at the end of a correction'] += 1
             total += len(sequence)
             if sequence:
                 recordings.append((recording_id, sequence))
@@ -200,6 +219,7 @@ class Worker:
                    'stepMs': step, 'columns': featurize.columns, 'derived': featurize.derived, 'formulas': featurize.formula_sources, 'grids': featurize.grids,
                    'buttons': [b['id'] for b in buttons]}
         return {'recordings': recordings, 'skipped': skipped, 'skippedReasons': dict(reasons.most_common()),
+                'corrections': {rid for rid, _ in recordings if rid in corrections},
                 'samples': total, 'observationSchema': observation_schema, 'actionSchema': action_schema,
                 'outputs': buttons, 'featurize': featurize, 'options': options}
 
@@ -416,16 +436,22 @@ class Worker:
         epochs, lr = int(request.get('epochs', 60)), float(request.get('learningRate', .003))
         if not 1 <= epochs <= 200 or not .00001 <= lr <= .1:
             raise ValueError('Epochs must be 1..200 and learning rate 0.00001..0.1')
+        chosen_share = request.get('correctionShare')
+        chosen_share = CORRECTION_SHARE if chosen_share is None else float(chosen_share)
+        if not 0 <= chosen_share <= MAX_CORRECTION_SHARE:
+            raise ValueError(f'The corrections\' share of training must be 0..{MAX_CORRECTION_SHARE:.0%}')
         data = self.dataset(request)
         ids, skipped = request['recordingIds'], data['skipped']
         observation_schema, action_schema, featurize = data['observationSchema'], data['actionSchema'], data['featurize']
         anchor, surface, near_px = data['options']['anchor'], data['options']['surface'], data['options']['nearPx']
         history, delay_ms, step = data['options']['history'], data['options']['actionDelayMs'], data['options']['stepMs']
-        sequences = [[(x, y) for _, x, y in sequence] for _, sequence in data['recordings']]
-        training, validation, split = split_sequences(sequences)
+        fixes = data['corrections']
+        sequences = [[(x, y, rid in fixes) for _, x, y in sequence] for rid, sequence in data['recordings']]
+        training, validation, split = split_sequences(sequences, {n for n, (rid, _) in enumerate(data['recordings']) if rid in fixes})
         torch.manual_seed(7)
         x = torch.tensor([r[0] for r in training], dtype=torch.float32)
         y = torch.tensor([r[1] for r in training], dtype=torch.float32)
+        fix = torch.tensor([r[2] for r in training], dtype=torch.bool)
         vx = torch.tensor([r[0] for r in validation], dtype=torch.float32)
         vy = torch.tensor([r[1] for r in validation], dtype=torch.float32)
         mean, std = x.mean(0), x.std(0, unbiased=False).clamp_min(1e-6)
@@ -433,25 +459,32 @@ class Worker:
         hidden = hidden_for(x.shape[1])
         network = policy(x.shape[1], y.shape[1], hidden)
         optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+        # Each epoch draws its rows so that the corrections are the chosen share of them (or more, if they
+        # already are), the recordings the rest; without corrections, every row once, in a new order
+        fixed = int(fix.sum())
+        share = max(chosen_share, fixed / len(x)) if 0 < fixed < len(x) else fixed / len(x)
+        draw = torch.where(fix, share / max(fixed, 1), (1 - share) / max(len(x) - fixed, 1)) if 0 < fixed < len(x) else None
         # A button pressed in 5% of samples would be learned as never pressed; weighting its presses by
-        # how rarely it's pressed (at most 20x) makes missing one cost as much as pressing it wrongly
-        pressed = y.sum(0)
-        pos_weight = ((len(y) - pressed) / pressed.clamp_min(1)).clamp(1, 20)
+        # how rarely it's pressed (at most 20x) makes missing one cost as much as pressing it wrongly.
+        # How often is counted over the rows as they're drawn.
+        rate = ((draw if draw is not None else torch.full((len(y),), 1 / len(y)))[:, None] * y).sum(0)
+        pos_weight = ((1 - rate) / rate.clamp_min(1 / len(y))).clamp(1, 20)
         loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         run = str(uuid.uuid4())
         config = {'recordingIds': ids, 'epochs': epochs, 'learningRate': lr, 'split': split,
                   'anchor': anchor, 'surface': surface, 'nearPx': near_px, 'history': history,
                   'actionDelayMs': delay_ms, 'stepMs': step, 'skipped': skipped, 'skippedReasons': data['skippedReasons'],
                   'columns': featurize.columns, 'derived': featurize.derived, 'formulas': featurize.formula_sources,
-                  'buttons': [b['id'] for b in data['outputs']], 'policy': self._policy(request)}
+                  'buttons': [b['id'] for b in data['outputs']], 'policy': self._policy(request),
+                  'correctionShare': chosen_share}
         with self.db() as db:
             db.execute('INSERT INTO training_runs VALUES(?,?,?,?,?)', (run, 'running', json.dumps(config), '[]', None))
         metrics = []
         try:
-            best_loss, best, best_buttons = float('inf'), None, []
+            best_score, best_loss, best, best_buttons, best_learned = float('inf'), float('inf'), None, [], None
             for epoch in range(epochs):
                 network.train()
-                order = torch.randperm(len(x))
+                order = torch.multinomial(draw, len(x), replacement=True) if draw is not None else torch.randperm(len(x))
                 for batch in order.split(64):
                     optimizer.zero_grad()
                     loss = loss_fn(network(x[batch]), y[batch])
@@ -464,13 +497,25 @@ class Worker:
                     validation_loss = float(loss_fn(validation_logits, vy))
                     accuracy = float(((validation_logits >= 0) == (vy >= .5)).float().mean())
                     buttons = button_stats(validation_logits, vy, data['outputs'])
+                    # How it does on the corrections: there's nothing of them to validate on (they're
+                    # trained whole), so these are the rows it learned from, and what they say is whether
+                    # it can do what it was shown. Never most of them means its values can't tell those
+                    # moments from the recordings' (such as a portal no State shows).
+                    if fixed:
+                        fix_logits = network(x[fix])
+                        fix_loss = float(loss_fn(fix_logits, y[fix]))
+                        learned = float(((fix_logits >= 0) == (y[fix] >= .5)).all(1).float().mean())
                 if not math.isfinite(train_loss + validation_loss):
                     raise ValueError('Nonfinite training loss')
-                if validation_loss < best_loss:
-                    best_loss, best_buttons = validation_loss, buttons
+                # The version kept does both: what the recordings it hadn't seen did, and the corrections, by their share
+                score = (1 - share) * validation_loss + share * fix_loss if fixed else validation_loss
+                if score < best_score:
+                    best_score, best_loss, best_buttons = score, validation_loss, buttons
+                    best_learned = learned if fixed else None
                     best = {key: value.detach().clone() for key, value in network.state_dict().items()}
                 metric = {'epoch': epoch+1, 'loss': train_loss, 'validationLoss': validation_loss, 'buttonAccuracy': accuracy,
-                          'buttonF1': sum(b['f1'] for b in buttons) / len(buttons)}
+                          'buttonF1': sum(b['f1'] for b in buttons) / len(buttons),
+                          **({'correctionsLearned': learned} if fixed else {})}
                 metrics.append(metric)
                 self.emit({'event': 'training', 'result': {'runId': run, **metric}})
             directory = self.root / 'models' / run
@@ -482,6 +527,7 @@ class Worker:
                         'trainingSamples': len(x), 'validationSamples': len(vx), 'config': config,
                         'features': featurize.describe(), 'history': history, 'stepMs': step,
                         'metrics': metrics, 'bestValidationLoss': best_loss, 'buttons': best_buttons,
+                        'corrections': {'recordings': len(fixes), 'rows': fixed, 'share': share, 'learned': best_learned} if fixed else None,
                         'hidden': hidden, 'architecture': f'mlp{hidden}x{hidden}_multilabel'}
             temporary = directory / 'metadata.tmp'
             temporary.write_text(json.dumps(metadata, indent=2), encoding='utf8')
@@ -534,7 +580,7 @@ class Worker:
             raise ValueError('Model observation/action schema mismatch')
         if metadata['version'] != VERSION:
             raise ValueError('This policy was trained by an older FireFly, which saw its inputs differently; train it again')
-        if not 1 <= metadata['inputSize'] <= MAX_INPUTS or not 1 <= metadata['outputSize'] <= 24:
+        if not 1 <= metadata['inputSize'] <= MAX_INPUTS or not 1 <= metadata['outputSize'] <= 128:  # buttons (session.cpp)
             raise ValueError('Unsupported model metadata')
         checkpoint = torch.load(directory/'checkpoint.pt', map_location='cpu', weights_only=True)
         network = policy(metadata['inputSize'], metadata['outputSize'], metadata.get('hidden', 64))

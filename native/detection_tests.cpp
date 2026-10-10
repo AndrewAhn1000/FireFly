@@ -234,6 +234,45 @@ int main() {
       nearest({1, frameWith({{sprite, {30, 40}}}, 0), tracks});
       auto picked = nearest({1, frameWith({{sprite, {62, 44}}, {sprite, {170, 90}}}, 30), tracks}).match["regions"][0];
       check(picked["found"] == true && picked["x"] == 62 / 200.0, "A search growing past its reach took a lookalike further away");
+      // Widening each frame instead: a frame looks one step further out than the last, so an object 120 px
+      // away is found on the 4th frame (within 20, 40, 80, then 160), and the search is back to its reach
+      // once it's found
+      auto widening = trackWith(20);
+      std::const_pointer_cast<firefly::Track>((*widening)[0])->widenEachFrame = true;
+      firefly::Tracker stepwise;
+      stepwise({1, frameWith({{sprite, {30, 40}}}, 0), widening});
+      std::vector<bool> found;
+      for (int i = 1; i <= 4; ++i)
+        found.push_back(stepwise({1, frameWith({{sprite, {150, 80}}}, 30.0 * i), widening}).match["regions"][0]["found"]);
+      check(found == std::vector<bool>{false, false, false, true}, "Widening each frame didn't take a step a frame to find the object");
+      // Found, its next search is its reach again: a lookalike past it, with the object gone, isn't taken
+      auto after = stepwise({1, frameWith({{sprite, {20, 10}}}, 150), widening}).match["regions"][0];
+      check(after["found"] == false, "Once found, the search didn't go back to its reach");
+      // Widening by 4 times a step instead of twice: within 20, 80, then 320, so found on the 3rd frame
+      auto bigger = trackWith(20);
+      {
+        auto t = std::const_pointer_cast<firefly::Track>((*bigger)[0]);
+        t->widenEachFrame = true; t->widenBy = 4;
+      }
+      firefly::Tracker quicker;
+      quicker({1, frameWith({{sprite, {30, 40}}}, 0), bigger});
+      std::vector<bool> foundSooner;
+      for (int i = 1; i <= 3; ++i)
+        foundSooner.push_back(quicker({1, frameWith({{sprite, {150, 80}}}, 30.0 * i), bigger}).match["regions"][0]["found"]);
+      check(foundSooner == std::vector<bool>{false, false, true}, "Widening by more a step didn't find the object sooner");
+      // A little at a time (1.1 times) still gets there: every step is at least a pixel further
+      auto slow = trackWith(20);
+      {
+        auto t = std::const_pointer_cast<firefly::Track>((*slow)[0]);
+        t->widenBy = 1.1;
+      }
+      firefly::Tracker patient;
+      patient({1, frameWith({{sprite, {30, 40}}}, 0), slow});
+      check(patient({1, frameWith({{sprite, {150, 80}}}, 30), slow}).match["regions"][0]["found"] == true, "Widening a little at a time in one frame never got there");
+      // The same frames searched in one frame each (the default) find it at once
+      firefly::Tracker atOnce;
+      atOnce({1, frameWith({{sprite, {30, 40}}}, 0), tracks});
+      check(atOnce({1, frameWith({{sprite, {150, 80}}}, 30), tracks}).match["regions"][0]["found"] == true, "The default stopped searching the whole frame");
     }
     // An object moving further between frames than its reach is still followed: it's also looked for
     // where it was heading

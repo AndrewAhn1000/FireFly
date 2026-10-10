@@ -87,8 +87,11 @@ static bool emit(int vk, bool down) {
 struct Guard {
   std::set<int> held;
   void release() {
-    for (int vk : held)
-      emit(vk, false);
+    // The other keys first, then Shift, Ctrl and Alt (16-18), so letting go makes no combination either
+    for (bool modifiers : {false, true})
+      for (int vk : held)
+        if ((vk >= VK_SHIFT && vk <= VK_MENU) == modifiers)
+          emit(vk, false);
     held.clear();
     active = false;
   }
@@ -203,8 +206,11 @@ int main() {
         const bool has = thread && GetGUIThreadInfo(thread, &gui) && gui.hwndFocus &&
                          (gui.hwndFocus == target || IsChild(target, gui.hwndFocus));
         response["keyboardFocus"] = has;
-        if (GetAsyncKeyState(VK_CONTROL) & 0x8000 ||
-            GetAsyncKeyState(VK_MENU) & 0x8000 ||
+        // A Ctrl or Alt the player holds would make shortcuts of the policy's keys. Windows reports the
+        // guard's own presses as held too, and a policy can press Ctrl and Alt itself, so only those it
+        // isn't holding count.
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000 && !guard.held.contains(VK_CONTROL)) ||
+            (GetAsyncKeyState(VK_MENU) & 0x8000 && !guard.held.contains(VK_MENU)) ||
             GetAsyncKeyState(VK_LWIN) & 0x8000 ||
             GetAsyncKeyState(VK_RWIN) & 0x8000)
           throw std::runtime_error(
@@ -219,20 +225,26 @@ int main() {
           if (states[i].get<bool>())
             desired.insert(schema["buttons"][i]["vk"].get<int>());
         }
-        for (auto it = guard.held.begin(); it != guard.held.end();)
-          if (!desired.contains(*it)) {
-            if (!emit(*it, false))
-              throw std::runtime_error("Input release rejected by Windows");
-            it = guard.held.erase(it);
-          } else
-            ++it;
-        for (int vk : desired)
-          if (!guard.held.contains(vk)) {
-            guard.held.insert(vk);
-            if (!emit(vk, true))
-              throw std::runtime_error(
-                  "Application does not accept synthetic input");
-          }
+        desired = firefly::withoutShortcuts(std::move(desired));
+        // Shift, Ctrl and Alt go down before the other keys and up after them, as a player presses
+        // them, so a game sees a combination rather than the key alone
+        const auto modifier = [](int vk) { return vk >= VK_SHIFT && vk <= VK_MENU; };
+        for (bool modifiers : {false, true})
+          for (auto it = guard.held.begin(); it != guard.held.end();)
+            if (modifier(*it) == modifiers && !desired.contains(*it)) {
+              if (!emit(*it, false))
+                throw std::runtime_error("Input release rejected by Windows");
+              it = guard.held.erase(it);
+            } else
+              ++it;
+        for (bool modifiers : {true, false})
+          for (int vk : desired)
+            if (modifier(vk) == modifiers && !guard.held.contains(vk)) {
+              guard.held.insert(vk);
+              if (!emit(vk, true))
+                throw std::runtime_error(
+                    "Application does not accept synthetic input");
+            }
         last = firefly::monotonicMs();
         active = true;
         response["held"] = desired.size();

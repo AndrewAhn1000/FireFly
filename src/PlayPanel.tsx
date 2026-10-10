@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { buttonLabel } from './Keyboard';
 import {
-  cleanError, correctionsOf, meanF1, newestFirst, percent, playingText, POLICY_VERSION, retrainRequest,
-  type PlayStatus, type PolicyVersion, type RecordingInfo,
+  cleanError, correctionShareHint, correctionsOf, DEFAULT_CORRECTION_SHARE, MAX_CORRECTION_SHARE, meanF1, newestFirst, percent,
+  playingText, POLICY_VERSION, retrainRequest, type PlayStatus, type PolicyVersion, type RecordingInfo,
 } from './policyPlay';
 
 // The Play tab: every trained policy and its versions, to play one as it is, or with corrections recorded
@@ -31,6 +31,10 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
   const [training, setTraining] = useState<{ versionId: string; epochs: number; progress: Epoch | null } | null>(null);
   const [trained, setTrained] = useState<string | null>(null); // the version a training here just made
   const [error, setError] = useState('');
+  // How much the corrections count in the next training, when chosen here; else as much as they did for the
+  // version shown. Choosing another version starts from its own again.
+  const [share, setShare] = useState<number | null>(null);
+  useEffect(() => setShare(null), [selectedId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -76,8 +80,8 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
     const res = await window.bridge.policy.play({ modelId: v.id, windowId, corrections });
     if (!res.ok) setError(res.error ?? 'Could not start playing');
   };
-  const train = async (v: PolicyVersion, siblings: PolicyVersion[]) => {
-    const request = retrainRequest(v, siblings, recordings);
+  const train = async (v: PolicyVersion, siblings: PolicyVersion[], correctionShare: number) => {
+    const request = retrainRequest(v, siblings, recordings, correctionShare);
     if (!request) { setError('The recordings this version was trained from have all been deleted'); return; }
     setError(''); setTrained(null);
     setTraining({ versionId: v.id, epochs: Number(request.epochs) || 60, progress: null });
@@ -130,6 +134,14 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
             {v.stepMs ? ` · acts every ${Math.round(v.stepMs)} ms` : ''}
           </div>
           {buttons.length > 0 && <div className="play-meta">Presses {buttons.join(', ')}</div>}
+          {v.corrections?.learned != null && <div className="play-meta">
+            Trained with {v.corrections.recordings} correction{v.corrections.recordings === 1 ? '' : 's'}: does what you showed it {percent(v.corrections.learned)} of the time
+          </div>}
+          {v.corrections?.learned != null && v.corrections.learned < .8 && <div className="play-hint">
+            It can’t do much of what your corrections showed it. Most likely its States can’t tell those moments apart from
+            ones in the recordings where it should do otherwise: add a State that shows what’s different there (such as a
+            portal’s position), and train it again.
+          </div>}
 
           {!playable ? <div className="play-hint">Trained by an older FireFly, so it can't play: train its Policy node again in Graphs.</div> : <>
             <div className="play-actions">
@@ -149,10 +161,19 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
           <div className="play-meta">
             {fixes.length ? `${fixes.length} correction${fixes.length > 1 ? 's' : ''} recorded while ${group.key ? `${group.name}'s versions` : 'it'} played${own ? ` (${own} while this one played)` : ''}` : 'None recorded yet: play it with corrections, and take over when it goes wrong.'}
           </div>
+          {(() => {
+            const chosen = share ?? v.config.correctionShare ?? DEFAULT_CORRECTION_SHARE;
+            return <label className="play-share" title={correctionShareHint}>
+              How much they count
+              <input type="range" aria-label="How much the corrections count" min={0} max={MAX_CORRECTION_SHARE} step={.05} value={chosen}
+                disabled={!!training} onChange={e => setShare(Number(e.target.value))} />
+              <b>{chosen === 0 ? 'as plain rows' : `${percent(chosen)} of training`}</b>
+            </label>;
+          })()}
           <div className="play-actions">
             <button className="train-btn-sm" disabled={!fixes.length || !!training || recording || isPlaying}
               title={isPlaying ? 'Stop it first' : recording ? 'Stop recording first' : !fixes.length ? 'Record some corrections first' : ''}
-              onClick={() => void train(v, group.versions)}>
+              onClick={() => void train(v, group.versions, share ?? v.config.correctionShare ?? DEFAULT_CORRECTION_SHARE)}>
               {trainingHere ? `Training… ${training?.progress ? `${training.progress.epoch}/${training.epochs}` : ''}` : 'Train a new version with my corrections'}
             </button>
           </div>

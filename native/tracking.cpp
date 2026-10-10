@@ -58,10 +58,19 @@ Json Tracker::follow(const Track &track, History &history, Pyramid &pyramid, con
   // position is only missing when it isn't recognised anywhere), and nearest first: the box goes to the
   // object near where it was rather than to a lookalike further away. Only a frame the object isn't found
   // in at all costs a search of the whole window, a little more with the smaller searches before it.
+  // Widening each frame instead (track.widenEachFrame), a frame makes one search: the reach, or one step
+  // further out than the last frame looked without finding it, until it's found again.
   const bool near = track.reach >= 0 && !track.multi && (history.last || track.start);
   const int longest = std::max(frame.width, frame.height);
-  // The searches of one frame, nearest first: the reach, then twice as far until it covers the window
-  auto further = [&](int reach) { return std::max(reach, kGrowFrom) * 2; };
+  // The searches of one frame, nearest first: the reach, then widenBy times as far (twice, unless chosen)
+  // until it covers the window; always at least a pixel further, so it gets there
+  auto further = [&](int reach) {
+    const int from = std::max(reach, kGrowFrom);
+    return std::max(from + 1, (int)std::ceil(from * track.widenBy));
+  };
+  const bool stepwise = near && track.widenEachFrame;
+  const int first = stepwise && history.widened >= 0 ? std::min(further(history.widened), longest) : track.reach;
+  int searched = first; // how far this frame looked
   // Where it's heading: how far its centre has moved since it was last found, at the speed it was moving
   // then, for up to kGapMs (after longer its path starts again). It's looked for there as well as where it
   // was, so an object faster than its reach between frames isn't lost, and one that stops is still found.
@@ -80,13 +89,15 @@ Json Tracker::follow(const Track &track, History &history, Pyramid &pyramid, con
       search.reach = kCornerReach; search.anywhere = true;
       fit = fitCorners(pyramid, track.topLeft, track.bottomRight, search);
     } else
-      for (int reach = track.reach;; reach = further(reach)) {
+      for (int reach = first;; reach = further(reach)) {
         search.reach = reach + (int)std::ceil(cv::norm(moved));
         search.anywhere = reach >= longest;
         fit = fitCorners(pyramid, track.topLeft, track.bottomRight, search);
-        if (fit.found || search.anywhere) break;
+        searched = reach;
+        if (fit.found || search.anywhere || stepwise) break;
       }
     if (fit.found) history.last = fit.box;
+    if (stepwise) history.widened = fit.found ? -1 : searched;
     out = {{"x", (double)fit.box.x / frame.width}, {"y", (double)fit.box.y / frame.height},
       {"w", (double)fit.box.width / frame.width}, {"h", (double)fit.box.height / frame.height},
       {"confidence", std::min(fit.topLeft, fit.bottomRight)}, {"found", fit.found}};
@@ -113,12 +124,13 @@ Json Tracker::follow(const Track &track, History &history, Pyramid &pyramid, con
     std::vector<TemplateHit> hits;
     if (track.multi) hits = matchTemplates(pyramid, track.templates, track.threshold, 50);
     else
-      for (int reach = track.reach;; reach = further(reach)) {
+      for (int reach = first;; reach = further(reach)) {
         const bool whole = !near || reach >= longest;
         hits = matchTemplates(pyramid, track.templates, 0, (int)track.templates.size(), 1,
                               whole ? std::function<cv::Rect(const Pattern &)>() : within(reach),
                               {history.winner, kStick, track.threshold});
-        if (whole || (!hits.empty() && hits.front().confidence >= track.threshold)) break;
+        searched = reach;
+        if (whole || stepwise || (!hits.empty() && hits.front().confidence >= track.threshold)) break;
       }
     auto encode = [&](const TemplateHit &hit) {
       return Json{{"x", (double)hit.box.x / frame.width}, {"y", (double)hit.box.y / frame.height},
@@ -129,6 +141,7 @@ Json Tracker::follow(const Track &track, History &history, Pyramid &pyramid, con
     const bool found = !hits.empty() && hits.front().confidence >= track.threshold;
     out["found"] = found;
     if (found) { history.last = hits.front().box; history.winner = hits.front().templateId; }
+    if (stepwise) history.widened = found ? -1 : searched;
     if (!track.multi) {
       out["detected"] = Json::array();
       for (auto &hit : hits)

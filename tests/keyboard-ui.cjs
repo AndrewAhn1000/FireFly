@@ -1,6 +1,7 @@
-// The buttons a recording holds are chosen on a whole keyboard: clicked or pressed, the keys that make
-// system shortcuts or stay switched on can't be chosen, at most 24, and record.start gets them in the
-// order recordings always had them. Needs `npm run build`: electron tests/keyboard-ui.cjs
+// The buttons a recording holds are chosen on a whole keyboard: clicked or pressed, Shift, Ctrl and Alt
+// too, the keys that open Windows' menus or stay switched on can't be chosen, every other key can be at
+// once, and record.start gets them in the order recordings always had them. Needs `npm run build`:
+// electron tests/keyboard-ui.cjs
 const { app, BrowserWindow, ipcMain, nativeImage } = require('electron');
 const path = require('node:path'), fs = require('node:fs'), assert = require('node:assert/strict');
 const root = path.join(__dirname, '..'), wait = ms => new Promise(r => setTimeout(r, ms));
@@ -48,7 +49,7 @@ app.whenReady().then(async () => {
     await until(`!!document.querySelector('.kb-dialog .kb-board')`);
     assert.ok(await js(`document.querySelectorAll('.kb-key').length`) >= 104, 'a full keyboard');
     assert.equal(await js(`${key('W')}.getAttribute('aria-pressed')`), 'true');
-    for (const blocked of ['Ctrl', 'Alt', 'Shift', 'Win', 'Caps', 'PrtSc', 'Num', 'Menu']) {
+    for (const blocked of ['Win', 'Caps', 'PrtSc', 'Num', 'Menu']) {
       assert.equal(await js(`[...document.querySelectorAll('.kb-key-blocked')].some(k=>k.textContent===${JSON.stringify(blocked)}&&k.disabled&&k.title.length>20)`), true, `${blocked} can't be chosen and says why`);
     }
     // Keys sized and placed as on a keyboard: Space wider than a letter, the number pad's + two rows tall
@@ -62,23 +63,29 @@ app.whenReady().then(async () => {
     await until(`${key('Enter')}.getAttribute('aria-pressed')==='true'`);
     assert.equal(await js(`document.querySelectorAll('.kb [aria-label="Enter"][aria-pressed="true"]').length`), 2, 'both Enter keys lit');
     assert.equal(await js(`${key('W')}.getAttribute('aria-pressed')`), 'false', 'pressing a chosen key leaves it out');
+    // Shift, Ctrl and Alt are chosen as other keys are: pressed on their own (the browser marks Ctrl's own
+    // press as Ctrl held) or clicked, and either side's key is the same button
+    await press('ShiftLeft');
+    await js(`window.dispatchEvent(new KeyboardEvent('keydown',{code:'ControlRight',ctrlKey:true,bubbles:true,cancelable:true}));0`);
+    await until(`${key('Ctrl')}.getAttribute('aria-pressed')==='true'`, 'Ctrl chosen by pressing it');
+    for (const m of ['Shift', 'Ctrl'])
+      assert.equal(await js(`document.querySelectorAll('.kb [aria-label="${m}"][aria-pressed="true"]').length`), 2, `both ${m} keys lit`);
+    assert.equal(await js(`${key('Alt')}.disabled`), false, 'Alt can be chosen');
     // A modifier pressed with a key chooses nothing, and Escape closes the keyboard
     await js(`window.dispatchEvent(new KeyboardEvent('keydown',{code:'KeyT',ctrlKey:true,bubbles:true}));0`);
     assert.equal(await js(`${key('T')}.getAttribute('aria-pressed')`), 'false');
     await js(`${key('LMB')}.click();0`);
     await press('Escape');
     await until(`!document.querySelector('.kb-dialog')`, 'Escape closes it');
-    assert.deepEqual(await chips(), ['RMB', 'A', 'S', 'D', 'Space', 'F1', 'Enter', '[', 'Insert'], 'in the order recordings hold them');
+    assert.deepEqual(await chips(), ['RMB', 'A', 'S', 'D', 'Space', 'F1', 'Enter', '[', 'Insert', 'Shift', 'Ctrl'], 'in the order recordings hold them');
 
-    // At most 24: the rest can't be chosen until one is left out (9 chosen, so only B to Q of these take)
+    // There's no limit short of the whole keyboard: every one of these is taken (11 chosen before)
     await click('Choose on keyboard');
     await until(`!!document.querySelector('.kb-dialog')`);
     for (const l of 'BCEFGHIJKLMNOPQRTUVXYZ') await js(`${key(l)}.click();0`);
-    assert.equal(await js(`document.querySelectorAll('.kb-dialog .kb [aria-pressed="true"]').length - 1`), 24, '24 chosen (Enter is lit twice)');
-    assert.equal(await js(`${key('F2')}.disabled`), true, 'a 25th can\'t be chosen');
-    assert.equal(await js(`${key('R')}.getAttribute('aria-pressed')`), 'false', 'R, past the 24th, was not taken');
+    assert.equal(await js(`[...'BCEFGHIJKLMNOPQRTUVXYZ'].every(l=>document.querySelector('.kb [aria-label="'+l+'"]').getAttribute('aria-pressed')==='true')`), true, 'every letter taken');
+    assert.equal(await js(`${key('F2')}.disabled`), false, 'more can still be chosen');
     await js(`${key('Q')}.click();0`);
-    assert.equal(await js(`${key('F2')}.disabled`), false, 'leaving one out frees a place');
     await js(`${key('F2')}.click();0`);
     win.webContents.invalidate(); await wait(150);
     fs.writeFileSync(path.join(root, 'build/keyboard-ui.png'), (await win.webContents.capturePage()).toPNG());
@@ -93,18 +100,18 @@ app.whenReady().then(async () => {
     await click('Start recording');
     for (let i = 0; i < 50 && !started; i++) await wait(40);
     const ids = started.buttons.map(b => b.id);
-    assert.equal(ids.length, 23);
-    assert.deepEqual(ids.slice(0, 9), ['rmb', 'a', 's', 'd', 'space', 'e', 'f', 'g', 'c']);
-    assert.deepEqual(ids.slice(-5), ['f1', 'f2', 'enter', 'bracketleft', 'insert']);
+    assert.equal(ids.length, 32);
+    assert.deepEqual(ids.slice(0, 9), ['rmb', 'a', 's', 'd', 'space', 'e', 'r', 'f', 'g']);
+    assert.deepEqual(ids.slice(-7), ['f1', 'f2', 'enter', 'bracketleft', 'insert', 'shift', 'ctrl']);
     const vk = id => started.buttons.find(b => b.id === id)?.vk;
-    assert.deepEqual([vk('f1'), vk('f2'), vk('insert'), vk('enter'), vk('bracketleft'), vk('h')], [112, 113, 45, 13, 219, 72]);
+    assert.deepEqual([vk('f1'), vk('f2'), vk('insert'), vk('enter'), vk('bracketleft'), vk('h'), vk('shift'), vk('ctrl')], [112, 113, 45, 13, 219, 72, 16, 17]);
     assert.ok(ids.indexOf('c') < ids.indexOf('h'), 'the original buttons keep their place');
     // Kept for the window
     const saved = JSON.parse(await js(`localStorage.getItem('firefly-record-setup-' + encodeURIComponent('Keyboard fixture'))`));
     assert.ok(saved.buttons.includes('f2') && !saved.buttons.includes('b'));
 
     assert.deepEqual(errors, []);
-    console.log('PASS: whole keyboard, blocked keys explained, click and press to choose, both Enters one key, at most 24, chips, record.start in the old order with key codes, kept per window.');
+    console.log('PASS: whole keyboard, Shift/Ctrl/Alt choosable, blocked keys explained, click and press to choose, both Enters one key, no 24 limit, chips, record.start in the old order with key codes, kept per window.');
     clearTimeout(watchdog); win.destroy(); app.exit(0);
   } catch (e) {
     console.error(e); clearTimeout(watchdog);

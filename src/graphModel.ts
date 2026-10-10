@@ -19,6 +19,7 @@ export interface PolicyData {
   buttons: string[] | null; // the labels: the buttons it learns and presses; null is every one recorded
   off: string[];            // values wired in but left out, by column name
   stepMs: number | null; history: number; delayMs: number; epochs: number;
+  correctionShare?: number; // how much of training its corrections make up (DEFAULT_CORRECTION_SHARE unless chosen)
   [key: string]: unknown;
 }
 export type GraphData = StateData | FormulaData | RecordingsData | PolicyData | GridData;

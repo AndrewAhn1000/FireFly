@@ -105,7 +105,17 @@ app.whenReady().then(async () => {
     assert.equal(played[1].corrections, true);
     send('play:status', { playing: false, modelId: 'w2', reason: null });
 
-    // Train a new version with the corrections: what this version was trained from, plus every Walker correction
+    // How much the corrections count: 40% of training unless chosen (this version saved none), chosen on a slider
+    const slide = (selector, value) => js(`(()=>{const i=document.querySelector(${JSON.stringify(selector)});
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,'${value}');i.dispatchEvent(new Event('input',{bubbles:true}));})();0`);
+    assert.match(await text('.play-share'), /40% of training/);
+    await slide('.play-share input', 0);
+    await until(`document.querySelector('.play-share').textContent.includes('as plain rows')`, '0 shown as plain rows');
+    await slide('.play-share input', .7);
+    await until(`document.querySelector('.play-share').textContent.includes('70% of training')`, 'the chosen share shown');
+
+    // Train a new version with the corrections: what this version was trained from, plus every Walker correction,
+    // counting as much as was chosen
     await play('Train a new version with my corrections');
     for (let i = 0; i < 50 && !trained.length; i++) await wait(40);
     const request = trained[0];
@@ -115,6 +125,7 @@ app.whenReady().then(async () => {
     assert.deepEqual(request.grids, [{ name: 'floor', cols: 4, rows: 3 }]);
     assert.equal(request.stepMs, 66); assert.equal(request.history, 2); assert.equal(request.epochs, 5);
     assert.deepEqual(request.policy, walker);
+    assert.equal(request.correctionShare, .7, 'the corrections’ chosen share');
     send('policy:event', { event: 'training', result: { epoch: 2, validationLoss: .4 } });
     await until(`[...document.querySelectorAll('button')].some(b=>b.textContent.includes('Training… 2/5'))`, 'training progress');
     finishTraining();
@@ -133,6 +144,15 @@ app.whenReady().then(async () => {
     await click('Graphs');
     await until(`!!document.querySelector('.pg-delete-all')`, 'the Policy node’s Delete all');
     assert.deepEqual(await js(`[...document.querySelectorAll('.pg-version b')].map(b=>b.textContent)`), ['v3', 'v2', 'v1']);
+    // The Policy node chooses how much its corrections count too, and keeps it with the graph
+    assert.match(await text('.pg-share'), /40% of training/);
+    await slide('.pg-share input', .25);
+    await until(`document.querySelector('.pg-share').textContent.includes('25% of training')`, 'the node’s chosen share shown');
+    // (the graph library keeps the graph under a key of its own)
+    const keptShare = () => js(`Object.keys(localStorage).filter(k=>k.startsWith('firefly-policy-graph-Test%20Game')).map(k=>{try{return JSON.parse(localStorage.getItem(k))}catch{return null}})
+      .flatMap(g=>g?.nodes??[]).find(n=>n.id==='legacy')?.data.correctionShare`);
+    for (let i = 0; i < 50 && await keptShare() !== .25; i++) await wait(40);
+    assert.equal(await keptShare(), .25, 'kept with the graph');
     await js(`window.confirm = () => true; document.querySelector('.pg-delete-all').click();0`);
     for (let i = 0; i < 50 && deletedModels.length < 3; i++) await wait(40);
     await until(`!document.querySelector('.pg-version')`, 'the versions gone');

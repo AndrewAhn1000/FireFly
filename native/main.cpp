@@ -12,6 +12,7 @@
 #include "rate_meter.hpp"
 #include "tracked.hpp"
 #include "tracking.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <dwmapi.h>
@@ -117,6 +118,12 @@ struct MemScriptCtx {
   StateScope *scope = nullptr;
 };
 static constexpr int MEM_READ_LIMIT = 4096;
+// What a script that reached it can do about it: a list walked from its start for every item reads the
+// square of its length, and a structure read a field at a time a read per field
+static constexpr const char *READ_LIMIT_MESSAGE = "read limit exceeded (max %d per call): walk a linked list once, "
+  "keeping the node you're at rather than starting again from the first, and read a structure in one read_bytes "
+  "(unpacked with string.unpack) rather than a field at a time";
+static constexpr int MAX_READ_BYTES = 4096; // the most read_bytes reads at once
 
 // Finish all C++ exception handling before the Lua callback can perform a longjmp.
 static bool prepareRegionBoxes(MemScriptCtx *ctx, const char *key, bool namesOnly = false) {
@@ -300,7 +307,7 @@ template<typename T>
 static int readTyped(lua_State *L) {
   auto *ctx = static_cast<MemScriptCtx *>(lua_touserdata(L, lua_upvalueindex(1)));
   if (ctx->reads++ >= MEM_READ_LIMIT)
-    return luaL_error(L, "read limit exceeded (max %d per call)", MEM_READ_LIMIT);
+    return luaL_error(L, READ_LIMIT_MESSAGE, MEM_READ_LIMIT);
   uintptr_t addr = (uintptr_t)(lua_Unsigned)luaL_checkinteger(L, 1);
   T val{};
   SIZE_T n = 0;
@@ -369,9 +376,27 @@ static int listModulesFn(lua_State *L) {
   return 1;
 }
 
+// A block of memory as a Lua string, in one read however many values it holds: a structure's fields are then
+// taken out with string.unpack, e.g. local x1, y1, x2, y2 = string.unpack("<i4i4i4i4", read_bytes(rect, 16))
+static int readBytesFn(lua_State *L) {
+  auto *ctx = static_cast<MemScriptCtx *>(lua_touserdata(L, lua_upvalueindex(1)));
+  if (ctx->reads++ >= MEM_READ_LIMIT) return luaL_error(L, READ_LIMIT_MESSAGE, MEM_READ_LIMIT);
+  uintptr_t addr = (uintptr_t)(lua_Unsigned)luaL_checkinteger(L, 1);
+  const lua_Integer count = luaL_checkinteger(L, 2);
+  if (count < 1 || count > MAX_READ_BYTES) return luaL_error(L, "read_bytes reads 1..%d bytes", MAX_READ_BYTES);
+  std::string buf((size_t)count, '\0');
+  SIZE_T n = 0;
+  if (!ReadProcessMemory(ctx->proc, reinterpret_cast<LPCVOID>(addr), buf.data(), buf.size(), &n) || n != buf.size()) {
+    char at[32]; snprintf(at, sizeof(at), "0x%llx", (unsigned long long)addr);
+    return luaL_error(L, "read failed at %s", at);
+  }
+  lua_pushlstring(L, buf.data(), buf.size());
+  return 1;
+}
+
 static int readStrFn(lua_State *L) {
   auto *ctx = static_cast<MemScriptCtx *>(lua_touserdata(L, lua_upvalueindex(1)));
-  if (ctx->reads++ >= MEM_READ_LIMIT) return luaL_error(L, "read limit exceeded");
+  if (ctx->reads++ >= MEM_READ_LIMIT) return luaL_error(L, READ_LIMIT_MESSAGE, MEM_READ_LIMIT);
   uintptr_t addr = (uintptr_t)(lua_Unsigned)luaL_checkinteger(L, 1);
   int maxLen = (int)luaL_optinteger(L, 2, 255);
   if (maxLen < 1 || maxLen > 4096) maxLen = 255;
@@ -424,7 +449,7 @@ static ScriptEntry *getOrCreateScript(const std::string &code) {
     {"read_u32", readTyped<uint32_t>}, {"read_i32", readTyped<int32_t>},
     {"read_u64", readTyped<uint64_t>}, {"read_i64", readTyped<int64_t>},
     {"read_f32", readTyped<float>},    {"read_f64", readTyped<double>},
-    {"read_ptr", readTyped<uintptr_t>},{"read_str", readStrFn},
+    {"read_ptr", readTyped<uintptr_t>},{"read_str", readStrFn}, {"read_bytes", readBytesFn},
     {"get_module_base", getModuleBaseFn},
     {"list_modules",   listModulesFn},
     {"get_window_size", getWindowSizeFn},
@@ -1126,6 +1151,9 @@ int main() {
           track->threshold = request.value("threshold", 0.75);
           track->look = firefly::lookNamed(request.value("preprocess", std::string("color")));
           track->reach = request.value("reach", -1);
+          track->widenEachFrame = request.value("widenEachFrame", false);
+          // How much further out each step looks: a little more than the last up to 8 times as far
+          track->widenBy = std::clamp(request.value("widenBy", 2.0), 1.1, 8.0);
           // Where the object's box was (followed by corners, its top-left corner), and the biggest it can be,
           // both as fractions of the frame, and how far from where it was last found to look for it, in px
           if (request.contains("hint"))

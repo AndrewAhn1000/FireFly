@@ -15,6 +15,8 @@ if(FIREFLY_DIRECTML AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime-dir
   set(ORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libs/onnxruntime-directml")
   target_compile_definitions(firefly-observations PUBLIC FIREFLY_DIRECTML=1)
   target_link_libraries(firefly-observations PUBLIC dxgi d3d12)
+  # The DirectML this ONNX Runtime was built against; Windows' own copy in System32 can be older
+  set(FIREFLY_DML_DLL "${ORT_DIR}/lib/DirectML.dll")
 endif()
 if(EXISTS "${ORT_DIR}/include/onnxruntime_cxx_api.h")
   message(STATUS "ONNX Runtime found at ${ORT_DIR}")
@@ -52,6 +54,13 @@ if(FIREFLY_ORT_DLL)
       "${FIREFLY_ORT_DLL}"
       "$<TARGET_FILE_DIR:firefly-runtime>/onnxruntime.dll"
     COMMENT "Copying onnxruntime.dll")
+endif()
+if(FIREFLY_DML_DLL)
+  add_custom_command(TARGET firefly-runtime POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${FIREFLY_DML_DLL}"
+      "$<TARGET_FILE_DIR:firefly-runtime>/DirectML.dll"
+    COMMENT "Copying DirectML.dll")
 endif()
 
 add_executable(session-tests session_tests.cpp)

@@ -45,6 +45,7 @@ app.whenReady().then(async()=>{
   await require('./monster-script.cjs')(invoke);
   await require('./npc-portal-scripts.cjs')(invoke);
   await require('./lua-region-namespace.cjs')(invoke);
+  await require('./lua-memory.cjs')(invoke);
   await require('./lua-state-namespace.cjs')(invoke);
   const g=await invoke('memory.run_script',{script:'return get_window_size()'}),area=g.clientArea;
   const box=(x,y,w,h)=>({x:area.x+x/800*area.w,y:area.y+y/600*area.h,w:w/800*area.w,h:h/600*area.h});

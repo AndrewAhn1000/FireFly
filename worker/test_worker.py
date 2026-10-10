@@ -316,6 +316,55 @@ class LearningTests(unittest.TestCase):
         data = self.worker.dataset({'recordingIds': ['0', 'empty'], 'history': 0})
         self.assertEqual((data['skipped'], [rid for rid, _ in data['recordings']]), (['empty'], ['0']))
 
+    def test_corrections_change_what_it_does_where_it_was_corrected(self):
+        # The recordings press right for every value over .08; while a version played, the player corrected it
+        # to press left between .5 and .7, for a little over a second, then let go (the 1.5 s play waits)
+        with closing(sqlite3.connect(self.root/'catalog.sqlite')) as db, db:
+            metadata = {'observationSchema': self.schema, 'actionSchema': self.actions, 'correction': True, 'policyId': 'v1'}
+            db.execute('INSERT INTO recordings VALUES(?,?,?)', ('fix', 'complete', json.dumps(metadata)))
+            for i in range(20 + 23):
+                value = .5 + (i * 7 % 20) / 100
+                sample = {'valid': True, 'timestamp': 1000 + i * 66, 'observationSchema': 'obs-test', 'actionSchema': 'act-test',
+                          'observations': [{'name': 'error', 'type': 'number', 'valid': True, 'value': value}],
+                          'actions': {'valid': True, 'buttons': {'left': i < 20, 'right': False}}}
+                db.execute('INSERT INTO samples VALUES(?,?,?)', ('fix', i, json.dumps(sample)))
+        request = {'recordingIds': ['0', '1', '2', 'fix'], 'epochs': 80, 'history': 0, 'stepMs': 66}
+        # The wait for the player to let go isn't part of it: it would teach the policy to stand still there
+        data = self.worker.dataset(request)
+        self.assertEqual(data['corrections'], {'fix'})
+        self.assertEqual(len(dict(data['recordings'])['fix']), 20)
+        self.assertEqual(data['skippedReasons']['Waiting for the player to let go, at the end of a correction'], 23)
+
+        def presses(model, value):
+            self.worker.load({'modelId': model['id'], 'observationSchema': 'obs-test', 'actionSchema': 'act-test'})
+            return self.worker.predict({'observationSchema': 'obs-test', 'observations': [{'name': 'error', 'type': 'number', 'valid': True, 'value': value}]})['buttons']
+        # Chosen as plain rows (0), as it was: the correction is lost among the recordings, and it goes on pressing right
+        plain = self.worker.train({**request, 'correctionShare': 0})
+        self.assertEqual(plain['config']['correctionShare'], 0)
+        self.assertEqual(presses(plain, .6), [False, True])
+        self.assertLess(plain['corrections']['learned'], .5)
+        self.assertLess(plain['corrections']['share'], .05)  # its rows' own share
+        # A share no policy can learn from the recordings with is refused
+        for share in (-.1, .95):
+            with self.assertRaisesRegex(ValueError, 'share'):
+                self.worker.train({**request, 'correctionShare': share})
+        # Drawn as a share of every epoch (40% unless chosen), it does what it was shown there, and what the
+        # recordings did elsewhere
+        model = self.worker.train(request)
+        self.assertEqual(model['config']['correctionShare'], .4)
+        self.assertEqual(model['corrections']['recordings'], 1)
+        self.assertEqual(model['corrections']['rows'], 20)  # trained whole, none of it held back
+        self.assertEqual(model['corrections']['share'], .4)
+        self.assertEqual(self.worker.train({**request, 'epochs': 3, 'correctionShare': .7})['corrections']['share'], .7)
+        self.assertGreaterEqual(model['corrections']['learned'], .85)  # the band's edges border the recordings' right
+        self.assertIn('correctionsLearned', model['metrics'][-1])
+        self.assertEqual(presses(model, .6), [True, False])
+        for value, expected in [(-.7, [True, False]), (.3, [False, True]), (.9, [False, True])]:
+            self.assertEqual(presses(model, value), expected)
+        self.assertGreater(min(b['f1'] for b in model['buttons']), .85)
+        # Without corrections, nothing about it changes
+        self.assertIsNone(self.worker.train({'recordingIds': ['0', '1', '2'], 'epochs': 3, 'history': 0})['corrections'])
+
     def test_validation_and_temporal_gap(self):
         training, validation, split = split_sequences([list(range(100))])
         self.assertEqual(split, 'temporal_with_gap')

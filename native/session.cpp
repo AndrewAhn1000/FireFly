@@ -86,8 +86,9 @@ Json observationSchema(const Graph &graph, const Json &trackedDefinitions,
   return schema;
 }
 Json actionSchema(const Json &buttons) {
-  if (!buttons.is_array() || buttons.empty() || buttons.size() > 24)
-    throw std::runtime_error("Configure 1..24 action buttons");
+  // Every key that can be chosen at once (src/Keyboard.tsx BUTTONS), with room to spare
+  if (!buttons.is_array() || buttons.empty() || buttons.size() > 128)
+    throw std::runtime_error("Configure 1..128 action buttons");
   std::set<int> keys;
   std::set<std::string> names;
   for (auto &b : buttons) {
@@ -96,12 +97,15 @@ Json actionSchema(const Json &buttons) {
     if (!b["vk"].is_number_integer() || name.empty() || name.size() > 48 ||
         !names.insert(name).second || !keys.insert(key).second)
       throw std::runtime_error("Action IDs and physical inputs must be unique");
-    // The keyboard's keys and the mouse buttons (src/Keyboard.tsx), explicitly excluding what makes
-    // operating-system shortcuts (Ctrl, Alt, Shift, Windows, Menu), lock keys that stay on for the whole
-    // system (Caps, Num, Scroll Lock), and Print Screen and Pause.
+    // The keyboard's keys and the mouse buttons (src/Keyboard.tsx), explicitly excluding the Windows and
+    // Menu keys (they open Windows' own menus, outside the game), lock keys that stay on for the whole
+    // system (Caps, Num, Scroll Lock), and Print Screen and Pause. Shift, Ctrl and Alt are either side's
+    // (games bind them often: MapleStory attacks on Ctrl and jumps on Alt); the input guard never presses
+    // them into a Windows shortcut such as Alt+Tab.
     const bool allowed =
         key == 1 || key == 2 || key == 4 ||           // mouse left, right, middle
         key == 8 || key == 9 || key == 13 ||          // Backspace, Tab, Enter
+        (key >= 16 && key <= 18) ||                   // Shift, Ctrl, Alt
         key == 27 || key == 32 ||                     // Esc, Space
         (key >= 33 && key <= 40) ||                   // Page Up/Down, End, Home, arrows
         key == 45 || key == 46 ||                     // Insert, Delete
@@ -114,11 +118,21 @@ Json actionSchema(const Json &buttons) {
         (key >= 219 && key <= 222);                   // [ \ ] '
     if (!allowed)
       throw std::runtime_error("Supported buttons: the mouse's left, right and middle, and the keyboard's "
-                               "keys but Ctrl, Alt, Shift, Windows, Menu, the lock keys, Print Screen and Pause");
+                               "keys but Windows, Menu, the lock keys, Print Screen and Pause");
   }
   Json result = {{"version", 1}, {"buttons", buttons}};
   result["identity"] = sha256(result.dump());
   return result;
+}
+std::set<int> withoutShortcuts(std::set<int> keys) {
+  // Alt (18) with Tab, Esc, Space or F4: switch windows, open the window menu, close the game; Ctrl (17)
+  // with Esc, and with Shift too: the Start menu and Task Manager
+  if (keys.contains(18))
+    for (int vk : {9, 27, 32, 115})
+      keys.erase(vk);
+  if (keys.contains(17))
+    keys.erase(27);
+  return keys;
 }
 void ActionTimeline::reset(double timestamp, const Json &buttons,
                            bool focused) {

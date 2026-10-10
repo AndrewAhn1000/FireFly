@@ -33,10 +33,22 @@ int main() {
       rejected = true;
     }
     check(rejected, "System key allowed");
-    // The whole keyboard but the keys that make system shortcuts or stay switched on
-    for (int vk : {8, 9, 13, 27, 33, 36, 45, 46, 96, 107, 111, 112, 123, 186, 192, 219, 222})
+    // The whole keyboard, Shift, Ctrl and Alt too, but the keys that open Windows' menus or stay switched on
+    for (int vk : {8, 9, 13, 16, 17, 18, 27, 33, 36, 45, 46, 96, 107, 111, 112, 123, 186, 192, 219, 222})
       actionSchema(Json::array({{{"id", "key"}, {"vk", vk}}}));
-    for (int vk : {16, 17, 18, 20, 44, 19, 91, 92, 93, 144, 145, 160, 162, 164, 108}) {
+    // Every key at once
+    Json every = Json::array();
+    for (int vk : {1, 2, 4, 8, 9, 13, 16, 17, 18, 27, 32})
+      every.push_back({{"id", "k" + std::to_string(vk)}, {"vk", vk}});
+    for (int vk = 33; vk <= 90; ++vk)
+      if (vk <= 40 || vk == 45 || vk == 46 || (vk >= 48 && vk <= 57) || vk >= 65)
+        every.push_back({{"id", "k" + std::to_string(vk)}, {"vk", vk}});
+    check(actionSchema(every)["buttons"].size() > 24, "More than 24 buttons refused");
+    // A policy holding Alt or Ctrl never makes a Windows shortcut of them; the modifier and other keys are kept
+    check(withoutShortcuts({18, 9, 27, 32, 115, 65}) == std::set<int>{18, 65}, "Alt+Tab, Esc, Space or F4 pressed");
+    check(withoutShortcuts({17, 16, 27, 37}) == std::set<int>{16, 17, 37}, "Ctrl+Esc or Ctrl+Shift+Esc pressed");
+    check(withoutShortcuts({9, 27, 32, 115, 16}) == std::set<int>{9, 16, 27, 32, 115}, "Keys without Alt or Ctrl were held back");
+    for (int vk : {20, 44, 19, 91, 92, 93, 144, 145, 160, 162, 164, 108}) {
       bool refused = false;
       try { actionSchema(Json::array({{{"id", "key"}, {"vk", vk}}})); } catch (...) { refused = true; }
       check(refused, ("A modifier, lock or system key was allowed: " + std::to_string(vk)).c_str());

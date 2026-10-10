@@ -2,6 +2,7 @@
 #include "graph.hpp"
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 namespace firefly {
 double monotonicMs();
@@ -14,6 +15,9 @@ Json observationSchema(const Graph &graph, const Json &trackedDefinitions = Json
                        const Json &trackedFields = Json::array(),
                        const Json &excluded = Json::array());
 Json actionSchema(const Json &buttons);
+// The keys a policy holds, less any that would make a Windows shortcut with a modifier it holds (Alt with
+// Tab, Esc, F4 or Space; Ctrl with Esc): those switch, close or leave the game. The modifier is still held.
+std::set<int> withoutShortcuts(std::set<int> keys);
 class ActionTimeline {
 public:
   void reset(double timestamp, const Json &buttons, bool focused);

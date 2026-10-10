@@ -23,6 +23,12 @@ struct Track {
   // (its top-left corner, followed by corners) may move. Negative looks through the whole frame
   // every time. Multi-match always looks through the whole frame.
   int reach = -1;
+  // Where an object not within its reach is looked for: further and further out in the same frame until
+  // it's found or the whole frame is searched (false), or one step further out each frame it isn't found,
+  // back to its reach once it is (true): a frame costs less, and a lost object takes a few frames to find.
+  bool widenEachFrame = false;
+  // How much further out each step looks: its reach times this (a reach of under 16 px grows from 16)
+  double widenBy = 2;
   bool fitting() const { return !multi && !topLeft.empty() && !bottomRight.empty(); }
   bool empty() const { return !fitting() && templates.empty(); }
 };
@@ -54,6 +60,7 @@ private:
     std::optional<cv::Rect> last; // where the object was last found, in frame px
     std::string winner;           // the template it was found as, which keeps winning unless clearly beaten
     std::deque<std::pair<double, cv::Point2d>> path; // where the box's centre was lately: (capture ms, px)
+    int widened = -1; // widening each frame: how far the last frame looked without finding it; -1 once found
   };
   Json follow(const Track &track, History &history, Pyramid &pyramid, const CapturedFrame &frame);
   uint64_t generation_ = 0;

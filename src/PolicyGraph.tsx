@@ -6,7 +6,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import AliasInput from './FormulaAliasInput';
 import { buttonLabel } from './Keyboard';
-import { cleanError, correctionsOf, deleteVersions, meanF1, newestFirst, percent, playingText, POLICY_VERSION, type PlayStatus, type PolicyVersion, type Schema } from './policyPlay';
+import { cleanError, correctionShareHint, correctionsOf, DEFAULT_CORRECTION_SHARE, deleteVersions, MAX_CORRECTION_SHARE, meanF1, newestFirst, percent, playingText, POLICY_VERSION, type PlayStatus, type PolicyVersion, type Schema } from './policyPlay';
 import { NEW_INPUT, aliasFrom, renameIn } from './formulaInputs';
 import { PreservedTextarea, PreservedInput } from './PreservedInputs';
 import {
@@ -305,6 +305,14 @@ function PolicyNode({ id, data, selected }: NodeProps<GraphNode>) {
         <div className="pg-hint">{corrections.length ? `${corrections.length} correction${corrections.length === 1 ? '' : 's'} recorded` : 'No corrections yet'}
           {corrections.length > 0 && <button className="nodrag modal-btn pg-inline" disabled={!compiled?.request || !!g.training || g.recordingNow}
             onClick={() => g.train(id, true)}>Train with corrections</button>}</div>
+        {corrections.length > 0 && (() => {
+          const share = d.correctionShare ?? DEFAULT_CORRECTION_SHARE;
+          return <label className="nodrag pg-share" title={correctionShareHint}>They count
+            <input type="range" aria-label="How much the corrections count" min={0} max={MAX_CORRECTION_SHARE} step={.05} value={share}
+              disabled={!!g.training} onChange={e => g.update(id, { correctionShare: Number(e.target.value) })} />
+            <b>{share === 0 ? 'as plain rows' : `${percent(share)} of training`}</b>
+          </label>;
+        })()}
       </>}
     </div>
   </div>;
@@ -476,7 +484,7 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
   const train = useCallback(async (id: string, withCorrections = false) => {
     const c = compiled[id];
     if (!c?.request) return;
-    const node = nodes.find(n => n.id === id)!, epochs = (node.data as PolicyData).epochs;
+    const node = nodes.find(n => n.id === id)!, { epochs, correctionShare } = node.data as PolicyData;
     let recordingIds = c.request.recordingIds;
     if (withCorrections) {
       const own = new Set(versions.filter(v => v.policy?.id === id).map(v => v.id));
@@ -484,7 +492,7 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     }
     setTraining({ nodeId: id, progress: null }); setError('');
     try {
-      await window.bridge.policy.invoke('train', { ...c.request, recordingIds, epochs });
+      await window.bridge.policy.invoke('train', { ...c.request, recordingIds, epochs, correctionShare: correctionShare ?? DEFAULT_CORRECTION_SHARE });
       await refresh();
     } catch (e) { setError(cleanError(e)); }
     setTraining(null);

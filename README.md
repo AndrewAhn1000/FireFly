@@ -49,14 +49,13 @@ React UI (src/)  ──►  Electron main (electron/)  ──►  native runtime
 
 ## Requirements
 
-- Windows 10 or 11.
-- [Node.js](https://nodejs.org/) (current LTS).
-- Python 3.12, as `py -3.12`.
-- Visual Studio 2022 (or its Build Tools) with the C++ workload, CMake 3.24 or newer, and git.
-- **Optional:**
-  - A DirectX 12 GPU, to run models on the GPU (DirectML).
-  - An NVIDIA GPU with a CUDA build of PyTorch, for faster training. The setup script installs the CPU build.
-  - An OCR language installed in Windows (Settings › Time & language › Language & region), to read text from the screen.
+To **use** FireFly, you only need Windows 10 or 11 and the installer below. Optionally:
+
+- A DirectX 12 GPU, to run models on the GPU (DirectML: NVIDIA, AMD or Intel).
+- An NVIDIA GPU, to train on the GPU (CUDA).
+- An OCR language installed in Windows (Settings › Time & language › Language & region), to read text from the screen.
+
+To **build it from source**, you also need the tools under [Building from source](#building-from-source).
 
 ## Download
 
@@ -67,21 +66,33 @@ Get the Windows installer, `FireFly-Setup-<version>.exe`, from the [latest relea
 
 ## Building from source
 
-Install the JavaScript dependencies, then set up and build the native runtime:
+FireFly is built from three parts, each with its own tools: a C++ runtime (built with OpenCV, Lua and SQLite, which vcpkg compiles from source), ONNX Runtime to run models, and a Python environment with PyTorch for training.
+
+### 1. Install the tools
+
+| Tool | Install with |
+|---|---|
+| [Node.js](https://nodejs.org/) 20 or newer | `winget install --id OpenJS.NodeJS.LTS -e` |
+| Git | `winget install --id Git.Git -e` |
+| CMake 3.24 or newer | `winget install --id Kitware.CMake -e` |
+| Visual Studio 2022 Build Tools, C++ workload | `winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
+| Python 3.12, as `py -3.12` | `winget install --id Python.Python.3.12 -e` |
+
+Visual Studio 2022 itself works too, with **Desktop development with C++** ticked. Close and reopen your terminal after installing, so it finds the new tools.
+
+### 2. Set up
+
+From the repository folder:
 
 ```powershell
-npm install
-npm run native:setup       # pins vcpkg and its packages into .tools/
-npm run native:onnxruntime # ONNX Runtime (CPU); or native:onnxruntime:gpu for DirectML
-npm run native:configure   # the TEMP folder's path must not contain spaces
-npm run native:build
+npm run setup
 ```
 
-Set up Python (a `.venv` with PyTorch, ONNX and Ultralytics):
+It checks the tools first and says how to install any that are missing (`npm run setup -- -Install` installs them with winget). Then it installs the JavaScript packages, builds the native runtime with ONNX Runtime (DirectML, so models can run on the GPU as well as the CPU), and makes the Python `.venv`. The first run builds OpenCV, which takes a while; later runs reuse it. Each step is one of the npm scripts in `package.json` (`native:setup`, `native:onnxruntime:gpu`, `native:configure`, `native:build`, `python:setup`), so you can run any of them again on its own.
 
-```powershell
-npm run python:setup
-```
+The `.venv` gets the CPU build of PyTorch. To train on an NVIDIA GPU, the **Train** tab shows the command that installs the CUDA build that suits your card. Running `npm run setup` again keeps it.
+
+### 3. Run
 
 Run the app:
 
@@ -99,6 +110,13 @@ npm run dev
 ```powershell
 $env:NODE_ENV='development'; npx electron .
 ```
+
+### Troubleshooting
+
+- **"The term 'git' (or 'cmake') is not recognized".** The tool isn't installed, or it was installed after the terminal was opened. Open a new terminal, or restart your editor if the terminal is inside one. `npm run setup` also looks for tools installed since the terminal opened.
+- **Only "CPU" is offered when running a model, though the Train tab finds the GPU.** Training and running models use the GPU in different ways: training through PyTorch and CUDA, running models through ONNX Runtime and DirectML. A native runtime built with only `native:onnxruntime` (the CPU build) can't use the GPU. Run `npm run native:onnxruntime:gpu`, `npm run native:configure` and `npm run native:build`, then restart FireFly.
+- **`native:configure` fails with "expected this path to exist after extracting".** One of vcpkg's downloaded tools is incomplete. Delete `%LOCALAPPDATA%\firefly-vcpkg-downloads\tools` and configure again.
+- **`native:configure` can't find a compiler ("No CMAKE_CXX_COMPILER could be found").** The Visual Studio C++ workload is missing. Install the Build Tools as above, or add **Desktop development with C++** in the Visual Studio Installer.
 
 ## A first session
 

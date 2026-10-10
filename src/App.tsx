@@ -9,6 +9,7 @@ import type { GpuInfo } from './bridge';
 import PlayPanel from './PlayPanel';
 import { inferenceChoice, type InferenceDevice } from './inference';
 import Keyboard, { BUTTONS, MAX_BUTTONS } from './Keyboard';
+import { copySetup, savedSetups, setupOf, SETUP_PARTS, type SavedSetup, type SetupPart } from './windowSetup';
 import Transport from './Transport';
 import GraphLibrary from './GraphLibrary';
 import { stateValueError } from './stateValues';
@@ -47,7 +48,7 @@ interface Corners         { tl: Template; br: Template; size: number; at: { x: n
 // match: template matching moves the box to follow its object; without it the box stays where it was put
 // fit: the box also takes the size of the object, found by its corners rather than by a template of the whole
 // flow: the values read from what's inside the box (see flows.ts)
-interface Region          { id: string; label: string; x: number; y: number; w: number; h: number; templates: Template[]; source?: 'manual' | 'script'; script?: string; scriptWidth?: number; scriptHeight?: number; visible?: boolean; match?: boolean; multiMatch?: boolean; matchThreshold?: number; searchReach?: number | 'window'; matchOn?: MatchLook; fit?: boolean; corners?: Corners; flow?: Flow; }
+interface Region          { id: string; label: string; x: number; y: number; w: number; h: number; templates: Template[]; source?: 'manual' | 'script'; script?: string; scriptWidth?: number; scriptHeight?: number; visible?: boolean; match?: boolean; multiMatch?: boolean; matchThreshold?: number; searchReach?: number | 'window'; searchWiden?: 'frame' | 'frames'; searchWidenBy?: number; matchOn?: MatchLook; fit?: boolean; corners?: Corners; flow?: Flow; }
 interface ScriptBox       { x: number; y: number; w: number; h: number; }
 interface ScriptRegionReading {
   value: unknown;
@@ -141,10 +142,15 @@ const matchThreshold = (r: Region) => r.matchThreshold ?? (r.multiMatch || fitsC
 // every frame. Multi-match always looks through the whole window; corners look near where they were by default.
 const searchReach = (r: Region): number | null =>
   r.multiMatch && !fitsCorners(r) ? null : r.searchReach === 'window' ? null : r.searchReach ?? (fitsCorners(r) ? CORNER_REACH : null);
+// Not near where it was, each step of the search looks this many times as far as the last (tracking.cpp), unless chosen
+const WIDEN_BY = 2;
 // Where a followed region's object was last found, as fractions of the frame
 interface LiveBox         { x: number; y: number; w: number; h: number; }
 // A region where it is on screen: at its object's last place while it follows one, else where it was put
 const placedAt = (r: Region, live: Record<string, LiveBox>): Region => live[r.id] ? { ...r, ...live[r.id] } : r;
+// What a window has saved, in a few words (windowSetup.ts)
+const plural = (n: number, what: string) => `${n} ${what}${n === 1 ? '' : 's'}`;
+const setupSummary = (s: SavedSetup) => [plural(s.states, 'state'), plural(s.regions, 'region'), ...(s.graphs ? [plural(s.graphs, 'graph')] : [])].join(', ');
 // A copy of a per-region record without one region, or with none at all
 function without<T>(record: Record<string, T>, regionId?: string): Record<string, T> {
   if (regionId === undefined) return {};
@@ -190,6 +196,10 @@ const DEFAULT_SCRIPT = `-- Available functions:
 --   read_u8/i8/u16/i16/u32/i32/u64/i64/f32/f64(addr)
 --   read_ptr(addr)                  8-byte pointer dereference
 --   read_str(addr, maxLen)          null-terminated UTF-8
+--   read_bytes(addr, count)         a block in one read; take values out with
+--                                   string.unpack("<i4i4", read_bytes(addr, 8))
+-- A run makes at most 4096 reads: walk a list once, and read a structure with
+-- read_bytes rather than a field at a time.
 -- Return any number, boolean, string, or table.
 
 local base = get_module_base("game.exe") + 0x00000000  -- replace offset
@@ -364,7 +374,12 @@ export default function App() {
     try { localStorage.setItem('firefly-last-window', selectedTitle); } catch { /* quota */ }
   }, [selectedTitle]);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
-  const [confirmDialog, setConfirmDialog] = useState<{ windowId: string; title: string } | null>(null);
+  // Starting a session; `from` is another window whose setup a window with none starts from
+  const [confirmDialog, setConfirmDialog] = useState<{ windowId: string; title: string; from?: string } | null>(null);
+  // Copying another window's setup into this one's (windowSetup.ts)
+  const [importDialog, setImportDialog] = useState<{ from: string; parts: SetupPart[] } | null>(null);
+  // Bumped when the Graphs' saved library changes under them, so they're read again
+  const [graphsVersion, setGraphsVersion] = useState(0);
   const [createDialog, setCreateDialog]   = useState<{ id?: string; label: string; templates: Template[]; source: 'manual' | 'script'; script: string; scriptWidth?: number; scriptHeight?: number } | null>(null);
   const regionScriptTestVersion = useRef(0);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -682,6 +697,8 @@ export default function App() {
       multiMatch: false,
       threshold: region ? matchThreshold(region) : 0.75,
       reach: region ? searchReach(region) ?? -1 : -1,
+      widenEachFrame: region?.searchWiden === 'frames',
+      widenBy: region?.searchWidenBy ?? WIDEN_BY,
       hint: corners.at,
       largest: { w: Math.min(1, corners.box.w * FIT_GROWTH), h: Math.min(1, corners.box.h * FIT_GROWTH) },
     } : {
@@ -691,6 +708,9 @@ export default function App() {
       preprocess: region?.matchOn ?? 'color',
       threshold: region ? matchThreshold(region) : 0.75,
       reach: region ? searchReach(region) ?? -1 : -1,
+      // Not near where it was: further out in the same frame until found (the default), or a step a frame
+      widenEachFrame: region?.searchWiden === 'frames',
+      widenBy: region?.searchWidenBy ?? WIDEN_BY, // each step looks this many times as far
       // Looking only near where it was starts from where the box is now
       ...(region ? { hint: (({ x, y, w, h }) => ({ x, y, w, h }))(placedAt(region, liveBoxesRef.current)) } : {}),
     }).catch(() => {});
@@ -2066,7 +2086,7 @@ export default function App() {
         ...scriptStates.map(async s => {
           try {
             const res = await runLua(s.script!, s.scriptWidth ?? 0, s.scriptHeight ?? 0);
-            if (res.value == null) readErrors[s.id] = 'Lua returned nil; keeping the last value.';
+            if (res.value == null) readErrors[s.id] = 'Lua returned nil: the script ran, but found nothing to return (such as a pointer that is 0 right now); keeping the last value.';
             else { stateUpdates[s.id] = res.value; readErrors[s.id] = undefined; }
           } catch (error) { readErrors[s.id] = String(error); }
         }),
@@ -2112,17 +2132,9 @@ export default function App() {
     } catch (e) { stopping.current = false; setError(String(e)); }
   }, [recording]);
 
-  const selectWindow = useCallback(async (id: string, title: string) => {
-    if (captureActive) {
-      stopping.current = true;
-      try {
-        if (recording?.active) await window.bridge.invoke('record.stop');
-        await window.bridge.invoke('stop');
-        setCaptureActive(false); setRecording(null); setFrameUrl(null);
-      } catch { stopping.current = false; }
-    }
-    setSelectedId(id);
-    setSelectedTitle(title);
+  // A window's setup as saved under its title (see Persistence): its Regions, States and their folders, and
+  // what it records. What was read, tried or selected for the window before is let go.
+  const loadSetup = useCallback((title: string) => {
     luaRegionSnapshots.current = {};
     ++scriptTestVersion.current;
     setStateDialog(null); setScriptPreview(null); setSelectedStateId(null);
@@ -2147,10 +2159,25 @@ export default function App() {
       const saved = localStorage.getItem(`firefly-recorded-${encodeURIComponent(title)}`);
       setRecordChoices(saved ? JSON.parse(saved) as Record<string, boolean> : {});
     } catch { setRecordChoices({}); }
-    setStateValues({}); setStateReadErrors({}); setFrameSize(null);
+    setStateValues({}); setStateReadErrors({});
     regionReadingsRef.current = {}; setRegionReadings({});
     stopAllTracking();
     ix.current = { mode:'idle', selId:null, selBoxIdx:null, drawStart:null, drawEnd:null, moveStart:null, orig:null, working:null, handle:null };
+  }, [setRegions, stopAllTracking]);
+
+  const selectWindow = useCallback(async (id: string, title: string) => {
+    if (captureActive) {
+      stopping.current = true;
+      try {
+        if (recording?.active) await window.bridge.invoke('record.stop');
+        await window.bridge.invoke('stop');
+        setCaptureActive(false); setRecording(null); setFrameUrl(null);
+      } catch { stopping.current = false; }
+    }
+    setSelectedId(id);
+    setSelectedTitle(title);
+    loadSetup(title);
+    setFrameSize(null);
     try {
       await applyLiveGraph(runningModelsRef.current);
       await window.bridge.invoke('start', { windowId: id });
@@ -2158,7 +2185,18 @@ export default function App() {
       // Every region set to follow its object picks that up again
       for (const r of regionsRef.current) if (r.match && hasAnchors(r)) startTracking(r.id);
     } catch (e) { setError(String(e)); }
-  }, [captureActive, recording, setRegions, applyLiveGraph, startTracking, stopAllTracking]);
+  }, [captureActive, recording, applyLiveGraph, startTracking, loadSetup]);
+
+  // Another window's setup in place of this one's, for the parts chosen: saved under this window's title, then
+  // read again as when a session starts. The capture carries on.
+  const importSetup = useCallback((from: string, parts: SetupPart[]) => {
+    if (!selectedTitle || !parts.length) return;
+    try { copySetup(localStorage, from, selectedTitle, parts); }
+    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
+    loadSetup(selectedTitle);
+    if (parts.includes('graphs')) setGraphsVersion(v => v + 1);
+    if (captureActive) for (const r of regionsRef.current) if (r.match && hasAnchors(r)) startTracking(r.id);
+  }, [selectedTitle, captureActive, loadSetup, startTracking]);
 
   const startRecording = useCallback(async () => {
     const buttons = BUTTON_DEFS.filter(b => activeButtons.has(b.id)).map(({ id, vk }) => ({ id, vk }));
@@ -2649,7 +2687,41 @@ export default function App() {
                                     )}
                                     <div className="rtp-hint">{reach === null
                                       ? 'Looks through the whole window every frame, so the box goes wherever the best match is.'
-                                      : `Looks only this far from where the object was last found, so the box can't jump to lookalikes elsewhere${fitsCorners(reg) ? '' : ', and template states only see what\'s near it'}. It also looks ahead, where the object was heading. If the object isn't there, the same frame looks twice as far, and further, until it's found or the whole window has been searched, so it's found on the frame it's in.`}</div>
+                                      : `Looks only this far from where the object was last found, so the box can't jump to lookalikes elsewhere${fitsCorners(reg) ? '' : ', and template states only see what\'s near it'}. It also looks ahead, where the object was heading.`}</div>
+                                    {reach !== null && (() => {
+                                      const widen = reg.searchWiden ?? 'frame', by = reg.searchWidenBy ?? WIDEN_BY;
+                                      const setWiden = (v: 'frame' | 'frames') => {
+                                        setRegions(prev => prev.map(x => x.id === reg.id ? { ...x, searchWiden: v } : x));
+                                        if (isTracked) syncTemplates(reg.id);
+                                      };
+                                      const setBy = (v: number) => {
+                                        setRegions(prev => prev.map(x => x.id === reg.id ? { ...x, searchWidenBy: v } : x));
+                                        if (isTracked) syncTemplatesSoon(reg.id);
+                                      };
+                                      const times = `${Number.isInteger(by) ? by : by.toFixed(2).replace(/0$/, '')}×`;
+                                      return <>
+                                        <label className="rtp-lbl">When it isn't there</label>
+                                        <div role="radiogroup" aria-label="When it isn't near where it was">
+                                          <label className="rtp-checkbox-row">
+                                            <input type="radio" name={`widen-${reg.id}`} checked={widen === 'frame'} onChange={() => setWiden('frame')} />
+                                            Search the frame until it's found
+                                          </label>
+                                          <label className="rtp-checkbox-row">
+                                            <input type="radio" name={`widen-${reg.id}`} checked={widen === 'frames'} onChange={() => setWiden('frames')} />
+                                            Widen the search a step each frame
+                                          </label>
+                                        </div>
+                                        <label className="rtp-lbl">Each step looks</label>
+                                        <div className="rtp-threshold-row">
+                                          <input type="range" min={1.25} max={4} step={0.25} aria-label="How much further each step looks"
+                                            value={by} onChange={e => setBy(Number(e.target.value))} />
+                                          <span className="rtp-threshold-val">{times} as far</span>
+                                        </div>
+                                        <div className="rtp-hint">{widen === 'frame'
+                                          ? `The same frame looks ${times} as far, and ${times} as far again, until the object is found or the whole window has been searched: it's found on the frame it's in, but every frame it's missing costs a search of the whole window. Smaller steps find it nearer where it was, rather than a lookalike further out, with more searches.`
+                                          : `Each frame it isn't found looks ${times} as far as the last, and once it's found the search is back to its reach: a frame costs about one search, but a lost object takes a few frames to find (fewer with bigger steps), and one that's gone keeps the search at the whole window until it's back.`}</div>
+                                      </>;
+                                    })()}
                                   </>
                                 );
                               })()}
@@ -2991,6 +3063,7 @@ export default function App() {
               )}
             </div>
             <GraphLibrary
+              key={`${selectedTitle || lastTitle || 'any'}:${graphsVersion}`}
               regions={regions}
               active={viewTab === 'graph'}
               online={ready}
@@ -3476,7 +3549,11 @@ export default function App() {
           <div className="inspector">
 
             <div className="insp-section">
-              <div className="insp-section-hd"><span>Capture Target</span></div>
+              <div className="insp-section-hd"><span>Capture Target</span>
+                {selectedTitle && <button className="insp-section-action" disabled={isRecording}
+                  title={isRecording ? 'Stop recording first' : 'Copy the States, Regions, Lua scripts, Graphs or recording setup of another window, such as the same game titled differently'}
+                  onClick={() => setImportDialog({ from: savedSetups(localStorage, selectedTitle)[0]?.title ?? '', parts: SETUP_PARTS.map(p => p.id) })}>Import…</button>}
+              </div>
               <div className="insp-row">
                 <span className="insp-lbl">Window</span>
                 <span className={`insp-val ${!selectedWin ? 'insp-val-none' : ''}`}>{selectedWin?.title ?? 'None'}</span>
@@ -3682,7 +3759,9 @@ export default function App() {
                             {formatStateValue(s, val)}
                           </span>
                         )}
-                        {!s.off && visibleStateErrors[s.id] && <span className="state-read-status" title={visibleStateErrors[s.id]}>{hasValue ? 'Last value' : 'Read failed'}</span>}
+                        {/* A script returning nil ran and found nothing: that isn't a failed read, and said so it sent people looking for one */}
+                        {!s.off && visibleStateErrors[s.id] && <span className="state-read-status" title={visibleStateErrors[s.id]}>
+                          {hasValue ? 'Last value' : /returned (nil|no value)/.test(visibleStateErrors[s.id] ?? '') ? 'No value' : 'Read failed'}</span>}
                         <button className="state-edit" aria-label={`Edit ${s.name}`} title={isRecording ? 'Stop recording before editing States' : 'Edit State'} disabled={isRecording}
                           onClick={ev => { ev.stopPropagation(); editState(s); }}>Edit</button>
                         <button className="state-del" onClick={ev => { ev.stopPropagation(); setGameStates(prev => prev.filter(x => x.id !== s.id)); if (isOpen) setSelectedStateId(null); }}>✕</button>
@@ -4127,13 +4206,52 @@ export default function App() {
         </div>
       )}
 
+      {/* Importing another window's setup into this one's */}
+      {importDialog && selectedTitle && (() => {
+        const dlg = importDialog, sources = savedSetups(localStorage, selectedTitle), own = setupOf(localStorage, selectedTitle);
+        const toggle = (part: SetupPart, on: boolean) => setImportDialog({ ...dlg, parts: on ? [...dlg.parts, part] : dlg.parts.filter(p => p !== part) });
+        const losing = [
+          dlg.parts.includes('states') && own.states + own.regions > 0 && `its ${own.states} state${own.states !== 1 ? 's' : ''} and ${own.regions} region${own.regions !== 1 ? 's' : ''}`,
+          dlg.parts.includes('graphs') && own.graphs > 0 && `its ${own.graphs} graph${own.graphs !== 1 ? 's' : ''}`,
+          dlg.parts.includes('recording') && 'its recording setup',
+        ].filter(Boolean) as string[];
+        return (
+          <div className="modal-overlay" onClick={() => setImportDialog(null)}>
+            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import a setup">
+              <div className="modal-header"><span className="modal-title">Import a setup</span></div>
+              <div className="modal-form">
+                {sources.length === 0 ? <div className="modal-form-hint">No other window has States or Regions saved. A window’s setup is kept under its title, so start a session on it once and build one there first.</div> : <>
+                  <label className="modal-form-lbl" htmlFor="import-from">From the window</label>
+                  <select id="import-from" className="modal-form-select" aria-label="Import from" value={dlg.from} onChange={e => setImportDialog({ ...dlg, from: e.target.value })}>
+                    {sources.map(s => <option key={s.title} value={s.title}>{s.title} ({setupSummary(s)})</option>)}
+                  </select>
+                  <span className="modal-form-lbl">What to import</span>
+                  {SETUP_PARTS.map(p => <label key={p.id} className="import-part" title={p.hint}>
+                    <input type="checkbox" checked={dlg.parts.includes(p.id)} onChange={e => toggle(p.id, e.target.checked)} />
+                    <span>{p.label}<small>{p.hint}</small></span>
+                  </label>)}
+                  <div className="modal-form-hint">
+                    {losing.length ? `Replaces ${losing.join(', ')} for “${selectedTitle}”.` : `Copied to “${selectedTitle}”.`} The window imported from keeps its own.
+                  </div>
+                </>}
+              </div>
+              <div className="modal-actions">
+                <button className="modal-btn modal-btn-cancel" onClick={() => setImportDialog(null)}>Cancel</button>
+                <button className="modal-btn modal-btn-confirm" disabled={!sources.some(s => s.title === dlg.from) || !dlg.parts.length || isRecording}
+                  onClick={() => { setImportDialog(null); importSetup(dlg.from, dlg.parts); }}>Import</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Session confirmation dialog */}
       {confirmDialog && (() => {
         const dlg = confirmDialog;
         const thumb = thumbnails[dlg.title];
-        const savedKey = `firefly-regions-${encodeURIComponent(dlg.title)}`;
-        let savedCount = 0;
-        try { const s = localStorage.getItem(savedKey); if (s) savedCount = (JSON.parse(s) as Region[]).length; } catch {}
+        const own = setupOf(localStorage, dlg.title), savedCount = own.regions;
+        // A window with nothing of its own can start from another's, as the same game titled differently
+        const others = own.states + own.regions === 0 ? savedSetups(localStorage, dlg.title) : [];
         return (
           <div className="modal-overlay" onClick={() => setConfirmDialog(null)}>
             <div className="modal-card" onClick={e => e.stopPropagation()}>
@@ -4145,13 +4263,29 @@ export default function App() {
               {captureActive && selectedWin && (
                 <div className="modal-warn">Stops current capture of "{selectedWin.title}"</div>
               )}
-              {savedCount > 0
-                ? <div className="modal-session-info">Resuming — {savedCount} region{savedCount !== 1 ? 's' : ''} from last session</div>
+              {own.states + own.regions > 0
+                ? <div className="modal-session-info">Resuming — {own.states} state{own.states !== 1 ? 's' : ''} and {savedCount} region{savedCount !== 1 ? 's' : ''} from last session</div>
                 : <div className="modal-session-info modal-session-new">New session</div>
               }
+              {others.length > 0 && <div className="modal-form" style={{ paddingTop: 0 }}>
+                <label className="modal-form-lbl" htmlFor="start-from">Start with the setup of</label>
+                <select id="start-from" className="modal-form-select" aria-label="Start with the setup of" value={dlg.from ?? ''}
+                  onChange={e => setConfirmDialog({ ...dlg, from: e.target.value || undefined })}>
+                  <option value="">Nothing: start empty</option>
+                  {others.map(s => <option key={s.title} value={s.title}>{s.title} ({setupSummary(s)})</option>)}
+                </select>
+                <div className="modal-form-hint">Its States, Regions and Lua scripts, Graphs and recording setup are copied to this window. That window keeps its own.</div>
+              </div>}
               <div className="modal-actions">
                 <button className="modal-btn modal-btn-cancel" onClick={() => setConfirmDialog(null)}>Cancel</button>
-                <button className="modal-btn modal-btn-confirm" onClick={() => { setConfirmDialog(null); selectWindow(dlg.windowId, dlg.title); }}>Start Session</button>
+                <button className="modal-btn modal-btn-confirm" onClick={() => {
+                  setConfirmDialog(null);
+                  if (dlg.from) {
+                    try { copySetup(localStorage, dlg.from, dlg.title, SETUP_PARTS.map(p => p.id)); setGraphsVersion(v => v + 1); }
+                    catch (e) { setError(`Could not copy the setup: ${String(e)}`); }
+                  }
+                  selectWindow(dlg.windowId, dlg.title);
+                }}>Start Session</button>
               </div>
             </div>
           </div>
