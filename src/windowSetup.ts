@@ -81,3 +81,58 @@ export function copySetup(store: Store, from: string, to: string, parts: SetupPa
     });
   }
 }
+
+// ── A setup as a file, to share with someone else (Export… and Import… from a file) ────────────────────────
+// Its parts' keys, with the window's title written as WINDOW, so it goes under whatever window it's imported
+// for (the other person's game window may well be titled differently).
+
+export const WINDOW = '{window}';
+const PART_OF: [RegExp, SetupPart][] = [
+  [/^firefly-(states|state-folders|regions)-\{window\}$/, 'states'],
+  [/^firefly-(record-setup|recorded)-\{window\}$/, 'recording'],
+  [/^firefly-policy-graph-\{window\}(-view|-library|-document-[\w-]+)?$/, 'graphs'],
+];
+// The part a file's key belongs to, or null for one FireFly doesn't import
+export const partOfKey = (key: string): SetupPart | null => PART_OF.find(([re]) => re.test(key))?.[1] ?? null;
+
+const keysFor = (store: Store, title: string, part: SetupPart) => part === 'graphs' ? graphKeys(store, title) : keysOf(title)[part];
+
+export interface SetupFile { entries: Record<string, string>; parts: SetupPart[]; cleared: number }
+
+// A window's setup, for the parts chosen, as a file's entries. The folders Dataset Output nodes save into are
+// paths on this PC (with its user name, and of no use on another), so they're left empty: `cleared` counts them.
+export function exportSetup(store: Store, title: string, parts: SetupPart[]): SetupFile {
+  const entries: Record<string, string> = {}, mine = enc(title);
+  let cleared = 0;
+  for (const part of parts) for (const key of keysFor(store, title, part)) {
+    let value = store.getItem(key);
+    if (value === null) continue;
+    const at = key.indexOf(mine), relative = key.slice(0, at) + WINDOW + key.slice(at + mine.length);
+    if (part === 'graphs' && /-document-[\w-]+$/.test(relative) && !relative.endsWith('-view')) {
+      try {
+        const doc = JSON.parse(value) as { nodes?: { data?: { kind?: string; directory?: string } }[] };
+        for (const n of doc.nodes ?? []) if (n.data?.kind === 'output' && n.data.directory) { n.data.directory = ''; cleared++; }
+        value = JSON.stringify(doc);
+      } catch { /* not a graph: as it is */ }
+    }
+    entries[relative] = value;
+  }
+  return { entries, parts: parts.filter(p => Object.keys(entries).some(k => partOfKey(k) === p)), cleared };
+}
+
+// What a file's entries hold, as a window's setup is described
+export function fileSummary(entries: Record<string, string>): SavedSetup & { parts: SetupPart[] } {
+  const store: Store = { length: 0, key: () => null, getItem: k => entries[k.replace(enc(WINDOW), WINDOW)] ?? null, setItem() {}, removeItem() {} };
+  const parts = SETUP_PARTS.map(p => p.id).filter(p => Object.keys(entries).some(k => partOfKey(k) === p));
+  return { ...setupOf(store, WINDOW), parts };
+}
+
+// A file's entries as `title`'s setup, for the parts chosen, in place of what it had for them (as copySetup
+// does). Keys FireFly doesn't import are ignored.
+export function importSetupFile(store: Store, title: string, entries: Record<string, string>, parts: SetupPart[]) {
+  for (const part of parts) {
+    for (const key of keysFor(store, title, part)) store.removeItem(key);
+    for (const [key, value] of Object.entries(entries))
+      if (partOfKey(key) === part && typeof value === 'string') store.setItem(key.replace(WINDOW, enc(title)), value);
+  }
+}

@@ -43,6 +43,13 @@ contextBridge.exposeInMainWorld('bridge', {
     pause:            ()       => ipcRenderer.invoke('training:pause'),
     unpause:          ()       => ipcRenderer.invoke('training:unpause'),
   },
+  // A window's setup as a file to share (electron/setupFile.cjs)
+  setup: {
+    exportFile:    (params)          => ipcRenderer.invoke('setup:export', params),
+    openFile:      ()                => ipcRenderer.invoke('setup:open'),
+    installModels: (token, indexes)  => ipcRenderer.invoke('setup:install-models', token, indexes),
+    close:         (token)           => ipcRenderer.invoke('setup:close', token),
+  },
   models: {
     list:   ()           => ipcRenderer.invoke('models:list'),
     import: (src, hints) => ipcRenderer.invoke('models:import', src, hints),

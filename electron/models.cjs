@@ -309,6 +309,14 @@ function updateModel(root, id, patch) {
     meta.flow = validateFlow(patch.flow);
     delete meta.overlay; // replaced by the flow
   }
+  // How it was trained and scored, as a setup file brings it (its folders aren't kept: they were another PC's)
+  if (patch.training !== undefined) {
+    const t = patch.training;
+    if (t !== null && (typeof t !== 'object' || Array.isArray(t))) throw new Error('Training details must be an object');
+    const number = v => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    meta.training = t === null ? null : { dataDir: null, epochs: number(t.epochs), bestEpoch: number(t.bestEpoch), valIou: number(t.valIou),
+      map50: number(t.map50), map: number(t.map), precision: number(t.precision), recall: number(t.recall) };
+  }
   writeMeta(dir, meta);
   return withPaths(root, meta);
 }

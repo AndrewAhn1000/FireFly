@@ -12,6 +12,12 @@ export interface GpuInfo {
   wheel?: string | null;
 }
 
+// What a setup file holds (electron/setupFile.cjs), without its models' bytes
+export interface SetupFileSummary {
+  window: string; exportedAt: string | null; app: string | null; entries: Record<string, string>; parts: string[];
+  models: { index: number; name: string; kind: 'segmentation' | 'detector'; classes?: string[]; size: number }[];
+}
+
 interface Bridge {
   invoke(op: string, params?: Record<string, unknown>): Promise<unknown>;
   pickFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null>;
@@ -37,6 +43,12 @@ interface Bridge {
     datasetDelete(directory: string, relative: string): Promise<{ files: number; rows: number; rowsError: string }>;
   };
   // Behaviour-cloning policies: train, list and play them (events: 'policy:event', 'play:status')
+  setup: {
+    exportFile(params: { title: string; entries: Record<string, string>; parts: string[]; cleared: number; modelIds: string[] }): Promise<{ ok: boolean; canceled?: boolean; error?: string; path?: string; size?: number; models?: number }>;
+    openFile(): Promise<{ ok: boolean; canceled?: boolean; error?: string; token?: string; summary?: SetupFileSummary; path?: string }>;
+    installModels(token: string, indexes: number[]): Promise<{ ok: boolean; error?: string; models?: { name: string; ok: boolean; existing?: boolean; id?: string; error?: string }[] }>;
+    close(token: string): Promise<void>;
+  };
   policy: {
     invoke(op: string, params?: Record<string, unknown>): Promise<unknown>;
     play(params: { modelId: string; windowId: string; corrections?: boolean; graphId?: string }): Promise<{ ok: boolean; error?: string }>;

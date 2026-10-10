@@ -23,6 +23,7 @@
     "test:play-tab-ui": "electron tests/play-tab-ui.cjs",
     "test:gpu": "node --test tests/gpu.test.cjs",
     "test:gpu-ui": "electron tests/gpu-ui.cjs",
+    "test:setup-file-ui": "electron tests/setup-file-ui.cjs",
     "test:state-edit-ui": "electron tests/state-edit-ui.cjs",
     "test:region-edit-ui": "electron tests/region-edit-ui.cjs",
     "test:paused-region-edit-ui": "electron tests/paused-region-edit-ui.cjs",

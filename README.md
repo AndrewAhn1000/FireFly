@@ -128,6 +128,7 @@ $env:NODE_ENV='development'; npx electron .
 4. **Record.** In the **Recordings** tab, choose the buttons on the keyboard and what to record, press **Start recording**, then click into the game and play.
 5. **Train a policy.** In **Graphs**, drag your States into a Policy Graph, add formulas and a Recordings node, then press **Train** on the Policy node.
 6. **Play it.** In the **Play** tab, pick a version and press **Play**, or **Play and record my corrections**: take over whenever it goes wrong, and once you've corrected it, **Train a new version with my corrections**.
+7. **Share it.** **Export…** under Capture Target saves your States, Regions, graphs, recording setup and trained models as a `.firefly` file; anyone can load it with **Import… › From a file…**, whatever their game window is called.
 
 ## Project layout
 

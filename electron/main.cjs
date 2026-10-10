@@ -8,6 +8,7 @@ const { createPlay } = require('./play.cjs');
 const { createCollection } = require('./collection.cjs');
 const datasetPreview = require('./datasetPreview.cjs');
 const gpu = require('./gpu.cjs');
+const setupFile = require('./setupFile.cjs');
 
 const isDev = process.env.NODE_ENV === 'development';
 
@@ -720,6 +721,41 @@ ipcMain.handle('training:check-dataset', (_e, dataDir, kind) => {
 // --- Trained model library ---
 
 ipcMain.handle('models:list', () => models.listModels(MODELS_DIR));
+
+// A window's setup as a file to share (electron/setupFile.cjs): saved where the person chooses, and read back
+// in two steps: what it holds, to show before anything changes, and then its chosen models into the library
+// (the renderer writes the rest as the window's setup)
+ipcMain.handle('setup:export', async (_e, params) => {
+  const safe = String(params?.title ?? 'FireFly').replace(/[<>:"/\\|?*\x00-\x1f]+/g, ' ').trim().slice(0, 80) || 'FireFly';
+  const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    title: 'Export setup', defaultPath: path.join(app.getPath('documents'), `${safe}.firefly`),
+    filters: [{ name: 'FireFly setup', extensions: ['firefly'] }],
+  });
+  if (canceled || !filePath) return { ok: false, canceled: true };
+  try { return { ok: true, path: filePath, ...setupFile.writeSetupFile(filePath, { ...params, modelsDir: MODELS_DIR, appVersion: app.getVersion() }) }; }
+  catch (e) { return { ok: false, error: e.message }; }
+});
+const openedSetups = new Map(); // a setup file read, by the token the renderer imports it with
+ipcMain.handle('setup:open', async () => {
+  const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+    title: 'Import setup', properties: ['openFile'], filters: [{ name: 'FireFly setup', extensions: ['firefly'] }],
+  });
+  if (canceled || !filePaths?.[0]) return { ok: false, canceled: true };
+  try {
+    const { file, summary } = setupFile.readSetupFile(filePaths[0]);
+    const token = crypto.randomUUID();
+    openedSetups.clear(); // one at a time
+    openedSetups.set(token, file);
+    return { ok: true, token, summary, path: filePaths[0] };
+  } catch (e) { return { ok: false, error: e.message }; }
+});
+ipcMain.handle('setup:install-models', async (_e, token, indexes) => {
+  const file = openedSetups.get(token);
+  if (!file) return { ok: false, error: 'Open the setup file again' };
+  try { return { ok: true, models: await setupFile.installModels(file, Array.isArray(indexes) ? indexes : [], MODELS_DIR) }; }
+  catch (e) { return { ok: false, error: e.message }; }
+});
+ipcMain.handle('setup:close', (_e, token) => { openedSetups.delete(token); });
 
 ipcMain.handle('models:import', async (_e, src, hints) => {
   try { return { ok: true, ...(await models.importModel(MODELS_DIR, src, hints ?? {})) }; }

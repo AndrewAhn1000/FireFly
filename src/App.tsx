@@ -5,11 +5,11 @@ import ModelsPanel from './ModelsPanel';
 import OutputsPanel, { type FlowError } from './OutputsPanel';
 import ValuesPanel from './ValuesPanel';
 import RecordingsPanel from './RecordingsPanel';
-import type { GpuInfo } from './bridge';
+import type { GpuInfo, SetupFileSummary } from './bridge';
 import PlayPanel from './PlayPanel';
 import { inferenceChoice, type InferenceDevice } from './inference';
 import Keyboard, { BUTTONS, MAX_BUTTONS } from './Keyboard';
-import { copySetup, savedSetups, setupOf, SETUP_PARTS, type SavedSetup, type SetupPart } from './windowSetup';
+import { copySetup, exportSetup, fileSummary, importSetupFile, savedSetups, setupOf, SETUP_PARTS, type SavedSetup, type SetupPart } from './windowSetup';
 import Transport from './Transport';
 import GraphLibrary from './GraphLibrary';
 import { stateValueError } from './stateValues';
@@ -378,6 +378,10 @@ export default function App() {
   const [confirmDialog, setConfirmDialog] = useState<{ windowId: string; title: string; from?: string } | null>(null);
   // Copying another window's setup into this one's (windowSetup.ts)
   const [importDialog, setImportDialog] = useState<{ from: string; parts: SetupPart[] } | null>(null);
+  // Sharing a setup as a file: what goes into one, what a file opened holds and what of it to import, and what happened
+  const [exportDialog, setExportDialog] = useState<{ parts: SetupPart[]; modelIds: string[]; busy?: boolean } | null>(null);
+  const [fileImport, setFileImport] = useState<{ token: string; summary: SetupFileSummary; parts: SetupPart[]; models: number[]; busy?: boolean } | null>(null);
+  const [setupMessage, setSetupMessage] = useState('');
   // Bumped when the Graphs' saved library changes under them, so they're read again
   const [graphsVersion, setGraphsVersion] = useState(0);
   const [createDialog, setCreateDialog]   = useState<{ id?: string; label: string; templates: Template[]; source: 'manual' | 'script'; script: string; scriptWidth?: number; scriptHeight?: number } | null>(null);
@@ -2189,14 +2193,57 @@ export default function App() {
 
   // Another window's setup in place of this one's, for the parts chosen: saved under this window's title, then
   // read again as when a session starts. The capture carries on.
-  const importSetup = useCallback((from: string, parts: SetupPart[]) => {
-    if (!selectedTitle || !parts.length) return;
-    try { copySetup(localStorage, from, selectedTitle, parts); }
-    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
+  const setupImported = useCallback((parts: SetupPart[]) => {
+    if (!selectedTitle) return;
     loadSetup(selectedTitle);
     if (parts.includes('graphs')) setGraphsVersion(v => v + 1);
     if (captureActive) for (const r of regionsRef.current) if (r.match && hasAnchors(r)) startTracking(r.id);
   }, [selectedTitle, captureActive, loadSetup, startTracking]);
+  const importSetup = useCallback((from: string, parts: SetupPart[]) => {
+    if (!selectedTitle || !parts.length) return;
+    try { copySetup(localStorage, from, selectedTitle, parts); }
+    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
+    setupImported(parts);
+  }, [selectedTitle, setupImported]);
+
+  // This window's setup into a file to share: the parts chosen, and the trained models chosen with their files
+  const exportSetupFile = useCallback(async (parts: SetupPart[], modelIds: string[]) => {
+    if (!selectedTitle) return;
+    const file = exportSetup(localStorage, selectedTitle, parts);
+    const res = await window.bridge.setup.exportFile({ title: selectedTitle, entries: file.entries, parts: file.parts, cleared: file.cleared, modelIds });
+    if (res.canceled) return false;
+    if (!res.ok) { setError(`Could not export the setup: ${res.error}`); return false; }
+    setSetupMessage(`Exported to ${res.path} (${((res.size ?? 0) / 2 ** 20).toFixed(1)} MB${res.models ? `, with ${plural(res.models, 'model')}` : ''}).`
+      + (file.cleared ? ` ${plural(file.cleared, 'Dataset Output folder')} left out: ${file.cleared > 1 ? "they're" : "it's"} a place on this PC.` : ''));
+    return true;
+  }, [selectedTitle]);
+  // A setup file someone shared: what it holds first, then (on Import) its models into the library and the rest
+  // as this window's setup, in place of what it had for those parts
+  const openSetupFile = useCallback(async () => {
+    const res = await window.bridge.setup.openFile();
+    if (res.canceled) return;
+    if (!res.ok || !res.token || !res.summary) { setError(`Could not open the setup: ${res.error ?? 'unknown error'}`); return; }
+    const parts = fileSummary(res.summary.entries).parts;
+    setImportDialog(null);
+    setFileImport({ token: res.token, summary: res.summary, parts, models: res.summary.models.map(m => m.index) });
+  }, []);
+  const importSetupFromFile = useCallback(async (fi: NonNullable<typeof fileImport>) => {
+    if (!selectedTitle) return;
+    let added = '';
+    if (fi.models.length) {
+      const res = await window.bridge.setup.installModels(fi.token, fi.models);
+      if (!res.ok) { setError(`Could not add the setup's models: ${res.error}`); return; }
+      const failed = (res.models ?? []).filter(m => !m.ok), had = (res.models ?? []).filter(m => m.ok && m.existing);
+      added = [` ${plural((res.models ?? []).filter(m => m.ok && !m.existing).length, 'model')} added to Trained Models`,
+        had.length ? `, ${had.length} you already had` : '', failed.length ? `; ${failed.map(m => `“${m.name}” couldn't be added (${m.error})`).join(', ')}` : ''].join('') + '.';
+      await refreshModels();
+    }
+    try { importSetupFile(localStorage, selectedTitle, fi.summary.entries, fi.parts); }
+    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
+    void window.bridge.setup.close(fi.token);
+    setupImported(fi.parts);
+    setSetupMessage(`Imported the setup from “${fi.summary.window}”.${added}`);
+  }, [selectedTitle, setupImported, refreshModels]);
 
   const startRecording = useCallback(async () => {
     const buttons = BUTTON_DEFS.filter(b => activeButtons.has(b.id)).map(({ id, vk }) => ({ id, vk }));
@@ -3553,7 +3600,16 @@ export default function App() {
                 {selectedTitle && <button className="insp-section-action" disabled={isRecording}
                   title={isRecording ? 'Stop recording first' : 'Copy the States, Regions, Lua scripts, Graphs or recording setup of another window, such as the same game titled differently'}
                   onClick={() => setImportDialog({ from: savedSetups(localStorage, selectedTitle)[0]?.title ?? '', parts: SETUP_PARTS.map(p => p.id) })}>Import…</button>}
+                {selectedTitle && <button className="insp-section-action"
+                  title="Save this window's States, Regions, Graphs and recording setup, and trained models, as a file to share"
+                  onClick={() => {
+                    // The models this window's States read are what it needs: ticked to start with
+                    const read = new Set(gameStates.filter(s => s.source === 'model').map(s => s.output ?? ''));
+                    setExportDialog({ parts: SETUP_PARTS.map(p => p.id), modelIds: models.filter(m => modelOutputs(m).some(o => read.has(o.name))).map(m => m.id) });
+                  }}>Export…</button>}
               </div>
+              {setupMessage && <div className="insp-hint setup-message" role="status">{setupMessage}
+                <button className="setup-message-x" aria-label="Dismiss" onClick={() => setSetupMessage('')}>✕</button></div>}
               <div className="insp-row">
                 <span className="insp-lbl">Window</span>
                 <span className={`insp-val ${!selectedWin ? 'insp-val-none' : ''}`}>{selectedWin?.title ?? 'None'}</span>
@@ -4220,6 +4276,10 @@ export default function App() {
             <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import a setup">
               <div className="modal-header"><span className="modal-title">Import a setup</span></div>
               <div className="modal-form">
+                <div className="import-from-file">
+                  <button className="modal-btn" onClick={() => void openSetupFile()}>From a file…</button>
+                  <span className="modal-form-hint">A <code>.firefly</code> setup someone shared, saved with Export…</span>
+                </div>
                 {sources.length === 0 ? <div className="modal-form-hint">No other window has States or Regions saved. A window’s setup is kept under its title, so start a session on it once and build one there first.</div> : <>
                   <label className="modal-form-lbl" htmlFor="import-from">From the window</label>
                   <select id="import-from" className="modal-form-select" aria-label="Import from" value={dlg.from} onChange={e => setImportDialog({ ...dlg, from: e.target.value })}>
@@ -4239,6 +4299,90 @@ export default function App() {
                 <button className="modal-btn modal-btn-cancel" onClick={() => setImportDialog(null)}>Cancel</button>
                 <button className="modal-btn modal-btn-confirm" disabled={!sources.some(s => s.title === dlg.from) || !dlg.parts.length || isRecording}
                   onClick={() => { setImportDialog(null); importSetup(dlg.from, dlg.parts); }}>Import</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Exporting this window's setup as a file */}
+      {exportDialog && selectedTitle && (() => {
+        const dlg = exportDialog, own = setupOf(localStorage, selectedTitle);
+        const toggle = (part: SetupPart, on: boolean) => setExportDialog({ ...dlg, parts: on ? [...dlg.parts, part] : dlg.parts.filter(p => p !== part) });
+        const pick = (id: string, on: boolean) => setExportDialog({ ...dlg, modelIds: on ? [...dlg.modelIds, id] : dlg.modelIds.filter(x => x !== id) });
+        const mb = (bytes: number) => `${(bytes / 2 ** 20).toFixed(1)} MB`;
+        return (
+          <div className="modal-overlay" onClick={() => setExportDialog(null)}>
+            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Export the setup">
+              <div className="modal-header"><span className="modal-title">Export the setup of “{selectedTitle}”</span></div>
+              <div className="modal-form">
+                <span className="modal-form-lbl">What to include</span>
+                {SETUP_PARTS.map(p => <label key={p.id} className="import-part" title={p.hint}>
+                  <input type="checkbox" checked={dlg.parts.includes(p.id)} onChange={e => toggle(p.id, e.target.checked)} />
+                  <span>{p.label}{p.id === 'states' ? ` (${setupSummary({ ...own, graphs: 0 })})` : p.id === 'graphs' && own.graphs ? ` (${plural(own.graphs, 'graph')})` : ''}<small>{p.hint}</small></span>
+                </label>)}
+                <span className="modal-form-lbl">Trained models</span>
+                {models.length === 0 && <div className="modal-form-hint">None in Trained Models.</div>}
+                {models.map(m => <label key={m.id} className="import-part">
+                  <input type="checkbox" aria-label={`Include ${m.name}`} checked={dlg.modelIds.includes(m.id)} disabled={m.missing} onChange={e => pick(m.id, e.target.checked)} />
+                  <span>{m.name} <small>{m.kind === 'detector' ? 'Detector' : 'Segmentation'} · {mb(m.size)}{m.missing ? ' · its file is missing' : ''}</small></span>
+                </label>)}
+                <div className="modal-form-hint">
+                  The models ticked to start with are the ones this window's States read. Nothing in the file says where things are on this PC: Dataset Output folders and where models came from are left out.
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button className="modal-btn modal-btn-cancel" onClick={() => setExportDialog(null)}>Cancel</button>
+                <button className="modal-btn modal-btn-confirm" disabled={!dlg.parts.length && !dlg.modelIds.length || dlg.busy}
+                  onClick={async () => { setExportDialog({ ...dlg, busy: true }); const done = await exportSetupFile(dlg.parts, dlg.modelIds); setExportDialog(done ? null : { ...dlg, busy: false }); }}>
+                  {dlg.busy ? 'Exporting…' : 'Export…'}</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Importing a setup file */}
+      {fileImport && selectedTitle && (() => {
+        const fi = fileImport, sum = fileSummary(fi.summary.entries), own = setupOf(localStorage, selectedTitle);
+        const toggle = (part: SetupPart, on: boolean) => setFileImport({ ...fi, parts: on ? [...fi.parts, part] : fi.parts.filter(p => p !== part) });
+        const pick = (index: number, on: boolean) => setFileImport({ ...fi, models: on ? [...fi.models, index] : fi.models.filter(x => x !== index) });
+        const close = () => { void window.bridge.setup.close(fi.token); setFileImport(null); };
+        const losing = [
+          fi.parts.includes('states') && own.states + own.regions > 0 && `its ${plural(own.states, 'state')} and ${plural(own.regions, 'region')}`,
+          fi.parts.includes('graphs') && own.graphs > 0 && `its ${plural(own.graphs, 'graph')}`,
+          fi.parts.includes('recording') && 'its recording setup',
+        ].filter(Boolean) as string[];
+        return (
+          <div className="modal-overlay" onClick={close}>
+            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import a setup file">
+              <div className="modal-header"><span className="modal-title">Import a setup file</span></div>
+              <div className="modal-form">
+                <div className="modal-form-hint">Saved from the window “{fi.summary.window}”{fi.summary.exportedAt ? ` on ${new Date(fi.summary.exportedAt).toLocaleString()}` : ''}.</div>
+                <span className="modal-form-lbl">What to import</span>
+                {SETUP_PARTS.filter(p => sum.parts.includes(p.id)).map(p => <label key={p.id} className="import-part" title={p.hint}>
+                  <input type="checkbox" checked={fi.parts.includes(p.id)} onChange={e => toggle(p.id, e.target.checked)} />
+                  <span>{p.label}{p.id === 'states' ? ` (${setupSummary({ ...sum, graphs: 0 })})` : p.id === 'graphs' && sum.graphs ? ` (${plural(sum.graphs, 'graph')})` : ''}<small>{p.hint}</small></span>
+                </label>)}
+                {fi.summary.models.length > 0 && <>
+                  <span className="modal-form-lbl">Trained models</span>
+                  {fi.summary.models.map(m => <label key={m.index} className="import-part">
+                    <input type="checkbox" aria-label={`Add ${m.name}`} checked={fi.models.includes(m.index)} onChange={e => pick(m.index, e.target.checked)} />
+                    <span>{m.name} <small>{m.kind === 'detector' ? `Detector${m.classes?.length ? ` · ${m.classes.join(', ')}` : ''}` : 'Segmentation'} · {(m.size / 2 ** 20).toFixed(1)} MB</small></span>
+                  </label>)}
+                  <div className="modal-form-hint">Added to Trained Models; one you already have stays as it is.</div>
+                </>}
+                <div className="modal-form-hint">
+                  {losing.length ? `Replaces ${losing.join(', ')} for “${selectedTitle}”.` : `Imported into “${selectedTitle}”.`}
+                  {fi.parts.includes('graphs') ? ' Choose the folders Dataset Output nodes save into again: they weren’t shared.' : ''}
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button className="modal-btn modal-btn-cancel" onClick={close}>Cancel</button>
+                <button className="modal-btn modal-btn-confirm" disabled={(!fi.parts.length && !fi.models.length) || isRecording || fi.busy}
+                  title={isRecording ? 'Stop recording first' : undefined}
+                  onClick={async () => { setFileImport({ ...fi, busy: true }); await importSetupFromFile(fi); setFileImport(null); }}>
+                  {fi.busy ? 'Importing…' : 'Import'}</button>
               </div>
             </div>
           </div>

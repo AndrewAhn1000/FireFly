@@ -1193,6 +1193,11 @@ html, body, #root {
 .template-picker input { flex-shrink: 0; accent-color: #4b8df8; }
 .recordings-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; overflow: hidden; font-size: 11px; }
 .recordings-panel[hidden] { display: none; }
+/* Sharing a setup as a file */
+.import-from-file { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--divider); }
+.import-from-file .modal-form-hint { margin: 0; }
+.setup-message { display: flex; align-items: flex-start; gap: 6px; word-break: break-all; }
+.setup-message-x { flex-shrink: 0; padding: 0 2px; background: none; border: none; color: var(--text-dim); cursor: pointer; }
 
 /* Play tab: trained policies on the left, the chosen version's play and corrections on the right (src/PlayPanel.tsx) */
 .play-tab { display: flex; flex: 1; min-height: 0; min-width: 0; }

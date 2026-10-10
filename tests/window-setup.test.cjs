@@ -63,3 +63,30 @@ test('a part the other window has none of leaves this one with none of it either
  assert.equal(s.getItem(`firefly-regions-${enc(old)}`),null);
  assert.equal(s.getItem(`firefly-states-${enc(old)}`),'[]');
 });
+
+test('a setup goes into a file under {window} and comes out under whatever window it is imported for', async () => {
+ const {exportSetup, importSetupFile, fileSummary, WINDOW} = await import('../src/windowSetup.ts');
+ const s = saved();
+ // A collection graph whose Dataset Output saves into a folder on this PC
+ s.setItem(`firefly-policy-graph-${enc(old)}-document-g2`, JSON.stringify({version: 1, nodes: [{id: 'o', data: {kind: 'output', directory: 'C:\Users\me\FireFly\dataset', pattern: '{map}'}}], edges: []}));
+ const file = exportSetup(s, old, ['states', 'graphs', 'recording']);
+ assert.deepEqual(file.parts, ['states', 'graphs', 'recording']);
+ assert.ok(Object.keys(file.entries).every(k => k.includes(WINDOW) && !k.includes(enc(old))), 'keyed by {window}, not the title');
+ assert.ok(!Object.keys(file.entries).some(k => k.includes('other')), 'a window whose title starts with this one’s isn’t in it');
+ assert.equal(file.cleared, 1, 'the Dataset Output folder was left out');
+ assert.equal(JSON.parse(file.entries[`firefly-policy-graph-${WINDOW}-document-g2`]).nodes[0].data.directory, '');
+ assert.equal(JSON.parse(file.entries[`firefly-policy-graph-${WINDOW}-document-g2`]).nodes[0].data.pattern, '{map}');
+ const sum = fileSummary(file.entries);
+ assert.deepEqual([sum.states, sum.regions, sum.graphs, sum.parts], [2, 1, 2, ['states', 'graphs', 'recording']]);
+
+ // Into another PC's window, titled differently, which had its own recording setup and an empty graph
+ const other = store({[`firefly-record-setup-${enc(fresh)}`]: JSON.stringify({buttons: ['w'], hz: 15}),
+  [`firefly-policy-graph-${enc(fresh)}-library`]: library(['empty']), [`firefly-policy-graph-${enc(fresh)}-document-empty`]: '{}'});
+ importSetupFile(other, fresh, {...file.entries, 'firefly-train-config': '{"dataDir":"C:\\x"}', 'something-else': '1'}, ['states', 'graphs']);
+ const got = other.dump();
+ assert.equal(JSON.parse(got[`firefly-states-${enc(fresh)}`]).length, 2);
+ assert.equal(JSON.parse(got[`firefly-regions-${enc(fresh)}`])[0].label, 'Mini map');
+ assert.ok(got[`firefly-policy-graph-${enc(fresh)}-document-g1`] && !got[`firefly-policy-graph-${enc(fresh)}-document-empty`], 'its graphs replace the old ones');
+ assert.equal(got[`firefly-record-setup-${enc(fresh)}`], JSON.stringify({buttons: ['w'], hz: 15}), 'a part not chosen is left alone');
+ assert.ok(!('firefly-train-config' in got) && !('something-else' in got), 'keys FireFly doesn’t import are ignored');
+});
