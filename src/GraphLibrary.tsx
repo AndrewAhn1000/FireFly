@@ -9,9 +9,11 @@ interface Entry { id: string; parent: string | null; name: string; kind: Kind; c
 interface Library { version: 1; entries: Entry[]; selected: string; }
 interface Props extends PolicyGraphProps { regions: CaptureRegion[]; }
 const documentKey = (scope: string, id: string) => `${scope}-document-${id}`;
-function newPolicy() {
+// A new graph's Policy node is named after the graph, so its versions say which they are in the Play tab
+function newPolicy(name?: string) {
   const doc = emptyGraph(), ids = new Map(doc.nodes.map(n => [n.id, crypto.randomUUID()]));
-  return { ...doc, nodes: doc.nodes.map(n => ({ ...n, id: ids.get(n.id)! })), edges: doc.edges.map(e => ({ ...e, source: ids.get(e.source)!, target: ids.get(e.target)! })) };
+  return { ...doc, nodes: doc.nodes.map(n => ({ ...n, id: ids.get(n.id)!, data: n.data.kind === 'policy' && name ? { ...n.data, name } : n.data })),
+    edges: doc.edges.map(e => ({ ...e, source: ids.get(e.source)!, target: ids.get(e.target)! })) };
 }
 function readLibrary(scope: string): Library {
   const saved = localStorage.getItem(scope + '-library');
@@ -95,7 +97,7 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
     try {
       if (d.action === 'create') {
         const id = crypto.randomUUID();
-        if (d.kind !== 'folder') localStorage.setItem(documentKey(props.storageKey, id), JSON.stringify(d.kind === 'policy' ? newPolicy() : emptyCollection()));
+        if (d.kind !== 'folder') localStorage.setItem(documentKey(props.storageKey, id), JSON.stringify(d.kind === 'policy' ? newPolicy(d.name.trim()) : emptyCollection()));
         save({ ...library, selected: d.kind === 'folder' ? library.selected : id, entries: [...library.entries.map(e => e.id === d.parent ? { ...e, collapsed: false } : e), { id, parent: d.parent, name: d.name.trim(), kind: d.kind }] });
         if (d.kind !== 'folder') setOpened(ids => [...ids, id]);
       } else if (d.action === 'delete') {

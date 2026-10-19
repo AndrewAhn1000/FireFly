@@ -109,10 +109,13 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
 // Corrections are recordings too, a few seconds each, and a policy played for a while has hundreds: at 200 the
 // oldest fell off the list, and a Policy node let go of them as if deleted. 2000 is as many as worker.py trains
 // on at once (MAX_RECORDINGS).
+// What lists leave out is taken out by SQLite, before the metadata is parsed here: parsing all of it (323 recordings
+// held 22.6 MB, most of it their graphs) took a quarter of a second
 Json Catalog::list() const {
   Db db(root_);
   Statement query(
-      db, "SELECT id,name,status,duration,samples,invalid,inputs,metadata FROM "
+      db, "SELECT id,name,status,duration,samples,invalid,inputs,"
+          "json_remove(metadata,'$.graph','$.tracked','$.observationSchema.definition') FROM "
           "recordings ORDER BY created DESC LIMIT 2000");
   Json rows = Json::array();
   while (query.next()) {

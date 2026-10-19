@@ -7,12 +7,14 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 
 function harness(options = {}) {
   const calls = [], statuses = [];
-  const state = {focused: true, idleMs: 0, held: false, predict: () => ({buttons: [true, false]}), clock: 0};
+  const state = {focused: true, idleMs: 0, held: false, predict: () => ({buttons: [true, false]}), clock: 0,
+    step: () => ({buttons: [true, false], status: {phase: 'walk', text: 'walking to the destination: 80 px', done: 0, missed: 0, misses: []}})};
   const log = (who, op, params) => { calls.push({who, op, params}); };
   const play = createPlay({
     runtime: async (op, params) => {
       log('runtime', op, params);
-      if (op === 'session.schemas') return {observationSchema: {identity: options.identity ?? 'obs'}};
+      if (op === 'session.schemas') return {observationSchema: {identity: options.identity ?? 'obs'}, actionSchema: {identity: `act-${params.buttons.map(b => b.id).join('+')}`}};
+      if (op === 'record.stop' && state.recordStopMs) await wait(state.recordStopMs);
       return {};
     },
     worker: async (op, params) => {
@@ -20,8 +22,14 @@ function harness(options = {}) {
       if (op === 'models') return [{id: 'p', created: 1, stepMs: 39.5, observationSchema: {identity: 'obs'},
         actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}]}},
         {id: 'mover', created: 2, observationSchema: {identity: 'obs'}, policy: {id: 'n1', name: 'Move right'},
-        actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}]}, outputs: [{id: 'right', vk: 39}]}];
+        actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}]}, outputs: [{id: 'right', vk: 39}]},
+        {id: 'hitter', created: 3, observationSchema: {identity: 'obs'}, taps: {right: {downMs: 100, upMs: 100}},
+        actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}]}}];
+      if (op === 'load' && params.trace) return {trace: 'C:/traces/p/1.jsonl'};
       if (op === 'predict') return state.predict();
+      if (op === 'drive.load') return {buttons: [{id: 'right', vk: 39}, {id: 'space', vk: 32}], hops: 2, examples: 3,
+        actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}, {id: 'space', vk: 32}]}};
+      if (op === 'drive.step') return state.step();
       return {};
     },
     guard: async (op, params) => {
@@ -32,6 +40,7 @@ function harness(options = {}) {
       if (op === 'focused') return {focused: state.focused && !!state.configured};
       if (op === 'idle') return {idleMs: state.idleMs, held: state.held};
       if (op === 'apply' && state.stale) throw new Error('Stale observation (312 ms old; the limit is 250); refusing action');
+      if (op === 'apply' && state.strict && !state.configured) throw new Error('Input guardian is not configured');
       if (op === 'apply') return {held: 0, ageMs: 80};
       return {};
     },
@@ -144,6 +153,7 @@ test('a policy that learned some of the buttons presses only those, and its corr
   assert.deepEqual(h.ops('guard', 'configure')[0].params.buttons, [{id: 'right', vk: 39}]);
   h.frame(1); await wait(10);
   assert.deepEqual(h.ops('guard', 'apply')[0].params.buttons, [true]);
+  assert.equal(h.ops('guard', 'apply')[0].params.actionSchema, 'act-right', 'the action schema of the buttons the guard has, as the guard checks');
   h.play.guardStopped('Human takeover / emergency stop'); await wait(20);
   const started = h.ops('runtime', 'record.start')[0].params;
   assert.deepEqual(started.buttons, [{id: 'left', vk: 37}, {id: 'right', vk: 39}]);
@@ -189,7 +199,7 @@ test('play reports how old what it acts on is, and a stale refusal says where th
   frame(3, 240); await wait(20);
   assert.equal(h.play.playing, false);
   assert.match(h.statuses.at(-1).reason,
-    /^Stale observation \(312 ms old; the limit is 250\); refusing action: the frame was 240 ms old when the runtime sent it \(the graph took 12 ms, waiting for template matching 95 ms\), 297 ms when FireFly's main process got it, and 297 ms when it was sent to the input guard \(the policy took \d+ ms\)$/);
+    /^Stale observation \(312 ms old; the limit is 250\); refusing action: the frame was 240 ms old when the runtime sent it \(the graph 12 ms, waiting for template matching 95 ms\), 297 ms when FireFly's main process got it, and 297 ms when it was sent to the input guard \(the policy took \d+ ms\)$/);
 });
 
 test('a policy that can never predict says why, rather than looking as if it chose to press nothing', async () => {
@@ -215,4 +225,204 @@ test('play says which buttons it holds, and how often it has pressed each', asyn
   const last = h.statuses.at(-1);
   assert.deepEqual(last.holding, ['left', 'right']);
   assert.deepEqual(last.pressed, {left: 2, right: 1});  // left pressed, let go, pressed again
+});
+
+test('a frame while a correction is being saved waits for the guard, rather than stopping play', async () => {
+  const h = harness();
+  h.state.strict = true;
+  await h.play.start({modelId: 'p', windowId: '42', corrections: true});
+  h.frame(1); await wait(10);
+  // The player takes over: the guard stops itself, unconfigured
+  h.state.configured = false; h.state.idleMs = 0;
+  h.play.guardStopped('Human takeover / emergency stop (key 0x41 (A))');
+  await wait(15);
+  // They let go; saving the correction takes a while, and frames keep arriving meanwhile
+  h.state.recordStopMs = 40; h.state.idleMs = 1600;
+  for (let t = 2; t < 8; t++) { h.frame(t); await wait(8); }
+  await wait(40);
+  assert.equal(h.play.playing, true, `Play stopped: ${h.statuses.at(-1).reason}`);
+  assert.equal(h.statuses.at(-1).correcting, false);
+  assert.equal(h.statuses.at(-1).corrected, 1);
+  const before = h.ops('guard', 'apply').length;
+  h.frame(9); await wait(10);
+  assert.equal(h.ops('guard', 'apply').length, before + 1, 'The policy did not carry on once the guard was configured');
+  h.play.stop('Done');
+});
+
+test('a refusal because the guard just stopped itself waits for its reason: a takeover starts a correction', async () => {
+  const h = harness();
+  h.state.strict = true;
+  await h.play.start({modelId: 'p', windowId: '42', corrections: true});
+  h.frame(1); await wait(10);
+  // The guard stops itself, and this frame's buttons reach it before its stop reaches play
+  h.state.configured = false;
+  h.frame(2); await wait(10);
+  assert.equal(h.play.playing, true, 'A refusal from a guard that had just stopped ended play');
+  h.play.guardStopped('Human takeover / emergency stop (key 0x41 (A))');
+  await wait(10);
+  assert.equal(h.ops('runtime', 'record.start').length, 1, 'The takeover did not start a correction');
+  assert.equal(h.statuses.at(-1).correcting, true);
+  h.play.stop('Done');
+});
+
+test('a guard that stays unconfigured with no stop of its own still ends play, saying so', async () => {
+  const h = harness();
+  h.state.strict = true;
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(10);
+  h.state.configured = false;
+  h.state.clock = 100; h.frame(2); await wait(10);
+  assert.equal(h.play.playing, true);
+  h.state.clock = 1200; h.frame(3); await wait(10);
+  assert.equal(h.play.playing, false);
+  assert.match(h.statuses.at(-1).reason, /not configured/);
+});
+
+test('a watchdog stop says which part fell behind: frames stopping, or one prediction taking too long', async () => {
+  const h = harness();
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.state.monotonic = 1000; h.frame(1); await wait(10);
+  h.state.monotonic = 1400;
+  h.play.guardStopped('Action watchdog expired: no action for 309 ms (detection or the policy fell behind)');
+  assert.match(h.statuses.at(-1).reason, /no frame had come from the runtime for 400 ms/);
+
+  const slow = harness();
+  let finish;
+  slow.state.predict = () => new Promise(resolve => { finish = () => resolve({buttons: [false, false]}); });
+  await slow.play.start({modelId: 'p', windowId: '42'});
+  slow.state.clock = 0; slow.frame(1); await wait(10);
+  slow.state.clock = 320;
+  slow.play.guardStopped('Action watchdog expired: no action for 309 ms (detection or the policy fell behind)');
+  assert.match(slow.statuses.at(-1).reason, /the policy was still working out one frame after 320 ms/);
+  finish();
+});
+
+test('a stale refusal names the runtime part that held the frame, such as a slow Lua State', async () => {
+  const h = harness();
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(10);
+  h.state.stale = true;
+  h.play.onObservations({timestamp: 2, observations: [], tracked: [], probeMs: {platforms: 860, 'Map Id': 2},
+    latency: {graphMs: 1, waitMs: 0, ageMs: 887, pickupMs: 3, probesMs: 862, queuedMs: 0, takenMs: 21}});
+  await wait(20);
+  assert.match(h.statuses.at(-1).reason, /\(picking the frame up 3 ms, reading the Lua and memory States 862 ms \(the slowest, platforms, 860 ms\), waiting for the detection worker 0 ms, the graph 1 ms, taking its result 21 ms, waiting for template matching 0 ms\)/);
+});
+
+test('a policy pressing nothing says which button it was surest of, and how sure', async () => {
+  const h = harness();
+  h.state.predict = () => ({buttons: [false, false], probabilities: [0.31, 0.12]});
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(10);
+  const status = h.statuses.at(-1);
+  assert.deepEqual(status.holding, []);
+  assert.deepEqual(status.top, {id: 'left', p: 0.31});
+  h.play.stop('Done');
+});
+
+test('where it heads is the graph’s now: sent with the version it loads, and nothing when there is none', async () => {
+  const h = harness();
+  const goal = {plan: {cell: 40, aheadS: 2.5, destination: {kind: 'point', x: 10, y: 20}}};
+  await h.play.start({modelId: 'p', windowId: '42', goal});
+  assert.deepEqual(h.ops('worker', 'load')[0].params.goal, goal);
+  h.play.stop('Done');
+  const plain = harness();
+  await plain.play.start({modelId: 'p', windowId: '42'});
+  assert.equal('goal' in plain.ops('worker', 'load')[0].params, false);
+  plain.play.stop('Done');
+});
+
+test('where it is heading this frame reaches the status', async () => {
+  const h = harness();
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.state.predict = () => ({buttons: [true, false], probabilities: [.9, .1], heading: {kind: 'plan', x: 1420, y: 210, distance: 380}});
+  h.frame(1); await wait(20);
+  assert.deepEqual(h.statuses.at(-1).heading, {kind: 'plan', x: 1420, y: 210, distance: 380});
+  h.play.stop('Done');
+});
+
+test('keeping what it sees: asked for when it loads, said while it plays, and stopped with it', async () => {
+  const h = harness();
+  await h.play.start({modelId: 'p', windowId: '42', trace: true});
+  assert.equal(h.ops('worker', 'load')[0].params.trace, true);
+  assert.equal(h.statuses.at(-1).trace, 'C:/traces/p/1.jsonl');
+  h.play.stop('Done'); await wait(10);
+  assert.equal(h.ops('worker', 'trace.close').length, 1);
+  const plain = harness();
+  await plain.play.start({modelId: 'p', windowId: '42'});
+  assert.equal(plain.ops('worker', 'load')[0].params.trace, false);
+  plain.play.stop('Done'); await wait(10);
+  assert.equal(plain.ops('worker', 'trace.close').length, 0);
+});
+
+test('a frame picked up late says which requests held the runtime, or that none did', async () => {
+  const h = harness();
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(10);
+  h.state.stale = true;
+  h.play.onObservations({timestamp: 2, observations: [], tracked: [], latency: {graphMs: 1, waitMs: 0, ageMs: 335, pickupMs: 330, probesMs: 4, queuedMs: 0, takenMs: 0,
+    heldBy: [{op: 'memory.run_script', ms: 180}, {op: 'memory.run_script', ms: 120}, {op: 'frame', ms: 25}]}});
+  await wait(20);
+  assert.match(h.statuses.at(-1).reason, /picking the frame up 330 ms \(the runtime was busy answering memory\.run_script for 300 ms, answering frame for 25 ms\)/);
+  const quiet = harness();
+  await quiet.play.start({modelId: 'p', windowId: '42'});
+  quiet.frame(1); await wait(10);
+  quiet.state.stale = true;
+  quiet.play.onObservations({timestamp: 2, observations: [], tracked: [], latency: {graphMs: 1, waitMs: 0, ageMs: 300, pickupMs: 290, probesMs: 4, queuedMs: 0, takenMs: 0, heldBy: []}});
+  await wait(20);
+  assert.match(quiet.statuses.at(-1).reason, /picking the frame up 290 ms \(nothing the runtime measured held it: capture itself, or the PC, was slow\)/);
+  // A result taken late: what held the loop then, the runtime's own work and a blocked write named as they are
+  const taken = harness();
+  await taken.play.start({modelId: 'p', windowId: '42'});
+  taken.frame(1); await wait(10);
+  taken.state.stale = true;
+  taken.play.onObservations({timestamp: 2, observations: [], tracked: [], latency: {graphMs: 1, waitMs: 0, ageMs: 256, pickupMs: 11, probesMs: 3, queuedMs: 0, takenMs: 240,
+    heldBy: [{op: 'frame', ms: 238, part: 'taken', request: true}, {op: "writing to FireFly, which wasn't reading", ms: 236, part: 'taken', request: false},
+      {op: 'memory.run_script', ms: 30, part: 'pickup', request: true}]}});
+  await wait(20);
+  const reason = taken.statuses.at(-1).reason;
+  assert.match(reason, /picking the frame up 11 ms,/, 'a quick pickup isn’t explained');
+  assert.match(reason, /taking its result 240 ms \(the runtime was busy answering frame for 238 ms, writing to FireFly, which wasn't reading for 236 ms\)/);
+});
+
+test('a button the player tapped is tapped to their rhythm while the policy holds it; one held stays held', async () => {
+  const h = harness();
+  h.state.predict = () => ({buttons: [true, true]});
+  await h.play.start({modelId: 'hitter', windowId: '42'});
+  const applied = [];
+  for (const t of [0, 50, 100, 150, 200, 250, 300]) { h.state.clock = t; h.frame(t + 1); await wait(10); applied.push(h.ops('guard', 'apply').at(-1).params.buttons); }
+  assert.deepEqual(applied.map(b => b[1]), [true, true, false, false, true, true, false]);  // right: 100 ms down, 100 up
+  assert.deepEqual(applied.map(b => b[0]), [true, true, true, true, true, true, true]);   // left: held
+  assert.deepEqual(h.statuses.at(-1).taps, ['right']);
+  // Let go, it's up at once, and starts down again when held again
+  h.state.predict = () => ({buttons: [false, false]});
+  h.state.clock = 350; h.frame(400); await wait(10);
+  assert.deepEqual(h.ops('guard', 'apply').at(-1).params.buttons, [false, false]);
+  h.state.predict = () => ({buttons: [false, true]});
+  h.state.clock = 400; h.frame(450); await wait(10);
+  assert.deepEqual(h.ops('guard', 'apply').at(-1).params.buttons, [false, true]);
+  h.play.stop('Done');
+});
+
+test('driving: the planner presses what its step says, with the frame’s age, and taking over stops it', async () => {
+  const h = harness();
+  h.state.monotonic = 1100;
+  await h.play.start({windowId: '42', drive: {goal: {name: 'goal'}, recordingIds: ['a']}, name: 'Way up'});
+  assert.deepEqual(h.ops('worker', 'drive.load')[0].params, {goal: {name: 'goal'}, recordingIds: ['a']});
+  assert.deepEqual(h.ops('guard', 'configure')[0].params.buttons, [{id: 'right', vk: 39}, {id: 'space', vk: 32}], 'Only the buttons it learned moves with');
+  assert.equal(h.ops('worker', 'load').length, 0, 'No policy is loaded');
+  assert.deepEqual(h.ops('runtime', 'session.schemas')[0].params.buttons, [{id: 'right', vk: 39}, {id: 'space', vk: 32}],
+    'Frames carry the action schema of the buttons the guard is configured with');
+  h.frame(1000); await wait(10);
+  const step = h.ops('worker', 'drive.step')[0].params;
+  assert.ok(step.ageMs >= 100 && step.ageMs < 120, `the frame's age and a step's time: ${step.ageMs}`);
+  assert.deepEqual(h.ops('guard', 'apply')[0].params.buttons, [true, false]);
+  assert.equal(h.ops('guard', 'apply')[0].params.actionSchema, 'act-right+space');
+  const s = h.statuses.at(-1);
+  assert.equal(s.drive, true); assert.equal(s.name, 'Way up'); assert.equal(s.driving.text, 'walking to the destination: 80 px');
+  h.state.step = () => ({buttons: [false, false], status: {phase: 'missing', text: 'Invalid or missing observation: player', done: 0, missed: 0, misses: []}});
+  h.frame(1050); await wait(10);
+  assert.equal(h.statuses.at(-1).driving.phase, 'missing');
+  h.play.guardStopped('Player takeover (a key)');
+  assert.equal(h.statuses.at(-1).playing, false);
+  assert.equal(h.ops('runtime', 'record.start').length, 0, 'Driving records no corrections');
 });

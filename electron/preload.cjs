@@ -25,7 +25,7 @@ contextBridge.exposeInMainWorld('bridge', {
   policy: {
     invoke: (op, params) => ipcRenderer.invoke('policy:invoke', op, params),
     play:   (params)     => ipcRenderer.invoke('play:start', params),
-    stop:   ()           => ipcRenderer.invoke('play:stop'),
+    stop:   (how)        => ipcRenderer.invoke('play:stop', how),
     exportDataset: (params) => ipcRenderer.invoke('policy:export', params),
     reveal: (file)       => ipcRenderer.invoke('policy:reveal', file),
   },

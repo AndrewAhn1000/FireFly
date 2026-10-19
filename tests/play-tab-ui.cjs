@@ -45,8 +45,14 @@ app.whenReady().then(async () => {
       if (op === 'observe.fields') return { fields: [], excluded: [] };
       return { ok: true };
     });
+    const reported = [];
     ipcMain.handle('policy:invoke', async (_, op, params) => {
       if (op === 'models') return versions;
+      // Its last play that kept what it saw, beside its training
+      if (op === 'trace.report') { reported.push(params); return { frames: 120, acted: 100, missing: { 'monsters isn’t found': 20 }, trainingRows: 900, heldBackRows: 200,
+        unfamiliar: { playMedian: 9, heldBackMedian: 4, heldBack90: 6, beyondHeldBack90: 0.62 }, pressedNothing: 0.4, playerNothing: 0.1,
+        buttons: [{ id: 'right', playerPressed: 0.5, playPressed: 0.1, playChance: 0.3 }],
+        values: [{ name: 'spatial.monsters.nearest.dist', trainMean: 80, trainLow: 0, trainHigh: 400, playMean: 700, playLow: 300, playHigh: 1000, outside: 0.55, shift: 4.2 }] }; }
       if (op === 'models.delete') { deletedModels.push(params.modelId); versions = versions.filter(v => v.id !== params.modelId); return { ok: true }; }
       if (op === 'train') {
         trained.push(params);
@@ -81,7 +87,7 @@ app.whenReady().then(async () => {
     // Every policy and its versions, newest first; the newest is chosen
     await click('Play');
     await until(`document.querySelectorAll('.play-version').length === 4`);
-    assert.deepEqual(await js(`[...document.querySelectorAll('.play-group-hd')].map(h=>h.firstChild.textContent)`), ['Walker', 'Jumper', 'Earlier policies']);
+    assert.deepEqual(await js(`[...document.querySelectorAll('.play-group-hd')].map(h=>h.firstChild.textContent)`), ['Walker · Policy graph', 'Jumper', 'Earlier policies']);
     assert.deepEqual(await js(`[...document.querySelectorAll('.play-group')][0].textContent.match(/v\\d/g)`), ['v2', 'v1']);
     assert.match(await text('.play-title'), /Walker v2/);
     assert.match(await text('.play-detail'), /Presses →, Space/);
@@ -90,7 +96,7 @@ app.whenReady().then(async () => {
     // Play as it is, and with corrections
     await play('▶ Play');
     await until(`true`); for (let i = 0; i < 50 && !played.length; i++) await wait(40);
-    assert.deepEqual(played[0], { modelId: 'w2', windowId: '123', corrections: false });
+    assert.deepEqual(played[0], { modelId: 'w2', windowId: '123', corrections: false, trace: false });
     send('play:status', { playing: true, modelId: 'w2', actions: 5, holding: ['right'], pressed: { right: 3 } });
     await until(`document.querySelector('.play-live')?.textContent.includes('holding →')`, 'live play status');
     assert.match(await text('.play-live'), /5 actions.*pressed so far: → 3×/);
@@ -104,6 +110,20 @@ app.whenReady().then(async () => {
     for (let i = 0; i < 50 && played.length < 2; i++) await wait(40);
     assert.equal(played[1].corrections, true);
     send('play:status', { playing: false, modelId: 'w2', reason: null });
+    // Keeping what it sees: asked for with Play, and its last play compared with its training
+    await js(`[...document.querySelectorAll('.play-keep')].find(l=>l.textContent.includes('Keep what it sees')).querySelector('input').click();0`);await wait(80);
+    await play('▶ Play');
+    for (let i = 0; i < 50 && played.length < 3; i++) await wait(40);
+    assert.equal(played[2].trace, true);
+    send('play:status', { playing: false, modelId: 'w2', reason: null });
+    await play('Compare what it saw with its training');
+    await until(`document.querySelector('.play-trace')`, 'the comparison');
+    assert.deepEqual(reported, [{ modelId: 'w2' }]);
+    const compared = await text('.play-trace');
+    assert.match(compared, /100 of 120 frames acted on; nothing to go on in the rest \(monsters isn’t found: 20\)/);
+    assert.match(compared, /62% of its frames were less like its training.*mostly somewhere its recordings don’t cover/);
+    assert.match(compared, /pressed nothing in 40% of frames \(you: 10%\)/);
+    assert.match(compared, /spatial\.monsters\.nearest\.dist.*0…400 \(avg 80\).*300…1000 \(avg 700\).*55%.*4\.2/);
 
     // How much the corrections count: 40% of training unless chosen (this version saved none), chosen on a slider
     const slide = (selector, value) => js(`(()=>{const i=document.querySelector(${JSON.stringify(selector)});

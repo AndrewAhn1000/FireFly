@@ -2,6 +2,10 @@
 #include "detection.hpp"
 #include "latest_worker.hpp"
 #include "onnx_node.hpp"
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <thread>
 #include "command_reader.hpp"
 #include "graph.hpp"
@@ -610,7 +614,18 @@ static std::vector<uint8_t> fromBase64(const std::string &s) {
   return out;
 }
 
+// Writes that blocked lately, (when each ended, how long it took): a write to FireFly waits while its main process
+// isn't reading (a pipe holds little), and holds the main loop meanwhile. Only those of 20 ms or more
+// Packets are written from the main loop and from Background, one whole packet at a time
+static std::mutex packetMutex;
+static std::deque<std::pair<double, double>> slowWrites;
+static std::vector<std::pair<double, double>> recentSlowWrites() {
+  std::lock_guard lock(packetMutex);
+  return {slowWrites.begin(), slowWrites.end()};
+}
 static void packet(uint8_t kind, const void *data, uint32_t size) {
+  const double began = firefly::monotonicMs();
+  std::lock_guard lock(packetMutex);
   uint32_t total = size + 1;
   std::cout.write(reinterpret_cast<const char *>(&total), 4);
   std::cout.put(static_cast<char>(kind));
@@ -618,12 +633,52 @@ static void packet(uint8_t kind, const void *data, uint32_t size) {
   std::cout.flush();
   if (!std::cout)
     std::exit(0);
+  const double end = firefly::monotonicMs();
+  if (end - began >= 20) {
+    slowWrites.emplace_back(end, end - began);
+    if (slowWrites.size() > 32) slowWrites.pop_front();
+  }
 }
 static void jsonPacket(const Json &value) {
   // Text read from the screen or from memory may not be valid UTF-8, which must not fail a reply
   auto data = value.dump(-1, ' ', false, Json::error_handler_t::replace);
   packet(1, data.data(), static_cast<uint32_t>(data.size()));
 }
+// Requests answered off the main loop, in order, so they never hold it: reading the catalog of recordings, which
+// grows with every correction (listing 323 took a quarter of a second, while a playing policy's frames waited)
+class Background {
+public:
+  Background() : thread_([this] { run(); }) {}
+  ~Background() {
+    { std::lock_guard lock(mutex_); done_ = true; }
+    ready_.notify_one();
+    thread_.join();
+  }
+  void post(std::function<void()> task) {
+    { std::lock_guard lock(mutex_); tasks_.push_back(std::move(task)); }
+    ready_.notify_one();
+  }
+
+private:
+  void run() {
+    for (;;) {
+      std::function<void()> task;
+      {
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [&] { return done_ || !tasks_.empty(); });
+        if (tasks_.empty()) return; // done, with nothing left to answer
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      task();
+    }
+  }
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::function<void()>> tasks_;
+  bool done_ = false;
+  std::thread thread_; // last, so the rest is there before it runs
+};
 static Json response(uint32_t id) {
   return {{"v", 1}, {"id", id}, {"ok", true}};
 }
@@ -756,6 +811,14 @@ int main() {
   bool recording = false;
   double nextTick = 0, lastReport = 0, started = 0, lastSample = 0;
   int hz = 15;
+  // The frames just before a recording starts, as its samples would be, kept for a second while not recording: a
+  // correction (record.start's beforeMs) starts with the moment the policy got wrong, labelled with the keys the
+  // player took over with, once the first sample says what they are. Without them a correction began after the
+  // player's first key and never showed that moment, so however often it was corrected, the policy did it again
+  struct Recent { double timestamp; Json observations; Json frame; uint64_t generation; };
+  std::deque<Recent> recent;
+  std::vector<Recent> before; // waiting for the player's keys, until beforeUntil
+  double beforeUntil = 0;
   Json observationIdentity, actionIdentity;
   std::shared_ptr<const CapturedFrame> latest;
   bool collectFrames = false;
@@ -789,6 +852,22 @@ int main() {
   auto invalidateAll = [&] { invalidateDetection(); invalidateTracking(); tracked.reset(); clearCollected(); };
   std::string previewNode; // graph node drawn on the live view instead of the output
   CommandReader commands;
+  Background background; // after what its tasks copy, and gone (its last answers sent) before the loop's state
+  // What held the main loop lately: the requests (by op) and the loop's own work (what it was), each with when it
+  // ended and how long it took. Frames and their results wait for the loop, so one picked up or taken late says
+  // what held it (heldBy on its latency). Only those of 20 ms or more.
+  struct SlowOp { double end, ms; std::string what; bool request; };
+  std::deque<SlowOp> slowOps;
+  auto noteSlow = [&](double began, std::string what, bool request) {
+    const double end = firefly::monotonicMs();
+    if (end - began < 20) return;
+    slowOps.push_back({end, end - began, std::move(what), request});
+    if (slowOps.size() > 32) slowOps.pop_front();
+  };
+  // The loop's own work, timed
+  auto timed = [&](const char *what, auto &&work) { const double began = firefly::monotonicMs(); work(); noteSlow(began, what, false); };
+  std::string busyOp;
+  double busySince = 0;
   // How fast things actually happen, for the app to show against what a recording aims for: new frames
   // from the game (a window only yields one when it redraws), graph results, and recorded samples
   firefly::RateMeter frameRate, detectionRate, sampleRate;
@@ -806,6 +885,7 @@ int main() {
     for (auto &input : inputs.drain())
       recorder.enqueue(input);
     recorder.stop(reason);
+    before.clear();
     recording = false;
     ++recordingGeneration;
     event("recording", recorder.status());
@@ -831,7 +911,10 @@ int main() {
     if (recording) nextTick = std::max(nextTick + 1000.0 / hz, now);
     firefly::DetectionJob job;
     job.generation = generation; job.recordingGeneration = recordingGeneration;
+    const double probing = firefly::monotonicMs();
     job.probes = readProbes(latest.get());
+    job.submittedAt = firefly::monotonicMs();
+    job.probesMs = job.submittedAt - probing;
     job.frame = latest; job.graph = graph; job.preview = previewNode;
     worker.submit(std::move(job));
   };
@@ -864,6 +947,7 @@ int main() {
     auto result = worker.take();
     if (result && target && result->generation == generation) {
       const double now = firefly::monotonicMs();
+      result->takenAt = now;
       if (waiting) finishDetection(std::move(*std::exchange(waiting, std::nullopt)), now - waitingSince); // a newer one came first
       const double until = trackLatency < 0 ? now + kTrackWaitMs
         : std::min(now + kTrackWaitMs, result->frame->timestamp + 1.3 * trackLatency + 10);
@@ -894,9 +978,32 @@ int main() {
       observations["tracked"] = trackedValues;
       observations["frame"] = frameSize;
       // Where the time went since the frame was captured, for play to say why an action came too late
+      // From capture: the main loop picking the frame up, reading the probes, the frame waiting for the detection
+      // worker (busy with the one before), the graph, the main loop taking its result, and waiting for matching
       observations["latency"] = {{"graphMs", result->elapsedMs}, {"waitMs", waitedMs},
-        {"trackingMs", trackLatency}, {"ageMs", firefly::monotonicMs() - timestamp}};
+        {"trackingMs", trackLatency}, {"ageMs", firefly::monotonicMs() - timestamp},
+        {"pickupMs", result->submittedAt - result->probesMs - timestamp}, {"probesMs", result->probesMs},
+        {"queuedMs", result->startedAt - result->submittedAt}, {"takenMs", result->takenAt - result->finishedAt}};
+      // What held the loop while the frame waited for it: from its capture to its being picked up ("pickup"), and
+      // from the graph finishing it to its result being taken ("taken"); writes to FireFly that blocked are in both
+      const double pickedUp = result->submittedAt - result->probesMs;
+      Json heldBy = Json::array();
+      auto overlapping = [&](double end, double ms, const std::string &what, bool request) {
+        for (const auto &[part, from, to] : {std::tuple{"pickup", timestamp, pickedUp}, std::tuple{"taken", result->finishedAt, result->takenAt}})
+          if (end > from && end - ms < to) heldBy.push_back({{"op", what}, {"ms", ms}, {"part", part}, {"request", request}});
+      };
+      for (const auto &slow : slowOps) overlapping(slow.end, slow.ms, slow.what, slow.request);
+      for (const auto &[end, ms] : recentSlowWrites()) overlapping(end, ms, "writing to FireFly, which wasn't reading", false);
+      if (!heldBy.empty() || pickedUp - timestamp >= 50 || result->takenAt - result->finishedAt >= 50)
+        observations["latency"]["heldBy"] = heldBy; // empty: nothing it measured did
       if (!probes.empty()) observations["probeMs"] = probeMs;
+    }
+    if (!recording && !observations.is_null()) {
+      Json kept = observations["observations"];
+      for (auto &value : trackedValues) kept.push_back(value);
+      recent.push_back({timestamp, recordedOnly(kept), frameSize, generation});
+      while (!recent.empty() && (timestamp - recent.front().timestamp > 1000 || recent.front().generation != generation))
+        recent.pop_front();
     }
     if (recording && result->recordingGeneration == recordingGeneration &&
         timestamp >= started && timestamp > lastSample && !observations.is_null()) {
@@ -907,12 +1014,35 @@ int main() {
       sampled = recordedOnly(sampled);
       for (auto &value : sampled)
         valid = valid && value["valid"].get<bool>();
+      if (!before.empty()) {
+        // The moments before the recording, with the keys the player is holding now: what they took over with
+        bool pressed = false;
+        if (actions.value("valid", false) && actions.contains("buttons"))
+          for (const auto &[id, on] : actions["buttons"].items()) pressed = pressed || (on.is_boolean() && on.get<bool>());
+        if (pressed) {
+          for (auto &earlier : before) {
+            bool ok = true;
+            for (auto &value : earlier.observations) ok = ok && value["valid"].get<bool>();
+            recorder.enqueue({{"kind", "sample"}, {"timestamp", earlier.timestamp},
+              {"observationSchema", observationIdentity["identity"]}, {"actionSchema", actionIdentity["identity"]},
+              {"observations", earlier.observations}, {"actions", actions}, {"valid", ok}, {"frame", earlier.frame},
+              {"before", true}});
+          }
+          before.clear();
+        } else if (timestamp > beforeUntil) {
+          before.clear(); // nothing pressed: no takeover to say what those moments should have been
+        }
+      }
+      // Samples before the player's keys are known (the input monitor takes a moment) aren't kept while the moments
+      // before wait for them: written after those, they'd be out of order, and the trainer drops such samples
+      if (before.empty()) {
       recorder.enqueue({{"kind", "sample"}, {"timestamp", timestamp},
         {"observationSchema", observationIdentity["identity"]},
         {"actionSchema", actionIdentity["identity"]},
         {"observations", sampled}, {"actions", actions}, {"valid", valid}, {"frame", frameSize}});
       lastSample = timestamp;
       sampleRate.tick(timestamp);
+      }
     }
     if (!observations.is_null()) event("observations", observations);
     detectionRate.tick(timestamp);
@@ -922,18 +1052,21 @@ int main() {
     detected = std::move(result);
   };
   while (true) {
+    if (!busyOp.empty()) { // the request just answered: kept if it held the loop a while
+      noteSlow(busySince, busyOp, true);
+      busyOp.clear();
+    }
     if (target) {
       try {
-        receiveTracking();
-        receiveDetection();
-        if (recording) for (auto &input : inputs.drain())
-          recorder.enqueue(input);
+        timed("taking a template match", receiveTracking);
+        timed("handing on a graph result", receiveDetection);
+        if (recording) timed("saving recorded input", [&] { for (auto &input : inputs.drain()) recorder.enqueue(input); });
         if (recording && (inputs.overflow() || recorder.failed()))
           throw std::runtime_error("Recording input/writer overflow or disk "
                                    "failure; session interrupted");
         double now = firefly::monotonicMs();
         if (now >= nextCapture) {
-          acquire();
+          timed("taking the next frame from capture", acquire);
           nextCapture = now + 1000.0 / 60;
         }
         if (recording && now - lastReport > 500) {
@@ -956,6 +1089,8 @@ int main() {
     }
     uint32_t id = 0;
     std::string op;
+    busySince = firefly::monotonicMs();
+    busyOp = "a request";
     try {
       auto request = Json::parse(*line);
       if (!request.contains("id") || !request["id"].is_number_unsigned() ||
@@ -967,6 +1102,7 @@ int main() {
         continue;
       }
       op = request.at("op");
+      busyOp = op;
       auto r = response(id);
       if (op == "health") {
         r["captureSupported"] = winrt::Windows::Graphics::Capture::
@@ -1018,17 +1154,22 @@ int main() {
         if (recording && recorder.status().value("id", std::string()) == recordingId)
           throw std::runtime_error("Stop this recording before deleting it");
         catalog->remove(recordingId);
-      } else if (op == "dataset.list") {
+      } else if (op == "dataset.list" || op == "dataset.read") {
         if (!catalog)
           throw std::runtime_error("Storage not initialized");
-        r["recordings"] = catalog->list();
-      } else if (op == "dataset.read") {
-        if (!catalog)
-          throw std::runtime_error("Storage not initialized");
-        r["recording"] =
-            catalog->read(request.at("recordingId"), request.value("offset", 0),
-                          request.value("limit", 50), request.value("tail", false),
-                          request.value("stream", std::string("samples")));
+        // Off the main loop (Background): the catalog is only its folder, so the task has its own
+        background.post([store = *catalog, request, op, r, id]() mutable {
+          try {
+            if (op == "dataset.list") r["recordings"] = store.list();
+            else r["recording"] = store.read(request.at("recordingId"), request.value("offset", 0),
+                                             request.value("limit", 50), request.value("tail", false),
+                                             request.value("stream", std::string("samples")));
+            jsonPacket(r);
+          } catch (const std::exception &e) {
+            error(id, "REQUEST_FAILED", e.what());
+          }
+        });
+        continue;
       } else if (op == "record.start") {
         if (recording)
           throw std::runtime_error("Already recording");
@@ -1041,6 +1182,12 @@ int main() {
         actionIdentity = firefly::actionSchema(request.at("buttons"));
         observationIdentity = firefly::observationSchema(*graph, extraDefinitions(), extraFields(), unrecorded);
         started = firefly::monotonicMs();
+        before.clear();
+        if (const double beforeMs = std::clamp(request.value("beforeMs", 0.0), 0.0, 1000.0); beforeMs > 0)
+          for (const auto &earlier : recent)
+            if (earlier.generation == generation && earlier.timestamp >= started - beforeMs && earlier.timestamp < started)
+              before.push_back(earlier);
+        beforeUntil = started + 300;
         Json metadata = {
             {"version", 1},
             {"id", request.at("recordingId")},

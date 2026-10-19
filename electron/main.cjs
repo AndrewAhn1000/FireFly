@@ -56,6 +56,43 @@ function logCrash(message) {
     fs.appendFileSync(path.join(dir, 'crashes.log'), line + '\n');
   } catch { /* the terminal has it */ }
 }
+// Why a policy stopped playing, and when its corrections began and ended, in <userData>/logs/play.log: the
+// banner's reason is gone once the next Play replaces it, and a stop is easy to miss while playing
+let playLogged = { playing: false, correcting: false };
+function logPlay(status) {
+  let line = null;
+  // Driving: each hop missed, with where from and to and why, so a hop that keeps failing can be found
+  const missed = status.driving?.missed ?? 0;
+  if (status.playing && status.drive && missed > (playLogged.missed ?? 0)) {
+    const last = status.driving.misses?.at(-1);
+    if (last) appendPlayLog(`Missed a hop from (${last.from.join(', ')}) to (${last.to.join(', ')}): ${last.why} (${missed} missed, ${status.driving.done ?? 0} done)`);
+  }
+  if (status.playing && !playLogged.playing) line = status.drive ? `Driving with ${status.name ?? 'the planner'}${status.trace ? `, keeping what it does in ${status.trace}` : ''}`
+    : status.trace ? `Playing, keeping what it sees in ${status.trace}` : 'Playing';
+  else if (status.playing && !!status.correcting !== playLogged.correcting)
+    line = status.correcting ? 'Correction began' : `Correction ended (${status.corrected ?? 0} so far)`;
+  else if (!status.playing && playLogged.playing) line = `Stopped: ${status.reason ?? 'no reason given'}`;
+  else if (!status.playing && playLogged.playing && playLogged.driving) line = `Stopped driving: ${status.reason ?? 'no reason given'} (${playLogged.done ?? 0} hops done, ${playLogged.missed ?? 0} missed)`;
+  playLogged = { playing: !!status.playing, correcting: !!status.correcting, driving: !!status.drive,
+    missed: status.playing ? missed : 0, done: status.playing ? status.driving?.done ?? 0 : 0 };
+  if (line) appendPlayLog(line);
+}
+function appendPlayLog(line) {
+  try {
+    const dir = path.join(app.getPath('userData'), 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, 'play.log'), `${new Date().toISOString()} ${line}\n`);
+  } catch { /* nowhere to keep it */ }
+}
+// What the guard saw in the seconds before a stop (the window in front, every key and click and who sent it),
+// under the stop in play.log: a stop nobody made needs it to tell what did
+function logTrace(trace) {
+  if (!Array.isArray(trace) || !trace.length) return;
+  try {
+    fs.appendFileSync(path.join(app.getPath('userData'), 'logs', 'play.log'), trace.map(line => `    ${line}
+`).join(''));
+  } catch { /* nowhere to keep it */ }
+}
 app.on('render-process-gone', (_e, contents, details) =>
   logCrash(`The window's page ended: ${details.reason} (exit code ${details.exitCode}) at ${contents.getURL().slice(0, 80)}`));
 app.on('child-process-gone', (_e, details) =>
@@ -260,9 +297,24 @@ function policyInvoke(op, params) {
     policyWorker = lineProcess(PYTHON_EXE(), ['-u', WORKER_SCRIPT(), '--root', DATA_DIR],
       { cwd: path.join(_resRoot(), 'worker'), env: { ...process.env, PYTHONIOENCODING: 'utf-8' } },
       msg => win?.webContents.send('policy:event', { event: msg.event, result: msg.result }),
-      () => { policyWorker = null; play.stop('The policy worker exited'); });
+      () => { policyWorker = null; });
   }
   return policyWorker.invoke(op, params);
+}
+
+// Play's own worker, started the first time a policy plays: its predictions, every frame, can't wait behind what the
+// rest of FireFly asks the other one (a dataset preview makes every recording's rows again, the Spatial node's
+// preview measures five times a second, training runs for minutes), which held a prediction 300 ms, past the guard's
+// watchdog. It answers play alone: load, predict, models and keeping what it sees.
+let playWorker = null;
+function playInvoke(op, params) {
+  if (!playWorker) {
+    if (!fs.existsSync(PYTHON_EXE())) return Promise.reject(new Error('Python not found — run npm run python:setup (dev) or npm run python:bundle first'));
+    playWorker = lineProcess(PYTHON_EXE(), ['-u', WORKER_SCRIPT(), '--root', DATA_DIR],
+      { cwd: path.join(_resRoot(), 'worker'), env: { ...process.env, PYTHONIOENCODING: 'utf-8' } },
+      () => {}, () => { playWorker = null; play.stop('The play worker exited'); });
+  }
+  return playWorker.invoke(op, params);
 }
 
 // The guard replies in the runtime's packets: u32 length, a kind byte, then JSON
@@ -282,7 +334,11 @@ function guardInvoke(op, params = {}) {
         let msg; try { msg = JSON.parse(buf.slice(5, 4 + total).toString('utf8').replace(/\0$/, '')); } catch { msg = null; }
         buf = buf.slice(4 + total);
         if (!msg) continue;
-        if (msg.event === 'guard-stopped') { play.guardStopped(msg.result?.reason ?? 'The input guard stopped'); continue; }
+        if (msg.event === 'guard-stopped') {
+          play.guardStopped(msg.result?.reason ?? 'The input guard stopped');
+          logTrace(msg.result?.trace);
+          continue;
+        }
         const call = pendingCalls.get(msg.id); pendingCalls.delete(msg.id);
         if (msg.ok) call?.resolve(msg); else call?.reject(new Error(msg.error?.message ?? 'Input rejected'));
       }
@@ -309,9 +365,12 @@ function guardInvoke(op, params = {}) {
 // Playing a policy, with the player's corrections (see play.cjs)
 let playingGraphId = null;
 const play = createPlay({
-  runtime: runtimeInvoke, guard: guardInvoke, worker: policyInvoke,
+  runtime: runtimeInvoke, guard: guardInvoke, worker: playInvoke,
   stopGuard: () => { guard?.invoke('stop').catch(() => {}); },
-  send: (channel, value) => win?.webContents.send(channel, { ...value, graphId: playingGraphId }),
+  send: (channel, value) => {
+    if (channel === 'play:status') logPlay(value);
+    win?.webContents.send(channel, { ...value, graphId: playingGraphId });
+  },
   // The runtime's capture times are QueryPerformanceCounter milliseconds, as libuv's hrtime is
   clock: () => Number(process.hrtime.bigint()) / 1e6,
 });
@@ -354,7 +413,12 @@ ipcMain.handle('play:start', async (_e, params) => {
   playingGraphId = params.graphId ?? null;
   try { await play.start(params); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
 });
-ipcMain.handle('play:stop', () => { play.stop('Stopped'); });
+// A key pressing Stop means FireFly was in front with the button focused, while play took the game to be
+ipcMain.handle('play:stop', async (_e, how) => {
+  const was = play.playing;
+  play.stop(how === 'key' ? 'Stop was pressed with a key (FireFly was in front, with Stop focused)' : 'Stop was clicked');
+  if (was && guard) logTrace((await guard.invoke('trace').catch(() => null))?.trace);
+});
 // Writes chosen recordings as a dataset for any trainer, to a file the player picks (see Worker.export)
 ipcMain.handle('policy:export', async (_e, params) => {
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -406,6 +470,7 @@ app.on('window-all-closed', () => {
   collectionWorker?.invoke('shutdown').catch(() => {});
   play.stop('Closing');
   policyWorker?.invoke('shutdown').catch(() => {});
+  playWorker?.invoke('shutdown').catch(() => {});
   guard?.invoke('shutdown').catch(() => {});
   if (runtime) {
     runtimeInvoke('shutdown', {}).catch(() => {});

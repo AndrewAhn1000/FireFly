@@ -1,18 +1,17 @@
 -- FireFly Lua State: Collection
 -- Returns { { points = { { x, y }, ... } }, ... }: every platform as one line, its footholds joined end to end,
 -- so below_ends gives where the platform itself ends, not one foothold of it. Walls (vertical footholds) aren't
--- platforms and are left out. Client pixels, like the other States (map position minus the camera).
+-- platforms and are left out. Every platform of the map, in map coordinates: measure from the character's map
+-- position (map-position.lua).
 -- Assumes GetValue(p, offset) means *(uint32_t*)(p + offset), and
 -- ReadPointer(base, offset) means *(uint32_t*)(*(uint32_t*)base + offset).
 -- Pointers are 32-bit; do not use FireFly's 64-bit read_ptr here. FireFly's Lua has no base library
 -- (no ipairs or pairs): lists are walked by index.
 -- A map's footholds don't move: they're read once per map and kept (a State's script keeps its globals between
--- runs), and each run only moves them by the camera and leaves out the platforms far off screen.
+-- runs), and every run on that map returns the same lines. Reads the Map Id State, which must be on.
 
 local PHYSICAL_SPACE_BASE = 0xBEBFA0 -- CWvsPhysicalSpace2DBase
-local CAMERA_BASE = 0xBF14EC
-local UI_MINIMAP_BASE = 0xBED788
-local OFS_MAP_ID = 0x668
+local MAP_ID_STATE = "Map Id"
 
 local OFS_PLATFORM_COUNT = 0x70
 local OFS_PLATFORM1 = 0x88
@@ -26,7 +25,6 @@ local OFS_NEXT_RIGHT_PLAT = 0x50
 -- A foothold in one read: its left x up to and including its right neighbour
 local FOOTHOLD_BYTES = OFS_NEXT_RIGHT_PLAT + 4 - OFS_PLATFORM_LEFT
 
-local MARGIN = 200 -- px off screen a platform may be and still be returned
 local MAX_FOOTHOLDS = 1300 -- three reads each, under FireFly's 4096 a run
 
 -- Reject the Windows null-pointer range and validate the entire field span.
@@ -39,11 +37,8 @@ local function pointer(base, offset)
     return read_u32(base + offset)
 end
 
--- One camera sample for every platform
-local camera = read_u32(CAMERA_BASE)
-if not validRange(camera, 0x100) then return nil end
-local cameraX = read_i32(camera + 0xF8)
-local cameraY = read_i32(camera + 0xFC)
+local mapId = states[MAP_ID_STATE]
+if mapId == nil then return nil end
 
 local space = read_u32(PHYSICAL_SPACE_BASE)
 if not validRange(space, OFS_PLATFORM1 + 4) then return nil end
@@ -51,8 +46,6 @@ local count = read_i32(space + OFS_PLATFORM_COUNT)
 if count < 0 or count > MAX_FOOTHOLDS then return nil end
 local first = read_u32(space + OFS_PLATFORM1)
 if count > 0 and not validRange(first + OFS_NEXT_PLATFORM, 0x10) then return nil end
-local minimap = read_u32(UI_MINIMAP_BASE)
-local mapId = validRange(minimap, OFS_MAP_ID + 4) and read_i32(minimap + OFS_MAP_ID) or -1
 local key = string.format("%d:%X:%X:%d", mapId, space, first, count)
 
 -- Every foothold of the map, walked once (keeping the node it's at), each read in one read_bytes
@@ -90,17 +83,14 @@ local function joinPlatforms(footholds, byAddress)
     local platforms, used = {}, {}
     local function from(start)
         local f, points = start, { { start.x1, start.y1 } }
-        local left, top, right, bottom = math.min(start.x1, start.x2), math.min(start.y1, start.y2), math.max(start.x1, start.x2), math.max(start.y1, start.y2)
         while f and not used[f] do
             used[f] = true
             points[#points + 1] = { f.x2, f.y2 }
-            left, right = math.min(left, f.x2), math.max(right, f.x2)
-            top, bottom = math.min(top, f.y2), math.max(bottom, f.y2)
             local nextF = byAddress[f.right]
             if not walkable(nextF) or nextF.x1 ~= f.x2 or nextF.y1 ~= f.y2 then break end
             f = nextF
         end
-        platforms[#platforms + 1] = { points = points, left = left, top = top, right = right, bottom = bottom }
+        platforms[#platforms + 1] = { points = points }
     end
     for i = 1, #footholds do -- from every left edge first
         local f = footholds[i]
@@ -114,26 +104,18 @@ local function joinPlatforms(footholds, byAddress)
     return platforms
 end
 
--- Read again only for a new map. The game keeps running while it's read: the list must be the same afterwards.
+-- Read again only for a new map, once it's settled: while a map changes, its id, foothold count and list can
+-- disagree for a moment, so a new map is read only when the same one was seen on the run before. The game keeps
+-- running while it's read: the list must be the same afterwards.
 if not FIREFLY_PLATFORMS or FIREFLY_PLATFORMS.key ~= key then
+    local settled = FIREFLY_PLATFORMS_SEEN == key
+    FIREFLY_PLATFORMS_SEEN = key
+    if not settled then return nil end
     local footholds, byAddress = readFootholds()
     if not footholds then return nil end
     if read_u32(PHYSICAL_SPACE_BASE) ~= space or read_i32(space + OFS_PLATFORM_COUNT) ~= count
         or read_u32(space + OFS_PLATFORM1) ~= first then return nil end
-    FIREFLY_PLATFORMS = { key = key, platforms = joinPlatforms(footholds, byAddress) }
+    FIREFLY_PLATFORMS = { key = key, lines = joinPlatforms(footholds, byAddress) }
 end
 
--- On screen (with a margin), moved by the camera; a platform is kept whole, so its ends are its own
-local view = get_window_size()
-local result = {}
-local platforms = FIREFLY_PLATFORMS.platforms
-for n = 1, #platforms do
-    local p = platforms[n]
-    if p.right - cameraX >= -MARGIN and p.left - cameraX <= view.w + MARGIN
-        and p.bottom - cameraY >= -MARGIN and p.top - cameraY <= view.h + MARGIN then
-        local points = {}
-        for i = 1, #p.points do points[i] = { p.points[i][1] - cameraX, p.points[i][2] - cameraY } end
-        result[#result + 1] = { points = points }
-    end
-end
-return result
+return FIREFLY_PLATFORMS.lines

@@ -1,4 +1,5 @@
 #include "capture.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <d3d11.h>
@@ -184,7 +185,9 @@ public:
     D3D11_MAPPED_SUBRESOURCE mapped{};
     check_hresult(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped));
     uint32_t w = size.Width, h = size.Height;
-    double timestamp = frame.SystemRelativeTime().count() / 10000.0;
+    // When Windows composed it, which is for the next refresh of the screen and so can be a few ms ahead of now:
+    // never later than now, so a frame's age is never negative (the input guard refused such frames as stale)
+    double timestamp = std::min(frame.SystemRelativeTime().count() / 10000.0, nowMs());
     std::vector<uint8_t> bytes(size_t(w) * h * 4);
 
     for (uint32_t y = 0; y < h; ++y)

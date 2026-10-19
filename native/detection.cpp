@@ -46,7 +46,12 @@ static std::string pngUrl(const cv::Mat &image) {
 DetectionResult Detector::operator()(DetectionJob job) {
   DetectionResult out{job.generation, job.recordingGeneration, job.frame};
   out.probes = std::move(job.probes);
+  out.submittedAt = job.submittedAt;
+  out.probesMs = job.probesMs;
   const auto begin = std::chrono::steady_clock::now();
+  // MSVC's steady_clock is QueryPerformanceCounter, so these are monotonicMs, as main.cpp's times are
+  const auto ms = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count(); };
+  out.startedAt = ms(begin);
   try {
 #ifdef _WIN32
     // OCR's WinRT calls now run on the detection thread.
@@ -69,7 +74,9 @@ DetectionResult Detector::operator()(DetectionJob job) {
       }
     }
   } catch (const std::exception &e) { out.error = e.what(); }
-  out.elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+  const auto end = std::chrono::steady_clock::now();
+  out.elapsedMs = std::chrono::duration<double, std::milli>(end - begin).count();
+  out.finishedAt = ms(end);
   if (!out.observations.is_null()) {
     out.observations["detectionMs"] = out.elapsedMs;
     out.observations["timestamp"] = job.frame->timestamp;

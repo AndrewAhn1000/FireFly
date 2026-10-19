@@ -2,8 +2,36 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { buttonLabel } from './Keyboard';
 import {
   cleanError, correctionShareHint, correctionsOf, DEFAULT_CORRECTION_SHARE, MAX_CORRECTION_SHARE, meanF1, newestFirst, percent,
-  playingText, POLICY_VERSION, retrainRequest, type PlayStatus, type PolicyVersion, type RecordingInfo,
+  playingText, policyNodes, POLICY_VERSION, retrainRequest, savedPlayGoal, stopHow, type PlayStatus, type TraceReport, type PolicyVersion, type RecordingInfo,
 } from './policyPlay';
+import { graphScope, SETTINGS } from './windowSetup';
+
+// What a version saw while it played, beside its training: whether its situations were familiar, how it pressed each
+// button against how the player did, and the values most unlike training
+function TraceSummary({ report, error }: { report: TraceReport | null; error?: string }) {
+  if (error) return <div className="play-stopped">{error}</div>;
+  if (!report) return null;
+  const pct = (v: number) => `${Math.round(v * 100)}%`, u = report.unfamiliar;
+  const odd = report.values.filter(v => v.outside > 0.01 || v.shift > 1).slice(0, 10);
+  return <div className="play-trace" aria-label="Its play beside its training">
+    <div>{report.acted.toLocaleString()} of {report.frames.toLocaleString()} frames acted on
+      {report.frames > report.acted ? `; nothing to go on in the rest (${Object.entries(report.missing).map(([r, n]) => `${r}: ${n}`).join('; ')})` : ''}.</div>
+    <div title="Each frame's distance to the training row most like it, in training's spread, beside the rows held back from training">
+      {pct(u.beyondHeldBack90)} of its frames were less like its training than nearly all (90%) of the moments held back from training
+      {u.beyondHeldBack90 > .3 ? ': it was mostly somewhere its recordings don’t cover' : u.beyondHeldBack90 > .1 ? ': often somewhere its recordings don’t cover' : ': its situations were like its training'}.</div>
+    <div>It pressed nothing in {pct(report.pressedNothing)} of frames (you: {pct(report.playerNothing)}).</div>
+    <table className="play-trace-table"><thead><tr><th>Button</th><th>You held it</th><th>It held it</th><th>Its average chance</th></tr></thead>
+      <tbody>{report.buttons.filter(b => b.playerPressed > .002 || b.playPressed > .002).map(b => <tr key={b.id}>
+        <td>{buttonLabel(b.id)}</td><td>{pct(b.playerPressed)}</td><td>{pct(b.playPressed)}</td><td>{pct(b.playChance)}</td></tr>)}</tbody></table>
+    {odd.length > 0 ? <>
+      <div>Values most unlike its training (outside: how often play went past anything training had; shift: how far the average moved, in training's spread):</div>
+      <table className="play-trace-table"><thead><tr><th>Value</th><th>Training</th><th>Play</th><th>Outside</th><th>Shift</th></tr></thead>
+        <tbody>{odd.map(v => <tr key={v.name}><td>{v.name}</td><td>{fmt(v.trainLow)}…{fmt(v.trainHigh)} (avg {fmt(v.trainMean)})</td>
+          <td>{fmt(v.playLow)}…{fmt(v.playHigh)} (avg {fmt(v.playMean)})</td><td>{pct(v.outside)}</td><td>{v.shift.toFixed(1)}</td></tr>)}</tbody></table>
+    </> : <div>Every value stayed within what training had.</div>}
+  </div>;
+}
+const fmt = (v: number) => Math.abs(v) >= 100 ? String(Math.round(v)) : String(Math.round(v * 10) / 10);
 
 // The Play tab: every trained policy and its versions, to play one as it is, or with corrections recorded
 // whenever the player takes over, and then train a new version with those corrections, without opening its
@@ -19,7 +47,7 @@ interface Props {
 }
 interface Epoch { epoch: number; validationLoss: number; buttonF1?: number; }
 // A named policy's versions, newest first; versions trained before policies had names go together
-interface Group { key: string; name: string; versions: PolicyVersion[] }
+interface Group { key: string; name: string; graphs: string[]; versions: PolicyVersion[] }
 
 const when = (v: PolicyVersion) => new Date(v.created * 1000).toLocaleString();
 
@@ -60,25 +88,40 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
     return () => offs.forEach(off => off());
   }, []);
 
+  // Each policy by its Policy node's name now (renamed since a version was trained, the version says the old one),
+  // and the graph it's in; a policy whose node is gone keeps its newest version's name
   const groups = useMemo(() => {
+    const nodes = policyNodes(graphScope(SETTINGS));
     const byKey = new Map<string, Group>();
     for (const v of versions) {
-      const key = v.policy?.id ?? '', name = v.policy?.name || 'Earlier policies';
-      if (!byKey.has(key)) byKey.set(key, { key, name, versions: [] });
+      const key = v.policy?.id ?? '', placed = key ? nodes.filter(n => n.policyId === key) : [];
+      const name = placed.find(n => n.name)?.name || v.policy?.name || 'Earlier policies';
+      if (!byKey.has(key)) byKey.set(key, { key, name, graphs: [...new Set(placed.map(n => n.graph))], versions: [] });
       byKey.get(key)!.versions.push(v);
     }
     // Named policies by their newest version, the unnamed ones last
     return [...byKey.values()].sort((a, b) => (a.key ? 0 : 1) - (b.key ? 0 : 1) || b.versions[0].created - a.versions[0].created);
-  }, [versions]);
+  }, [versions, active]);
   const selected = versions.find(v => v.id === selectedId) ?? groups[0]?.versions[0] ?? null;
   const group = selected ? groups.find(g => g.versions.includes(selected)) ?? null : null;
   const number = (v: PolicyVersion, g: Group) => g.key ? `v${g.versions.length - g.versions.indexOf(v)}` : when(v);
 
+  // Keeping what it sees while it plays, and that beside what it trained on
+  const [keepSeen, setKeepSeen] = useState(false);
+  const [report, setReport] = useState<{ versionId: string; report: TraceReport | null; error?: string; busy?: boolean } | null>(null);
   const play = async (v: PolicyVersion, corrections: boolean) => {
     if (!windowId) return;
     setError('');
-    const res = await window.bridge.policy.play({ modelId: v.id, windowId, corrections });
+    // Where it heads is its graph's now (the Goal's target, route or plan), not what the version trained with
+    const goal = v.policy ? savedPlayGoal(graphScope(SETTINGS), v.policy.id) : null;
+    if (goal && 'error' in goal) { setError(`Can’t play: ${goal.error}`); return; }
+    const res = await window.bridge.policy.play({ modelId: v.id, windowId, corrections, trace: keepSeen, ...(goal ? { goal } : {}) });
     if (!res.ok) setError(res.error ?? 'Could not start playing');
+  };
+  const compare = async (v: PolicyVersion) => {
+    setReport({ versionId: v.id, report: null, busy: true });
+    try { setReport({ versionId: v.id, report: await window.bridge.policy.invoke('trace.report', { modelId: v.id }) as TraceReport }); }
+    catch (e) { setReport({ versionId: v.id, report: null, error: cleanError(e) }); }
   };
   const train = async (v: PolicyVersion, siblings: PolicyVersion[], correctionShare: number) => {
     const request = retrainRequest(v, siblings, recordings, correctionShare);
@@ -95,7 +138,7 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
 
   const playingNow = status.playing ? versions.find(v => v.id === status.modelId) ?? null : null;
   const why = !capturing ? 'Start a capture session first' : !windowId ? 'Choose the game window first'
-    : recording ? 'Stop recording first' : status.playing ? 'Another version is playing' : '';
+    : recording ? 'Stop recording first' : status.playing ? (status.drive ? `${status.name ?? 'A planner'} is driving` : 'Another version is playing') : '';
 
   if (!versions.length) return (
     <div className="play-panel play-empty">
@@ -109,7 +152,9 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
     <div className="play-panel">
       <div className="play-list" aria-label="Trained policies">
         {groups.map(g => <div key={g.key || 'earlier'} className="play-group">
-          <div className="play-group-hd">{g.name}<span>{g.versions.length} version{g.versions.length > 1 ? 's' : ''}</span></div>
+          <div className="play-group-hd" title={g.graphs.length ? `In the graph${g.graphs.length > 1 ? 's' : ''} ${g.graphs.join(', ')}` : g.key ? 'Its Policy node is no longer in any graph' : undefined}>
+            <span className="play-group-name">{g.name}{g.graphs.length > 0 && <small> · {g.graphs.join(', ')}</small>}</span>
+            <span>{g.versions.length} version{g.versions.length > 1 ? 's' : ''}</span></div>
           {g.versions.map(v => {
             const f1 = meanF1(v), isPlaying = playingNow?.id === v.id;
             return <button key={v.id} className={`play-version${v.id === selected?.id ? ' play-version-sel' : ''}`} onClick={() => setSelectedId(v.id)}>
@@ -133,7 +178,8 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
             {f1 !== null ? ` · F1 ${percent(f1)} on recordings it hadn't seen` : ''}
             {v.stepMs ? ` · acts every ${Math.round(v.stepMs)} ms` : ''}
           </div>
-          {buttons.length > 0 && <div className="play-meta">Presses {buttons.join(', ')}</div>}
+          {buttons.length > 0 && <div className="play-meta">Presses {buttons.join(', ')}
+            {Object.keys(v.taps ?? {}).length > 0 && <> · taps {Object.entries(v.taps!).map(([b, t]) => `${buttonLabel(b)} (${t.downMs} ms down, ${t.upMs} up)`).join(', ')}, as you did</>}</div>}
           {v.corrections?.learned != null && <div className="play-meta">
             Trained with {v.corrections.recordings} correction{v.corrections.recordings === 1 ? '' : 's'}: does what you showed it {percent(v.corrections.learned)} of the time
           </div>}
@@ -145,15 +191,21 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
 
           {!playable ? <div className="play-hint">Trained by an older FireFly, so it can't play: train its Policy node again in Graphs.</div> : <>
             <div className="play-actions">
-              {isPlaying ? <button className="train-btn-stop" onClick={() => void window.bridge.policy.stop()}>■ Stop</button> : <>
+              {isPlaying ? <button className="train-btn-stop" onClick={e => void window.bridge.policy.stop(stopHow(e))}>■ Stop</button> : <>
                 <button className="train-btn-primary" disabled={!!why} title={why} onClick={() => void play(v, false)}>▶ Play</button>
                 <button className="train-btn-sm play-correct" disabled={!!why} title={why || 'Take over whenever it goes wrong: what you do is recorded as a correction'}
                   onClick={() => void play(v, true)}>▶ Play and record my corrections</button>
               </>}
             </div>
+            <label className="play-keep" title="Keeps each frame it acts on, with the values it saw and how sure it was of each button, to compare with what it trained on">
+              <input type="checkbox" checked={keepSeen} disabled={isPlaying} onChange={e => setKeepSeen(e.target.checked)} />Keep what it sees, to compare with its training</label>
             {why && !isPlaying && <div className="play-hint">{why}.</div>}
             {isPlaying && <div className="play-live" role="status">{playingText(status)}</div>}
-            {!status.playing && status.reason && (!status.modelId || status.modelId === v.id) && <div className="play-stopped">Stopped: {status.reason}</div>}
+            {!status.playing && status.reason && (!status.modelId && !status.drive || status.modelId === v.id) && <div className="play-stopped">Stopped: {status.reason}</div>}
+            {!isPlaying && <button className="train-btn-sm" disabled={report?.busy}
+              title="Its last play that kept what it saw, beside what it trained on" onClick={() => void compare(v)}>
+              {report?.busy && report.versionId === v.id ? 'Comparing…' : 'Compare what it saw with its training'}</button>}
+            {report && report.versionId === v.id && !report.busy && <TraceSummary report={report.report} error={report.error} />}
             <div className="play-hint">With corrections, press keys or click in the game whenever it goes wrong: you take over, what you do is recorded, and it carries on once you've let go for 1.5 s. Without, any key or click stops it.</div>
           </>}
 
