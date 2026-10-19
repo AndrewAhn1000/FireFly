@@ -41,49 +41,58 @@ html, body, #root {
 /* ── Editor grid ────────────────────────────────────────────────── */
 .editor {
   display: grid;
-  grid-template-rows: 36px 1fr 22px;
+  grid-template-rows: 30px 1fr 22px;
   height: 100%;
   overflow: hidden;
 }
 
-/* ── Toolbar ────────────────────────────────────────────────────── */
-.toolbar {
+/* ── Menu bar ───────────────────────────────────────────────────── */
+.menubar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 10px;
+  padding: 0 4px;
   background: var(--bg-toolbar);
   border-bottom: 1px solid var(--divider);
-  -webkit-app-region: drag;
-  flex-shrink: 0;
+  position: relative;
+  z-index: 150;
 }
-
-.toolbar-brand {
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.8px;
-  color: var(--text-bright);
-  -webkit-app-region: no-drag;
-  margin-right: 6px;
+.menubar-entry { position: relative; }
+.menubar-item {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: default;
 }
-
-.toolbar-actions {
+.menubar-item:hover, .menubar-item.open { background: rgba(255,255,255,0.1); }
+.menubar-menu {
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  min-width: 200px;
+  padding: 4px;
   display: flex;
-  align-items: center;
-  gap: 4px;
-  -webkit-app-region: no-drag;
-  flex: 1;
-  justify-content: center;
+  flex-direction: column;
+  background: var(--bg-panel, #252526);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 5px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.45);
 }
-
-.toolbar-status {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--text-dim);
-  -webkit-app-region: no-drag;
+.menubar-menu button {
+  text-align: left;
+  padding: 5px 20px 5px 12px;
+  font-size: 12px;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 3px;
+  cursor: default;
 }
+.menubar-menu button:hover:not(:disabled) { background: var(--accent, #0e639c); color: #fff; }
+.menubar-menu button:disabled { opacity: 0.4; }
 
 /* Toolbar buttons */
 .tbtn {
@@ -98,50 +107,6 @@ html, body, #root {
   border-radius: 3px;
   transition: background 0.1s, color 0.1s;
 }
-
-.tbtn-icon { font-size: 10px; }
-
-.tbtn-primary {
-  background: #3a7bd5;
-  color: #fff;
-}
-.tbtn-primary:hover:not(:disabled) { background: #4a8be5; }
-.tbtn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
-
-.tbtn-ghost {
-  background: rgba(255,255,255,0.06);
-  color: var(--text);
-  border: 1px solid rgba(255,255,255,0.1);
-}
-.tbtn-ghost:hover:not(:disabled) { background: rgba(255,255,255,0.12); }
-.tbtn-ghost:disabled { opacity: 0.35; cursor: not-allowed; }
-
-.tbtn-record {
-  background: var(--record);
-  color: #fff;
-}
-.tbtn-record:hover { background: #f03838; }
-
-.tbtn-record-active {
-  background: rgba(224,48,48,0.18);
-  color: #ff6b6b;
-  border: 1px solid rgba(224,48,48,0.4);
-  font-variant-numeric: tabular-nums;
-  min-width: 90px;
-  justify-content: center;
-}
-.tbtn-record-active:hover { background: rgba(224,48,48,0.28); }
-
-/* Status dot */
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.status-dot-on  { background: var(--green); box-shadow: 0 0 4px var(--green); }
-.status-dot-off { background: var(--yellow); }
-.status-label   { font-size: 11px; color: var(--text-dim); }
 
 /* ── Workspace ──────────────────────────────────────────────────── */
 .workspace {
@@ -327,10 +292,6 @@ html, body, #root {
   align-items: center;
   gap: 4px;
 }
-.win-saved-badge {
-  color: #69f0ae;
-  font-size: 8px;
-}
 /* ── Session confirmation modal ──────────────────────────────────── */
 .modal-overlay {
   position: fixed;
@@ -378,14 +339,6 @@ html, body, #root {
   margin: 0 16px 4px;
   font-size: 11px;
   color: #ffd54f;
-}
-.modal-session-info {
-  margin: 0 16px 12px;
-  font-size: 11px;
-  color: #69f0ae;
-}
-.modal-session-new {
-  color: var(--text-muted);
 }
 .modal-actions {
   display: flex;
@@ -1194,8 +1147,6 @@ html, body, #root {
 .recordings-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; overflow: hidden; font-size: 11px; }
 .recordings-panel[hidden] { display: none; }
 /* Sharing a setup as a file */
-.import-from-file { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--divider); }
-.import-from-file .modal-form-hint { margin: 0; }
 .setup-message { display: flex; align-items: flex-start; gap: 6px; word-break: break-all; }
 .setup-message-x { flex-shrink: 0; padding: 0 2px; background: none; border: none; color: var(--text-dim); cursor: pointer; }
 
@@ -1791,6 +1742,7 @@ html, body, #root {
 .sb-sep  { color: rgba(255,255,255,0.35); flex-shrink: 0; }
 .sb-rec  { display: flex; align-items: center; gap: 5px; }
 .sb-err  { color: #ffd0d0; display: flex; align-items: center; gap: 5px; }
+.sb-msg  { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .sb-err-close {
   color: rgba(255,255,255,0.7);
   font-size: 11px;

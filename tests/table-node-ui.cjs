@@ -60,14 +60,14 @@ app.whenReady().then(async()=>{
     {id:'mobs',name:'Mob animations',type:'collection',source:'script',script:'return {1,3}'},
     {id:'busy',name:'Busy',type:'boolean',source:'script',script:'return true -- busy'},
   ];
-  await js(`localStorage.clear();localStorage.setItem('firefly-states-Test%20Game',${JSON.stringify(JSON.stringify(states))})`);
+  await js(`localStorage.clear();localStorage.setItem('firefly-states-%7Bsettings%7D',${JSON.stringify(JSON.stringify(states))})`);
   win.reload();await wait(500);
   await until(`document.querySelector('.win-item')`);await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);await click('Start Session');
   await until(`document.querySelector('[aria-label="Edit Mob animations"]')`);
   await click('Graphs');
   await click('+ Collection');await input('Graph name','Seen moments');await click('Save');
   await until(`document.querySelector('.collection-editor')`);
-  const scope='firefly-policy-graph-Test%20Game';
+  const scope='firefly-policy-graph-%7Bsettings%7D';
   const selected=await js(`JSON.parse(localStorage.getItem('${scope}-library')).selected`);
   const readDoc=()=>js(`JSON.parse(localStorage.getItem('${scope}-document-${selected}'))`);
   for(const kind of ['Table','State','State','State','State'])await click(kind);

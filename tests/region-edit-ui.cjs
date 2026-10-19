@@ -26,7 +26,7 @@ app.whenReady().then(async()=>{
   const until=async code=>{for(let i=0;i<100;i++){if(await js(code))return;await wait(40);}throw Error('UI condition failed: '+code);};
   const click=async label=>{await js(`(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(label)});if(!b)throw Error('Missing '+${JSON.stringify(label)});b.click()})()`);await wait(60);};
   const input=async(label,value)=>{await js(`(()=>{const i=document.querySelector('[aria-label="${label}"]');Object.getOwnPropertyDescriptor(i.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,'value').set.call(i,${JSON.stringify(value)});i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(50);};
-  const key='firefly-regions-Region%20fixture',saved=()=>js(`JSON.parse(localStorage.getItem('${key}'))`);
+  const key='firefly-regions-%7Bsettings%7D',saved=()=>js(`JSON.parse(localStorage.getItem('${key}'))`);
   const original=[{id:'mobs',label:'Monsters',source:'script',script:'return {{x=80,y=60,w=160,h=120}}',templates:[],visible:true,x:0,y:0,w:0,h:0},
     {id:'ui',label:'Minimap',source:'manual',templates:[],x:.75,y:0,w:.25,h:.25}];
   await win.loadFile(path.join(root,'dist/index.html'));

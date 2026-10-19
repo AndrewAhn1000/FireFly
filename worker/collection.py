@@ -15,6 +15,8 @@ from PIL import Image
 from formulas import FormulaSet, Missing
 
 
+# The scope Table nodes are kept under: the global settings' graphs (graphScope(SETTINGS) in windowSetup.ts)
+SETTINGS_SCOPE = 'firefly-policy-graph-%7Bsettings%7D'
 KINDS = {'state', 'condition', 'logic', 'formula', 'trigger', 'capture', 'format', 'output', 'table'}
 
 
@@ -35,6 +37,10 @@ class Tables:
             db.execute('CREATE TABLE IF NOT EXISTS table_rows (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, name TEXT NOT NULL,'
                        ' columns TEXT NOT NULL, saved_at TEXT NOT NULL, image TEXT)')
             db.execute('CREATE INDEX IF NOT EXISTS table_rows_name ON table_rows (scope, name)')
+            # Settings used to be per window, and so were tables (scoped by the window's title): their rows are the
+            # settings' now, as the windows' graphs became the settings' (migrateSettings in windowSetup.ts)
+            with db:
+                db.execute('UPDATE table_rows SET scope = ? WHERE scope LIKE ? AND scope != ?', (SETTINGS_SCOPE, 'firefly-policy-graph-%', SETTINGS_SCOPE))
             self.db = db
         return self.db
 

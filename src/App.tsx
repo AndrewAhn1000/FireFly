@@ -9,11 +9,11 @@ import type { GpuInfo, SetupFileSummary } from './bridge';
 import PlayPanel from './PlayPanel';
 import { inferenceChoice, type InferenceDevice } from './inference';
 import Keyboard, { BUTTONS, MAX_BUTTONS } from './Keyboard';
-import { copySetup, exportSetup, fileSummary, importSetupFile, savedSetups, setupOf, SETUP_PARTS, type SavedSetup, type SetupPart } from './windowSetup';
+import { exportSetup, fileSummary, graphScope, importSetupFile, migrateSettings, setupOf, SETTINGS, SETUP_PARTS, type SavedSetup, type SetupPart } from './windowSetup';
 import Transport from './Transport';
 import GraphLibrary from './GraphLibrary';
 import { stateValueError } from './stateValues';
-import { scriptRegionBoxes, luaRegionSnapshot, type ScriptGeometry, type RegionBoxSnapshot } from './scriptRegions';
+import { scriptRegionBoxes, luaRegionSnapshot, type ScriptBox, type ScriptGeometry, type RegionBoxSnapshot } from './scriptRegions';
 import LuaScriptEditor from './LuaScriptEditor';
 import { luaPollRunner, luaStateDefinitions } from './luaPolling';
 import LookThumb, { MATCH_LOOKS, type MatchLook } from './LookThumb';
@@ -49,7 +49,6 @@ interface Corners         { tl: Template; br: Template; size: number; at: { x: n
 // fit: the box also takes the size of the object, found by its corners rather than by a template of the whole
 // flow: the values read from what's inside the box (see flows.ts)
 interface Region          { id: string; label: string; x: number; y: number; w: number; h: number; templates: Template[]; source?: 'manual' | 'script'; script?: string; scriptWidth?: number; scriptHeight?: number; visible?: boolean; match?: boolean; multiMatch?: boolean; matchThreshold?: number; searchReach?: number | 'window'; searchWiden?: 'frame' | 'frames'; searchWidenBy?: number; matchOn?: MatchLook; fit?: boolean; corners?: Corners; flow?: Flow; }
-interface ScriptBox       { x: number; y: number; w: number; h: number; }
 interface ScriptRegionReading {
   value: unknown;
   geometry: ScriptGeometry;
@@ -150,6 +149,12 @@ interface LiveBox         { x: number; y: number; w: number; h: number; }
 const placedAt = (r: Region, live: Record<string, LiveBox>): Region => live[r.id] ? { ...r, ...live[r.id] } : r;
 // What a window has saved, in a few words (windowSetup.ts)
 const plural = (n: number, what: string) => `${n} ${what}${n === 1 ? '' : 's'}`;
+// Memory and Lua States read the game's process: only while a session is on a window
+const needsProcess = (s: GameState) => s.source === 'memory' || s.source === 'script';
+// What a settings file is called, and where one came from: a file from before settings were global names a window
+const SETTINGS_NAME = 'FireFly settings';
+const fileOrigin = (window: string, capital = false) =>
+  !window || window === SETTINGS_NAME || window === SETTINGS ? `${capital ? 'S' : 's'}ettings from a file` : `${capital ? 'T' : 't'}he setup of the window “${window}”`;
 const setupSummary = (s: SavedSetup) => [plural(s.states, 'state'), plural(s.regions, 'region'), ...(s.graphs ? [plural(s.graphs, 'graph')] : [])].join(', ');
 // A copy of a per-region record without one region, or with none at all
 function without<T>(record: Record<string, T>, regionId?: string): Record<string, T> {
@@ -215,6 +220,8 @@ const DEFAULT_REGION_SCRIPT = `-- Return a box or array of boxes in game pixel c
 --   { x1, y1, x2, y2, w, h }  two corners + explicit box size
 --   { x, y, w, h }             top-left + size (legacy)
 
+--   { points = {{x, y}, ...} } a line through two or more points
+--
 local sz = get_window_size()
 return { x1=0, y1=0, x2=sz.w, y2=sz.h }
 `;
@@ -364,24 +371,26 @@ export default function App() {
   const [filter, setFilter]               = useState('');
   const [page, setPage]                   = useState(0);
   const [selectedId, setSelectedId]       = useState<string | null>(null);
-  const [selectedTitle, setSelectedTitle] = useState<string | null>(null);
-  // The last window a session was started on: with none chosen (as after starting FireFly), the Policy
-  // Graph is that window's, rather than an empty one that looked as if the graph had gone
-  const [lastTitle, setLastTitle] = useState<string | null>(() => { try { return localStorage.getItem('firefly-last-window'); } catch { return null; } });
-  useEffect(() => {
-    if (!selectedTitle) return;
-    setLastTitle(selectedTitle);
-    try { localStorage.setItem('firefly-last-window', selectedTitle); } catch { /* quota */ }
-  }, [selectedTitle]);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
-  // Starting a session; `from` is another window whose setup a window with none starts from
-  const [confirmDialog, setConfirmDialog] = useState<{ windowId: string; title: string; from?: string } | null>(null);
-  // Copying another window's setup into this one's (windowSetup.ts)
-  const [importDialog, setImportDialog] = useState<{ from: string; parts: SetupPart[] } | null>(null);
-  // Sharing a setup as a file: what goes into one, what a file opened holds and what of it to import, and what happened
+  // Starting a session
+  const [confirmDialog, setConfirmDialog] = useState<{ windowId: string; title: string } | null>(null);
+  // The settings as a file (the settings bar): what goes into one, what a file opened holds and what of it to
+  // import, and what happened
   const [exportDialog, setExportDialog] = useState<{ parts: SetupPart[]; modelIds: string[]; busy?: boolean } | null>(null);
   const [fileImport, setFileImport] = useState<{ token: string; summary: SetupFileSummary; parts: SetupPart[]; models: number[]; busy?: boolean } | null>(null);
   const [setupMessage, setSetupMessage] = useState('');
+  // The menu bar's open menu
+  const [menuOpen, setMenuOpen] = useState<string | null>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e: Event) => { if (!(e.target instanceof Element && e.target.closest('.menubar'))) setMenuOpen(null); };
+    const key = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenuOpen(null); };
+    window.addEventListener('mousedown', close); window.addEventListener('keydown', key);
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', key); };
+  }, [menuOpen]);
+  // The settings are read once they're there to read (see Persistence), and not saved before, which would
+  // write the empty ones FireFly starts with over them
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   // Bumped when the Graphs' saved library changes under them, so they're read again
   const [graphsVersion, setGraphsVersion] = useState(0);
   const [createDialog, setCreateDialog]   = useState<{ id?: string; label: string; templates: Template[]; source: 'manual' | 'script'; script: string; scriptWidth?: number; scriptHeight?: number } | null>(null);
@@ -1677,6 +1686,26 @@ export default function App() {
       }
     };
 
+    // A Lua Region's line, through its points, with a name at its start when it's given one
+    const drawLine = (line: { x: number; y: number }[], selected: boolean, label: string | null) => {
+      ctx.setLineDash([]);
+      ctx.strokeStyle = selected ? '#ffffff' : '#4fc3f7';
+      ctx.lineWidth = selected ? 3 : 2;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      line.forEach((p, i) => { const px = ox + p.x * rw, py = oy + p.y * rh; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); });
+      ctx.stroke();
+      if (label) {
+        const px = ox + line[0].x * rw, py = oy + line[0].y * rh;
+        ctx.font = '11px ui-monospace,monospace';
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = '#4fc3f7cc';
+        ctx.fillRect(px, Math.max(0, py - 17), tw + 6, 17);
+        ctx.fillStyle = '#fff';
+        ctx.fillText(label, px + 3, Math.max(12, py - 4));
+      }
+    };
+
     const { selId, selBoxIdx, mode, working, drawStart, drawEnd } = ix.current;
     // A paused view draws what its frame was captured with, not the live values
     const frozen = frozenOverlay.current;
@@ -1687,9 +1716,17 @@ export default function App() {
       if (r.source === 'script') {
         const boxes = scriptBoxes[r.id] ?? [];
         const hidden = hiddenSubBoxesRef.current[r.id];
+        // Lines carry the Region's name once, at the first (a map's platforms are dozens of them), or their own number
+        // when chosen on their own
+        let named = false;
         boxes.forEach((box, i) => {
           if (hidden?.has(i)) return;
           const isSel = r.id === selId && (selBoxIdx === null || selBoxIdx === i);
+          if (box.line) {
+            drawLine(box.line, isSel, r.id === selId && selBoxIdx === i ? `${r.label} ${i + 1}` : named ? null : r.label);
+            named = true;
+            return;
+          }
           drawBox({ ...r, ...box, label: `${r.label} ${i + 1}` }, isSel);
         });
       } else {
@@ -2022,45 +2059,56 @@ export default function App() {
 
   // ── Persistence ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!selectedTitle) return;
-    const key = `firefly-regions-${encodeURIComponent(selectedTitle)}`;
+    if (!settingsLoaded) return;
+    const key = `firefly-regions-${encodeURIComponent(SETTINGS)}`;
     try {
       if (regions.length > 0) localStorage.setItem(key, JSON.stringify(regions));
       else localStorage.removeItem(key);
     } catch { /* quota exceeded */ }
-  }, [regions, selectedTitle]);
+  }, [regions, settingsLoaded]);
 
   useEffect(() => {
-    if (!selectedTitle) return;
-    const key = `firefly-states-${encodeURIComponent(selectedTitle)}`;
+    if (!settingsLoaded) return;
+    const key = `firefly-states-${encodeURIComponent(SETTINGS)}`;
     try {
       if (gameStates.length > 0) localStorage.setItem(key, JSON.stringify(gameStates));
       else localStorage.removeItem(key);
     } catch { /* quota exceeded */ }
-  }, [gameStates, selectedTitle]);
+  }, [gameStates, settingsLoaded]);
 
   useEffect(() => {
-    if (!selectedTitle) return;
-    const key = `firefly-state-folders-${encodeURIComponent(selectedTitle)}`;
+    if (!settingsLoaded) return;
+    const key = `firefly-state-folders-${encodeURIComponent(SETTINGS)}`;
     try {
       if (stateFolders.length > 0) localStorage.setItem(key, JSON.stringify(stateFolders));
       else localStorage.removeItem(key);
     } catch { /* quota exceeded */ }
-  }, [stateFolders, selectedTitle]);
+  }, [stateFolders, settingsLoaded]);
 
   useEffect(() => {
-    if (!selectedTitle) return;
-    try { localStorage.setItem(`firefly-recorded-${encodeURIComponent(selectedTitle)}`, JSON.stringify(recordChoices)); }
+    if (!settingsLoaded) return;
+    try { localStorage.setItem(`firefly-recorded-${encodeURIComponent(SETTINGS)}`, JSON.stringify(recordChoices)); }
     catch { /* quota exceeded */ }
-  }, [recordChoices, selectedTitle]);
+  }, [recordChoices, settingsLoaded]);
 
   useEffect(() => {
-    if (!selectedTitle) return;
-    try { localStorage.setItem(`firefly-record-setup-${encodeURIComponent(selectedTitle)}`, JSON.stringify({ buttons: [...activeButtons], hz: recordHz })); }
+    if (!settingsLoaded) return;
+    try { localStorage.setItem(`firefly-record-setup-${encodeURIComponent(SETTINGS)}`, JSON.stringify({ buttons: [...activeButtons], hz: recordHz })); }
     catch { /* quota exceeded */ }
-  }, [activeButtons, recordHz, selectedTitle]);
+  }, [activeButtons, recordHz, settingsLoaded]);
 
   // ── Memory / script state polling ────────────────────────────────
+  // Memory and Lua States (and Lua Regions) read the game's process, which only a session on a window gives
+  // them: without one they're not read, run or tested, and what they read last isn't kept to be shown as if
+  // it were current
+  const clearProcessReads = useCallback(() => {
+    const reads = new Set(gameStatesRef.current.filter(s => needsProcess(s)).map(s => s.id));
+    const drop = <T,>(prev: Record<string, T>) => Object.fromEntries(Object.entries(prev).filter(([id]) => !reads.has(id)));
+    setStateValues(prev => drop(prev)); setStateReadErrors(prev => drop(prev));
+    luaRegionSnapshots.current = {};
+    regionScriptBoxesRef.current = {}; setRegionScriptBoxes({});
+    regionReadingsRef.current = {}; setRegionReadings({});
+  }, []);
   useEffect(() => {
     // A State turned off isn't read, and a hidden Lua Region's script doesn't run
     const memStates    = gameStates.filter(s => s.source === 'memory' && s.address && !s.off);
@@ -2133,43 +2181,57 @@ export default function App() {
       if (recording?.active) await window.bridge.invoke('record.stop');
       await window.bridge.invoke('stop');
       setCaptureActive(false); setRecording(null); setFrameUrl(null);
+      clearProcessReads();
     } catch (e) { stopping.current = false; setError(String(e)); }
-  }, [recording]);
+  }, [recording, clearProcessReads]);
 
-  // A window's setup as saved under its title (see Persistence): its Regions, States and their folders, and
-  // what it records. What was read, tried or selected for the window before is let go.
-  const loadSetup = useCallback((title: string) => {
+  // What was read, tried or selected for a window is let go: on a new window, or new settings
+  const resetSession = useCallback(() => {
     luaRegionSnapshots.current = {};
     ++scriptTestVersion.current;
     setStateDialog(null); setScriptPreview(null); setSelectedStateId(null);
     ++regionScriptTestVersion.current;
     setCreateDialog(null); setRegionScriptPreview(null);
-    try {
-      const saved = localStorage.getItem(`firefly-regions-${encodeURIComponent(title)}`);
-      setRegions(saved ? (JSON.parse(saved) as Region[]) : []);
-    } catch { setRegions([]); }
-    try {
-      const saved = localStorage.getItem(`firefly-states-${encodeURIComponent(title)}`);
-      setGameStates(saved ? (JSON.parse(saved) as GameState[]) : []);
-      const folders = localStorage.getItem(`firefly-state-folders-${encodeURIComponent(title)}`);
-      setStateFolders(folders ? (JSON.parse(folders) as StateFolder[]) : []);
-    } catch { setGameStates([]); }
-    try {
-      const saved = JSON.parse(localStorage.getItem(`firefly-record-setup-${encodeURIComponent(title)}`) ?? 'null') as { buttons?: string[]; hz?: number } | null;
-      setActiveButtons(new Set(saved?.buttons ?? DEFAULTS));
-      setRecordHz(Math.min(30, Math.max(5, saved?.hz ?? 15)));
-    } catch { setActiveButtons(new Set(DEFAULTS)); setRecordHz(15); }
-    try {
-      const saved = localStorage.getItem(`firefly-recorded-${encodeURIComponent(title)}`);
-      setRecordChoices(saved ? JSON.parse(saved) as Record<string, boolean> : {});
-    } catch { setRecordChoices({}); }
     setStateValues({}); setStateReadErrors({});
     regionReadingsRef.current = {}; setRegionReadings({});
     stopAllTracking();
     ix.current = { mode:'idle', selId:null, selBoxIdx:null, drawStart:null, drawEnd:null, moveStart:null, orig:null, working:null, handle:null };
-  }, [setRegions, stopAllTracking]);
+  }, [stopAllTracking]);
+  // The settings as saved (see Persistence): Regions, States and their folders, and what's recorded. They're
+  // the same for every window.
+  const loadSettings = useCallback(() => {
+    resetSession();
+    try {
+      const saved = localStorage.getItem(`firefly-regions-${encodeURIComponent(SETTINGS)}`);
+      setRegions(saved ? (JSON.parse(saved) as Region[]) : []);
+    } catch { setRegions([]); }
+    try {
+      const saved = localStorage.getItem(`firefly-states-${encodeURIComponent(SETTINGS)}`);
+      setGameStates(saved ? (JSON.parse(saved) as GameState[]) : []);
+      const folders = localStorage.getItem(`firefly-state-folders-${encodeURIComponent(SETTINGS)}`);
+      setStateFolders(folders ? (JSON.parse(folders) as StateFolder[]) : []);
+    } catch { setGameStates([]); }
+    try {
+      const saved = JSON.parse(localStorage.getItem(`firefly-record-setup-${encodeURIComponent(SETTINGS)}`) ?? 'null') as { buttons?: string[]; hz?: number } | null;
+      setActiveButtons(new Set(saved?.buttons ?? DEFAULTS));
+      setRecordHz(Math.min(30, Math.max(5, saved?.hz ?? 15)));
+    } catch { setActiveButtons(new Set(DEFAULTS)); setRecordHz(15); }
+    try {
+      const saved = localStorage.getItem(`firefly-recorded-${encodeURIComponent(SETTINGS)}`);
+      setRecordChoices(saved ? JSON.parse(saved) as Record<string, boolean> : {});
+    } catch { setRecordChoices({}); }
+  }, [setRegions, resetSession]);
+  // Once, at start: the settings (from the last window's own setup, the first time; see migrateSettings)
+  useEffect(() => {
+    try {
+      const from = migrateSettings(localStorage);
+      if (from) setSetupMessage(`Settings are now the same for every window. They start from what “${from}” had.`);
+    } catch { /* storage unavailable: start empty */ }
+    loadSettings();
+    setSettingsLoaded(true);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectWindow = useCallback(async (id: string, title: string) => {
+  const selectWindow = useCallback(async (id: string) => {
     if (captureActive) {
       stopping.current = true;
       try {
@@ -2179,8 +2241,7 @@ export default function App() {
       } catch { stopping.current = false; }
     }
     setSelectedId(id);
-    setSelectedTitle(title);
-    loadSetup(title);
+    resetSession();
     setFrameSize(null);
     try {
       await applyLiveGraph(runningModelsRef.current);
@@ -2189,46 +2250,36 @@ export default function App() {
       // Every region set to follow its object picks that up again
       for (const r of regionsRef.current) if (r.match && hasAnchors(r)) startTracking(r.id);
     } catch (e) { setError(String(e)); }
-  }, [captureActive, recording, applyLiveGraph, startTracking, loadSetup]);
+  }, [captureActive, recording, applyLiveGraph, startTracking, resetSession]);
 
-  // Another window's setup in place of this one's, for the parts chosen: saved under this window's title, then
-  // read again as when a session starts. The capture carries on.
+  // Imported settings, in place of what they were for the parts chosen: read again as at start. A capture
+  // carries on.
   const setupImported = useCallback((parts: SetupPart[]) => {
-    if (!selectedTitle) return;
-    loadSetup(selectedTitle);
+    loadSettings();
     if (parts.includes('graphs')) setGraphsVersion(v => v + 1);
     if (captureActive) for (const r of regionsRef.current) if (r.match && hasAnchors(r)) startTracking(r.id);
-  }, [selectedTitle, captureActive, loadSetup, startTracking]);
-  const importSetup = useCallback((from: string, parts: SetupPart[]) => {
-    if (!selectedTitle || !parts.length) return;
-    try { copySetup(localStorage, from, selectedTitle, parts); }
-    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
-    setupImported(parts);
-  }, [selectedTitle, setupImported]);
+  }, [captureActive, loadSettings, startTracking]);
 
-  // This window's setup into a file to share: the parts chosen, and the trained models chosen with their files
+  // The settings into a file to share: the parts chosen, and the trained models chosen with their files
   const exportSetupFile = useCallback(async (parts: SetupPart[], modelIds: string[]) => {
-    if (!selectedTitle) return;
-    const file = exportSetup(localStorage, selectedTitle, parts);
-    const res = await window.bridge.setup.exportFile({ title: selectedTitle, entries: file.entries, parts: file.parts, cleared: file.cleared, modelIds });
+    const file = exportSetup(localStorage, SETTINGS, parts);
+    const res = await window.bridge.setup.exportFile({ title: SETTINGS_NAME, entries: file.entries, parts: file.parts, cleared: file.cleared, modelIds });
     if (res.canceled) return false;
     if (!res.ok) { setError(`Could not export the setup: ${res.error}`); return false; }
     setSetupMessage(`Exported to ${res.path} (${((res.size ?? 0) / 2 ** 20).toFixed(1)} MB${res.models ? `, with ${plural(res.models, 'model')}` : ''}).`
       + (file.cleared ? ` ${plural(file.cleared, 'Dataset Output folder')} left out: ${file.cleared > 1 ? "they're" : "it's"} a place on this PC.` : ''));
     return true;
-  }, [selectedTitle]);
-  // A setup file someone shared: what it holds first, then (on Import) its models into the library and the rest
-  // as this window's setup, in place of what it had for those parts
+  }, []);
+  // A settings file someone shared: what it holds first, then (on Import) its models into the library and the
+  // rest as the settings, in place of what they were for those parts
   const openSetupFile = useCallback(async () => {
     const res = await window.bridge.setup.openFile();
     if (res.canceled) return;
     if (!res.ok || !res.token || !res.summary) { setError(`Could not open the setup: ${res.error ?? 'unknown error'}`); return; }
     const parts = fileSummary(res.summary.entries).parts;
-    setImportDialog(null);
     setFileImport({ token: res.token, summary: res.summary, parts, models: res.summary.models.map(m => m.index) });
   }, []);
   const importSetupFromFile = useCallback(async (fi: NonNullable<typeof fileImport>) => {
-    if (!selectedTitle) return;
     let added = '';
     if (fi.models.length) {
       const res = await window.bridge.setup.installModels(fi.token, fi.models);
@@ -2238,12 +2289,17 @@ export default function App() {
         had.length ? `, ${had.length} you already had` : '', failed.length ? `; ${failed.map(m => `“${m.name}” couldn't be added (${m.error})`).join(', ')}` : ''].join('') + '.';
       await refreshModels();
     }
-    try { importSetupFile(localStorage, selectedTitle, fi.summary.entries, fi.parts); }
-    catch (e) { setError(`Could not import the setup: ${String(e)}`); return; }
+    try { importSetupFile(localStorage, SETTINGS, fi.summary.entries, fi.parts); }
+    catch (e) { setError(`Could not import the settings: ${String(e)}`); return; }
     void window.bridge.setup.close(fi.token);
     setupImported(fi.parts);
-    setSetupMessage(`Imported the setup from “${fi.summary.window}”.${added}`);
-  }, [selectedTitle, setupImported, refreshModels]);
+    setSetupMessage(`Imported ${fileOrigin(fi.summary.window)}.${added}`);
+  }, [setupImported, refreshModels]);
+  // The Export dialog, with the models the States read ticked to start with: what the settings need
+  const openExport = useCallback(() => {
+    const read = new Set(gameStates.filter(s => s.source === 'model').map(s => s.output ?? ''));
+    setExportDialog({ parts: SETUP_PARTS.map(p => p.id), modelIds: models.filter(m => modelOutputs(m).some(o => read.has(o.name))).map(m => m.id) });
+  }, [gameStates, models]);
 
   const startRecording = useCallback(async () => {
     const buttons = BUTTON_DEFS.filter(b => activeButtons.has(b.id)).map(({ id, vk }) => ({ id, vk }));
@@ -2931,18 +2987,18 @@ export default function App() {
   return (
     <div className="editor">
 
-      {/* Toolbar */}
-      <div className="toolbar">
-        <div className="toolbar-brand">FireFly</div>
-        <div className="toolbar-actions">
-          {captureActive && (!isRecording
-            ? <button className="tbtn tbtn-record" onClick={startRecording}><span className="rec-dot-sm" /> Record</button>
-            : <button className="tbtn tbtn-record-active" onClick={stopRecording}><span className="rec-dot-sm anim" /> {fmt(elapsed)}</button>
+      {/* Menu bar: the settings (the same for every window) from and to a file */}
+      <div className="menubar" role="menubar">
+        <div className="menubar-entry">
+          <button className={`menubar-item${menuOpen === 'file' ? ' open' : ''}`} role="menuitem" aria-haspopup="menu" aria-expanded={menuOpen === 'file'}
+            onClick={() => setMenuOpen(m => m === 'file' ? null : 'file')}>File</button>
+          {menuOpen === 'file' && (
+            <div className="menubar-menu" role="menu" aria-label="File">
+              <button role="menuitem" disabled={isRecording} title={isRecording ? 'Stop recording first' : undefined}
+                onClick={() => { setMenuOpen(null); void openSetupFile(); }}>Import Settings…</button>
+              <button role="menuitem" onClick={() => { setMenuOpen(null); openExport(); }}>Export Settings…</button>
+            </div>
           )}
-        </div>
-        <div className="toolbar-status">
-          <span className={`status-dot ${ready ? 'status-dot-on' : 'status-dot-off'}`} />
-          <span className="status-label">{ready ? 'Connected' : 'Connecting…'}</span>
         </div>
       </div>
 
@@ -2963,9 +3019,7 @@ export default function App() {
             {status === 'ready' && filteredWins.length === 0 && (
               <div className="hierarchy-empty">{filter ? 'No matches' : 'No windows found — click ↺'}</div>
             )}
-            {pageWins.map(w => {
-              const hasSaved = !!localStorage.getItem(`firefly-regions-${encodeURIComponent(w.title)}`);
-              return (
+            {pageWins.map(w => (
               <div
                 key={w.id}
                 className={`win-item ${highlightedId === w.id ? 'selected' : ''} ${captureActive && selectedId === w.id ? 'capturing' : ''}`}
@@ -2980,13 +3034,10 @@ export default function App() {
                 </div>
                 <div className="win-meta">
                   <span className="win-title">{w.title}</span>
-                  <span className="win-pid">
-                    PID {w.pid}
-                    {hasSaved && <span className="win-saved-badge" title="Session data saved">●</span>}
-                  </span>
+                  <span className="win-pid">PID {w.pid}</span>
                 </div>
               </div>
-            );})}
+            ))}
           </div>
           {filteredWins.length > PAGE_SIZE && (
             <div className="pagination">
@@ -3110,15 +3161,14 @@ export default function App() {
               )}
             </div>
             <GraphLibrary
-              key={`${selectedTitle || lastTitle || 'any'}:${graphsVersion}`}
+              key={`settings:${graphsVersion}`}
               regions={regions}
               active={viewTab === 'graph'}
               online={ready}
               capturing={captureActive}
               windowId={captureActive ? selectedId : null}
               recording={isRecording}
-              storageKey={`firefly-policy-graph-${encodeURIComponent(selectedTitle || lastTitle || 'any')}`}
-              graphOf={selectedTitle || lastTitle}
+              storageKey={graphScope(SETTINGS)}
               observed={policyObserved}
               frameSize={frameSize}
               stateLabels={gameStates.reduce<Record<string, string>>((labels, s) => {
@@ -3596,20 +3646,7 @@ export default function App() {
           <div className="inspector">
 
             <div className="insp-section">
-              <div className="insp-section-hd"><span>Capture Target</span>
-                {selectedTitle && <button className="insp-section-action" disabled={isRecording}
-                  title={isRecording ? 'Stop recording first' : 'Copy the States, Regions, Lua scripts, Graphs or recording setup of another window, such as the same game titled differently'}
-                  onClick={() => setImportDialog({ from: savedSetups(localStorage, selectedTitle)[0]?.title ?? '', parts: SETUP_PARTS.map(p => p.id) })}>Import…</button>}
-                {selectedTitle && <button className="insp-section-action"
-                  title="Save this window's States, Regions, Graphs and recording setup, and trained models, as a file to share"
-                  onClick={() => {
-                    // The models this window's States read are what it needs: ticked to start with
-                    const read = new Set(gameStates.filter(s => s.source === 'model').map(s => s.output ?? ''));
-                    setExportDialog({ parts: SETUP_PARTS.map(p => p.id), modelIds: models.filter(m => modelOutputs(m).some(o => read.has(o.name))).map(m => m.id) });
-                  }}>Export…</button>}
-              </div>
-              {setupMessage && <div className="insp-hint setup-message" role="status">{setupMessage}
-                <button className="setup-message-x" aria-label="Dismiss" onClick={() => setSetupMessage('')}>✕</button></div>}
+              <div className="insp-section-hd"><span>Capture Target</span></div>
               <div className="insp-row">
                 <span className="insp-lbl">Window</span>
                 <span className={`insp-val ${!selectedWin ? 'insp-val-none' : ''}`}>{selectedWin?.title ?? 'None'}</span>
@@ -3620,7 +3657,8 @@ export default function App() {
               </div>
             </div>
 
-            {selectedId && (
+            {/* The settings: the same with or without a window */}
+            {(
               <div className="insp-section">
                 <div className="insp-section-hd">
                   <span>Regions</span>
@@ -3726,7 +3764,8 @@ export default function App() {
               </div>
             )}
 
-            {selectedId && (
+            {/* The settings: the same with or without a window */}
+            {(
               <div className="insp-section">
                 <div className="insp-section-hd">
                   <span>States</span>
@@ -3758,7 +3797,10 @@ export default function App() {
                   const hasValue = val !== undefined;
                   const valueError = s.source === 'script' && hasValue ? stateValueError(s.type, val) : null;
                   const isOpen = selectedStateId === s.id;
-                  const waiting = s.off ? 'Turned off: switch it on to read it' : paused ? 'No value in this frame' : !captureActive ? 'Start capture to read'
+                  const noProcess = !s.off && !captureActive && !paused && needsProcess(s);
+                  const waiting = s.off ? 'Turned off: switch it on to read it' : paused ? 'No value in this frame'
+                    : noProcess ? 'Not read without a window: start a session on the game to read it'
+                    : !captureActive ? 'Start capture to read'
                     : isRegion && !stateRegion ? 'This region was deleted'
                     : isMotion && stateRegion ? (!hasAnchors(stateRegion) ? `Add a template to ${stateRegion.label} so it can follow its object`
                       : !trackedIds.has(stateRegion.id) ? `Turn on “Follow the object in this box” for ${stateRegion.label} to read it` : 'Waiting for value…')
@@ -3810,13 +3852,15 @@ export default function App() {
                               : `⬡ ${s.address ?? ''}`}
                           </span>
                         </div>
-                        {s.off ? <span className="state-off-tag">off</span> : valueError ? <span className="sv-err">Invalid type</span> : hasValue && (
+                        {s.off ? <span className="state-off-tag">off</span>
+                          : noProcess ? <span className="state-off-tag" title="Memory and Lua States read the game's process, so they only run while a session is on its window">no window</span>
+                          : valueError ? <span className="sv-err">Invalid type</span> : hasValue && (
                           <span className={`state-val-chip ${s.type === 'boolean' ? (val ? 'state-val-true' : 'state-val-false') : ''}`}>
                             {formatStateValue(s, val)}
                           </span>
                         )}
                         {/* A script returning nil ran and found nothing: that isn't a failed read, and said so it sent people looking for one */}
-                        {!s.off && visibleStateErrors[s.id] && <span className="state-read-status" title={visibleStateErrors[s.id]}>
+                        {!s.off && !noProcess && visibleStateErrors[s.id] && <span className="state-read-status" title={visibleStateErrors[s.id]}>
                           {hasValue ? 'Last value' : /returned (nil|no value)/.test(visibleStateErrors[s.id] ?? '') ? 'No value' : 'Read failed'}</span>}
                         <button className="state-edit" aria-label={`Edit ${s.name}`} title={isRecording ? 'Stop recording before editing States' : 'Edit State'} disabled={isRecording}
                           onClick={ev => { ev.stopPropagation(); editState(s); }}>Edit</button>
@@ -3983,12 +4027,16 @@ export default function App() {
                   </label>
                   <LuaScriptEditor label="Region Lua script" value={createDialog.script} onChange={value => changeLuaScript('region', value)} regions={regions} states={luaStateItems} excludeId={createDialog.id} />
                   <div className="script-test-bar">
-                    <button className="script-test-btn" onClick={handleTestRegionScript} disabled={!createDialog.script.trim() || regionScriptPreview?.running === true}>
+                    <button className="script-test-btn" onClick={handleTestRegionScript} disabled={!captureActive || !createDialog.script.trim() || regionScriptPreview?.running === true}
+                      title={captureActive ? undefined : 'Start a session on the game first: Lua reads its process'}>
                       {regionScriptPreview?.running ? 'Running…' : 'Run Script'}
                     </button>
                     {regionScriptPreview && !regionScriptPreview.running && (
                       <span className={`script-test-status ${regionScriptPreview.error ? 'script-test-err' : 'script-test-ok'}`}>
-                        {regionScriptPreview.error ? '✕ Error' : `✓ ${regionScriptPreview.boxes?.length ?? 0} box${(regionScriptPreview.boxes?.length ?? 0) !== 1 ? 'es' : ''}`}
+                        {regionScriptPreview.error ? '✕ Error' : (() => {
+                          const all = regionScriptPreview.boxes ?? [], lines = all.filter(b => b.line).length, boxes = all.length - lines;
+                          return `✓ ${[boxes || !lines ? `${boxes} box${boxes === 1 ? '' : 'es'}` : '', lines ? plural(lines, 'line') : ''].filter(Boolean).join(', ')}`;
+                        })()}
                       </span>
                     )}
                     {!regionScriptPreview && <span className="script-test-hint">Run the script to validate before saving</span>}
@@ -4002,6 +4050,7 @@ export default function App() {
                               <span className="sv-idx">{i}</span>
                               <div className="sv-cell">
                                 <span className="sv-inline-obj">
+                                  {b.line && <span className="sv-key">line of {b.line.length} points, round it </span>}
                                   {(['x','y','w','h'] as const).map((k, ki) => (
                                     <span key={k}>
                                       {ki > 0 && <span className="sv-sep"> · </span>}
@@ -4120,7 +4169,8 @@ export default function App() {
                     <button
                       className="script-test-btn"
                       onClick={handleTestScript}
-                      disabled={!stateDialog.script.trim() || scriptPreview?.running === true}
+                      disabled={!captureActive || !stateDialog.script.trim() || scriptPreview?.running === true}
+                      title={captureActive ? undefined : 'Start a session on the game first: Lua reads its process'}
                     >
                       {scriptPreview?.running ? 'Running…' : 'Run Script'}
                     </button>
@@ -4262,59 +4312,16 @@ export default function App() {
         </div>
       )}
 
-      {/* Importing another window's setup into this one's */}
-      {importDialog && selectedTitle && (() => {
-        const dlg = importDialog, sources = savedSetups(localStorage, selectedTitle), own = setupOf(localStorage, selectedTitle);
-        const toggle = (part: SetupPart, on: boolean) => setImportDialog({ ...dlg, parts: on ? [...dlg.parts, part] : dlg.parts.filter(p => p !== part) });
-        const losing = [
-          dlg.parts.includes('states') && own.states + own.regions > 0 && `its ${own.states} state${own.states !== 1 ? 's' : ''} and ${own.regions} region${own.regions !== 1 ? 's' : ''}`,
-          dlg.parts.includes('graphs') && own.graphs > 0 && `its ${own.graphs} graph${own.graphs !== 1 ? 's' : ''}`,
-          dlg.parts.includes('recording') && 'its recording setup',
-        ].filter(Boolean) as string[];
-        return (
-          <div className="modal-overlay" onClick={() => setImportDialog(null)}>
-            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import a setup">
-              <div className="modal-header"><span className="modal-title">Import a setup</span></div>
-              <div className="modal-form">
-                <div className="import-from-file">
-                  <button className="modal-btn" onClick={() => void openSetupFile()}>From a file…</button>
-                  <span className="modal-form-hint">A <code>.firefly</code> setup someone shared, saved with Export…</span>
-                </div>
-                {sources.length === 0 ? <div className="modal-form-hint">No other window has States or Regions saved. A window’s setup is kept under its title, so start a session on it once and build one there first.</div> : <>
-                  <label className="modal-form-lbl" htmlFor="import-from">From the window</label>
-                  <select id="import-from" className="modal-form-select" aria-label="Import from" value={dlg.from} onChange={e => setImportDialog({ ...dlg, from: e.target.value })}>
-                    {sources.map(s => <option key={s.title} value={s.title}>{s.title} ({setupSummary(s)})</option>)}
-                  </select>
-                  <span className="modal-form-lbl">What to import</span>
-                  {SETUP_PARTS.map(p => <label key={p.id} className="import-part" title={p.hint}>
-                    <input type="checkbox" checked={dlg.parts.includes(p.id)} onChange={e => toggle(p.id, e.target.checked)} />
-                    <span>{p.label}<small>{p.hint}</small></span>
-                  </label>)}
-                  <div className="modal-form-hint">
-                    {losing.length ? `Replaces ${losing.join(', ')} for “${selectedTitle}”.` : `Copied to “${selectedTitle}”.`} The window imported from keeps its own.
-                  </div>
-                </>}
-              </div>
-              <div className="modal-actions">
-                <button className="modal-btn modal-btn-cancel" onClick={() => setImportDialog(null)}>Cancel</button>
-                <button className="modal-btn modal-btn-confirm" disabled={!sources.some(s => s.title === dlg.from) || !dlg.parts.length || isRecording}
-                  onClick={() => { setImportDialog(null); importSetup(dlg.from, dlg.parts); }}>Import</button>
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Exporting this window's setup as a file */}
-      {exportDialog && selectedTitle && (() => {
-        const dlg = exportDialog, own = setupOf(localStorage, selectedTitle);
+      {/* Exporting the settings as a file */}
+      {exportDialog && (() => {
+        const dlg = exportDialog, own = setupOf(localStorage, SETTINGS);
         const toggle = (part: SetupPart, on: boolean) => setExportDialog({ ...dlg, parts: on ? [...dlg.parts, part] : dlg.parts.filter(p => p !== part) });
         const pick = (id: string, on: boolean) => setExportDialog({ ...dlg, modelIds: on ? [...dlg.modelIds, id] : dlg.modelIds.filter(x => x !== id) });
         const mb = (bytes: number) => `${(bytes / 2 ** 20).toFixed(1)} MB`;
         return (
           <div className="modal-overlay" onClick={() => setExportDialog(null)}>
-            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Export the setup">
-              <div className="modal-header"><span className="modal-title">Export the setup of “{selectedTitle}”</span></div>
+            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Export the settings">
+              <div className="modal-header"><span className="modal-title">Export settings</span></div>
               <div className="modal-form">
                 <span className="modal-form-lbl">What to include</span>
                 {SETUP_PARTS.map(p => <label key={p.id} className="import-part" title={p.hint}>
@@ -4328,7 +4335,7 @@ export default function App() {
                   <span>{m.name} <small>{m.kind === 'detector' ? 'Detector' : 'Segmentation'} · {mb(m.size)}{m.missing ? ' · its file is missing' : ''}</small></span>
                 </label>)}
                 <div className="modal-form-hint">
-                  The models ticked to start with are the ones this window's States read. Nothing in the file says where things are on this PC: Dataset Output folders and where models came from are left out.
+                  The models ticked to start with are the ones your States read. Nothing in the file says where things are on this PC: Dataset Output folders and where models came from are left out.
                 </div>
               </div>
               <div className="modal-actions">
@@ -4342,23 +4349,23 @@ export default function App() {
         );
       })()}
 
-      {/* Importing a setup file */}
-      {fileImport && selectedTitle && (() => {
-        const fi = fileImport, sum = fileSummary(fi.summary.entries), own = setupOf(localStorage, selectedTitle);
+      {/* Importing a settings file */}
+      {fileImport && (() => {
+        const fi = fileImport, sum = fileSummary(fi.summary.entries), own = setupOf(localStorage, SETTINGS);
         const toggle = (part: SetupPart, on: boolean) => setFileImport({ ...fi, parts: on ? [...fi.parts, part] : fi.parts.filter(p => p !== part) });
         const pick = (index: number, on: boolean) => setFileImport({ ...fi, models: on ? [...fi.models, index] : fi.models.filter(x => x !== index) });
         const close = () => { void window.bridge.setup.close(fi.token); setFileImport(null); };
         const losing = [
-          fi.parts.includes('states') && own.states + own.regions > 0 && `its ${plural(own.states, 'state')} and ${plural(own.regions, 'region')}`,
-          fi.parts.includes('graphs') && own.graphs > 0 && `its ${plural(own.graphs, 'graph')}`,
-          fi.parts.includes('recording') && 'its recording setup',
+          fi.parts.includes('states') && own.states + own.regions > 0 && `your ${plural(own.states, 'state')} and ${plural(own.regions, 'region')}`,
+          fi.parts.includes('graphs') && own.graphs > 0 && `your ${plural(own.graphs, 'graph')}`,
+          fi.parts.includes('recording') && 'your recording setup',
         ].filter(Boolean) as string[];
         return (
           <div className="modal-overlay" onClick={close}>
-            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import a setup file">
-              <div className="modal-header"><span className="modal-title">Import a setup file</span></div>
+            <div className="modal-card modal-card-md" onClick={e => e.stopPropagation()} role="dialog" aria-label="Import settings">
+              <div className="modal-header"><span className="modal-title">Import settings</span></div>
               <div className="modal-form">
-                <div className="modal-form-hint">Saved from the window “{fi.summary.window}”{fi.summary.exportedAt ? ` on ${new Date(fi.summary.exportedAt).toLocaleString()}` : ''}.</div>
+                <div className="modal-form-hint">{fileOrigin(fi.summary.window, true)}{fi.summary.exportedAt ? `, saved ${new Date(fi.summary.exportedAt).toLocaleString()}` : ''}.</div>
                 <span className="modal-form-lbl">What to import</span>
                 {SETUP_PARTS.filter(p => sum.parts.includes(p.id)).map(p => <label key={p.id} className="import-part" title={p.hint}>
                   <input type="checkbox" checked={fi.parts.includes(p.id)} onChange={e => toggle(p.id, e.target.checked)} />
@@ -4373,7 +4380,7 @@ export default function App() {
                   <div className="modal-form-hint">Added to Trained Models; one you already have stays as it is.</div>
                 </>}
                 <div className="modal-form-hint">
-                  {losing.length ? `Replaces ${losing.join(', ')} for “${selectedTitle}”.` : `Imported into “${selectedTitle}”.`}
+                  {losing.length ? `Replaces ${losing.join(', ')}.` : 'Added to your settings.'} Settings are the same for every window.
                   {fi.parts.includes('graphs') ? ' Choose the folders Dataset Output nodes save into again: they weren’t shared.' : ''}
                 </div>
               </div>
@@ -4393,9 +4400,6 @@ export default function App() {
       {confirmDialog && (() => {
         const dlg = confirmDialog;
         const thumb = thumbnails[dlg.title];
-        const own = setupOf(localStorage, dlg.title), savedCount = own.regions;
-        // A window with nothing of its own can start from another's, as the same game titled differently
-        const others = own.states + own.regions === 0 ? savedSetups(localStorage, dlg.title) : [];
         return (
           <div className="modal-overlay" onClick={() => setConfirmDialog(null)}>
             <div className="modal-card" onClick={e => e.stopPropagation()}>
@@ -4407,28 +4411,12 @@ export default function App() {
               {captureActive && selectedWin && (
                 <div className="modal-warn">Stops current capture of "{selectedWin.title}"</div>
               )}
-              {own.states + own.regions > 0
-                ? <div className="modal-session-info">Resuming — {own.states} state{own.states !== 1 ? 's' : ''} and {savedCount} region{savedCount !== 1 ? 's' : ''} from last session</div>
-                : <div className="modal-session-info modal-session-new">New session</div>
-              }
-              {others.length > 0 && <div className="modal-form" style={{ paddingTop: 0 }}>
-                <label className="modal-form-lbl" htmlFor="start-from">Start with the setup of</label>
-                <select id="start-from" className="modal-form-select" aria-label="Start with the setup of" value={dlg.from ?? ''}
-                  onChange={e => setConfirmDialog({ ...dlg, from: e.target.value || undefined })}>
-                  <option value="">Nothing: start empty</option>
-                  {others.map(s => <option key={s.title} value={s.title}>{s.title} ({setupSummary(s)})</option>)}
-                </select>
-                <div className="modal-form-hint">Its States, Regions and Lua scripts, Graphs and recording setup are copied to this window. That window keeps its own.</div>
-              </div>}
+
               <div className="modal-actions">
                 <button className="modal-btn modal-btn-cancel" onClick={() => setConfirmDialog(null)}>Cancel</button>
                 <button className="modal-btn modal-btn-confirm" onClick={() => {
                   setConfirmDialog(null);
-                  if (dlg.from) {
-                    try { copySetup(localStorage, dlg.from, dlg.title, SETUP_PARTS.map(p => p.id)); setGraphsVersion(v => v + 1); }
-                    catch (e) { setError(`Could not copy the setup: ${String(e)}`); }
-                  }
-                  selectWindow(dlg.windowId, dlg.title);
+                  selectWindow(dlg.windowId);
                 }}>Start Session</button>
               </div>
             </div>
@@ -4443,6 +4431,7 @@ export default function App() {
         {captureActive && <><span className="sb-sep">|</span><span className="sb-seg">Capturing: {selectedWin?.title}</span></>}
         {runningModels.length > 0 && <><span className="sb-sep">|</span><span className="sb-seg">{runningModels.length > 1 ? 'Models' : 'Model'}: {runningModels.map(m => m.name).join(', ')}</span></>}
         {isRecording && <><span className="sb-sep">|</span><span className="sb-seg sb-rec"><span className="rec-dot-sm anim" /> {recording!.samples.toLocaleString()} samples · {fmt(elapsed)}</span></>}
+        {setupMessage && <><span className="sb-sep">|</span><span className="sb-seg sb-msg setup-message" role="status" title={setupMessage}>{setupMessage} <button className="sb-err-close" aria-label="Dismiss" onClick={() => setSetupMessage('')}>✕</button></span></>}
         {error && <><span className="sb-sep">|</span><span className="sb-seg sb-err">{error} <button className="sb-err-close" onClick={() => setError('')}>✕</button></span></>}
       </div>
     </div>

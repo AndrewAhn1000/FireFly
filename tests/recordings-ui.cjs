@@ -56,9 +56,9 @@ app.whenReady().then(async()=>{
   await js(`(()=>{const e=document.querySelector('[aria-label="Recorded data stream"]');e.value='inputs';e.dispatchEvent(new Event('change',{bubbles:true}));})()`);await until(`${last}==='2'`);
   assert.match(await js(`document.querySelector('.recordings-table').textContent`),/button/);
   await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);
-  await js(`[...document.querySelectorAll('button')].find(b=>b.textContent==='Start Session').click()`);await until(`!!document.querySelector('.toolbar-actions .tbtn-record')`);
+  await js(`[...document.querySelectorAll('button')].find(b=>b.textContent==='Start Session').click()`);await until(`!!document.querySelector('.insp-btn-record:not(:disabled)')`);
   await js(`(()=>{const e=document.querySelector('[aria-label="Recorded data stream"]');e.value='samples';e.dispatchEvent(new Event('change',{bubbles:true}));})()`);
-  await click('.toolbar-actions .tbtn-record');await until(`document.querySelector('.recordings-live')?.textContent.includes('Recording live')`);
+  await click('.insp-btn-record');await until(`document.querySelector('.recordings-live')?.textContent.includes('Recording live')`);
   live.samples=65;live.inputEvents=4;event({active:true,id:live.id,samples:65,queued:2});await until(`${last}==='65'`);assert.equal(await js(first),'16');
   await click('.recordings-controls input');live.samples=70;await until(`document.querySelector('.recordings-pagination').textContent.includes('of 70')`);assert.equal(await js(first),'16');
   await button('First');await until(`${first}==='1'`);live.samples=80;await until(`document.querySelector('.recordings-pagination').textContent.includes('of 80')`);assert.equal(await js(first),'1');

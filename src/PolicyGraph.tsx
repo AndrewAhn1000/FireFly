@@ -328,7 +328,6 @@ const nodeTypes: NodeTypes = { state: StateNode, formula: FormulaNode, recording
 // graph is built from; States are dragged in from the app's States list.
 export interface PolicyGraphProps { active: boolean; online: boolean; capturing: boolean; windowId: string | null; recording: boolean; storageKey: string; stateLabels: Record<string, string>; graphId?: string;
   observed: Record<string, string>;
-  graphOf?: string | null; // the window whose graph this is
   frameSize?: { w: number; h: number } | null; } // the captured window's size, for a new grid's screen
 
 export default function PolicyGraph(props: PolicyGraphProps) {
@@ -337,7 +336,7 @@ export default function PolicyGraph(props: PolicyGraphProps) {
   </div>;
 }
 
-function Editor({ online, capturing, windowId, recording, storageKey, stateLabels, observed, graphOf, frameSize, graphId }: PolicyGraphProps) {
+function Editor({ online, capturing, windowId, recording, storageKey, stateLabels, observed, frameSize, graphId }: PolicyGraphProps) {
   const initial = useMemo(() => readGraph(localStorage.getItem(storageKey)), [storageKey]);
   const [nodes, setNodes, onNodesChange] = useNodesState<GraphNode>(initial.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
@@ -385,11 +384,15 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     catch (e) { setError(cleanError(e)); await refresh(); }
   }, [refresh]);
   useEffect(() => { void refresh(); }, [refresh]);
+  // Read again every few seconds: recordings come and go in the Recordings tab, and versions are trained and
+  // deleted in the Play tab too (an editor stays mounted while hidden, so it wouldn't otherwise see them)
   useEffect(() => {
-    if (!online) return;
     const timer = setInterval(async () => {
-      try { setRecordings(((await window.bridge.invoke('dataset.list')) as { recordings: Recording[] }).recordings.filter(r => r.status === 'complete')); }
-      catch { /* the next try, or Refresh, reads it */ }
+      try {
+        if (online) setRecordings(((await window.bridge.invoke('dataset.list')) as { recordings: Recording[] }).recordings.filter(r => r.status === 'complete'));
+        const latest = newestFirst(await window.bridge.policy.invoke('models') as PolicyVersion[]);
+        setVersions(prev => prev.length === latest.length && prev.every((v, i) => v.id === latest[i].id) ? prev : latest);
+      } catch { /* the next try, or Refresh, reads it */ }
     }, 5000);
     return () => clearInterval(timer);
   }, [online]);
@@ -633,7 +636,6 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
 
   return <GraphContext.Provider value={ctx}>
     <aside className="pg-palette" aria-label="Nodes to add">
-      <div className="pg-hint pg-graph-of" title="Each window has its own Policy Graph">{graphOf ? <>Graph for <b>{graphOf}</b>{!windowId ? ' (the last window used)' : ''}</> : 'Start a session on a window to keep a graph for it'}</div>
       <div className="pg-palette-hd">Drag onto the graph</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'formula' })}><span className="pg-glyph">ƒ</span>Formula</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'grid' })} title="Shapes, such as platforms, as a grid over the whole screen"><span className="pg-glyph">▦</span>Grid</div>

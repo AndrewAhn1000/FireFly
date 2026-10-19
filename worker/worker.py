@@ -23,6 +23,7 @@ from review import Review
 torch.set_num_threads(2)
 
 MAX_SAMPLES = 300000  # samples loaded at once, over the chosen recordings
+MAX_RECORDINGS = 2000  # recordings (corrections included) in one dataset
 PREVIEW_ROWS = 300    # grid rows a formula is tried on, to show what it gives
 VERSION = 3           # of a policy: what its inputs are and how they're made
 # How much of each epoch corrections make up, however short they are beside the recordings: as plain rows,
@@ -164,8 +165,10 @@ class Worker:
         `history` grid points before it, and, with an action delay, the buttons that many steps later.
         What was skipped, and why, is counted in skippedReasons."""
         ids = request['recordingIds']
-        if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or len(set(ids)) != len(ids):
-            raise ValueError('Select 1..100 distinct recordings')
+        # Corrections are recordings of their own, a few seconds each, and a policy played for a while has hundreds:
+        # what limits a dataset is MAX_SAMPLES, over all of them
+        if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_RECORDINGS or len(set(ids)) != len(ids):
+            raise ValueError(f'Select 1..{MAX_RECORDINGS} distinct recordings')
         anchor = request.get('anchor') or None
         surface, near_px = request.get('surface', 'below'), request.get('nearPx', 200)
         history = int(request.get('history', 2))

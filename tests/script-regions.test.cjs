@@ -25,3 +25,17 @@ test('Region references preserve every dynamic box and distinguish unavailable f
  const empty=luaRegionSnapshot(definitions,{matched:{boxes:[],timestamp:300}})[1];
  assert.equal(empty.valid,true);assert.deepEqual(empty.boxes,[]);
 });
+test('lines are placed point by point into the client area, with the box round them, and scripts reading the Region get that box',async()=>{
+ const {scriptRegionBoxes:boxes,luaRegionSnapshot}=await import('../src/scriptRegions.ts');
+ const geometry={windowW:400,windowH:300,clientArea:{x:0,y:30/330,w:1,h:300/330}};
+ const [platform,rope]=boxes([{points:[[0,500],[100,500],[200,480]]},{points:[{x:250,y:300},{x:250,y:480}]}],geometry,800,600);
+ const near=(a,b)=>Math.abs(a-b)<1e-9;
+ assert.equal(platform.line.length,3);
+ assert.ok(near(platform.line[1].x*400,50)&&near(platform.line[1].y*330,30+250),'a point placed as a box corner is');
+ assert.ok(near(platform.x,0)&&near(platform.w*400,100)&&near(platform.y*330,30+240)&&near(platform.h*330,10),'the box round it');
+ assert.ok(near(rope.w,0)&&near(rope.h*330,90),'a vertical line is a box of no width');
+ assert.throws(()=>boxes({points:[[0,0]]},geometry),/two points/);
+ assert.throws(()=>boxes({points:[[0,0],[1,NaN]]},geometry),/finite x and y/);
+ const snapshot=luaRegionSnapshot([{x:0,y:0,w:1,h:1,id:'p',label:'Platforms',source:'script'}],{p:{boxes:[platform],timestamp:5}});
+ assert.deepEqual(snapshot[0].boxes,[{x:platform.x,y:platform.y,w:platform.w,h:platform.h}],'scripts read the box, not the points');
+});

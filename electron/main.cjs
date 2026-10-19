@@ -728,8 +728,8 @@ ipcMain.handle('models:list', () => models.listModels(MODELS_DIR));
 ipcMain.handle('setup:export', async (_e, params) => {
   const safe = String(params?.title ?? 'FireFly').replace(/[<>:"/\\|?*\x00-\x1f]+/g, ' ').trim().slice(0, 80) || 'FireFly';
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
-    title: 'Export setup', defaultPath: path.join(app.getPath('documents'), `${safe}.firefly`),
-    filters: [{ name: 'FireFly setup', extensions: ['firefly'] }],
+    title: 'Export settings', defaultPath: path.join(app.getPath('documents'), `${safe}.firefly`),
+    filters: [{ name: 'FireFly settings', extensions: ['firefly'] }],
   });
   if (canceled || !filePath) return { ok: false, canceled: true };
   try { return { ok: true, path: filePath, ...setupFile.writeSetupFile(filePath, { ...params, modelsDir: MODELS_DIR, appVersion: app.getVersion() }) }; }
@@ -738,7 +738,7 @@ ipcMain.handle('setup:export', async (_e, params) => {
 const openedSetups = new Map(); // a setup file read, by the token the renderer imports it with
 ipcMain.handle('setup:open', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
-    title: 'Import setup', properties: ['openFile'], filters: [{ name: 'FireFly setup', extensions: ['firefly'] }],
+    title: 'Import settings', properties: ['openFile'], filters: [{ name: 'FireFly settings', extensions: ['firefly'] }],
   });
   if (canceled || !filePaths?.[0]) return { ok: false, canceled: true };
   try {

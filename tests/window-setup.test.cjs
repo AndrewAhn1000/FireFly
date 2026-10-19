@@ -90,3 +90,34 @@ test('a setup goes into a file under {window} and comes out under whatever windo
  assert.equal(got[`firefly-record-setup-${enc(fresh)}`], JSON.stringify({buttons: ['w'], hz: 15}), 'a part not chosen is left alone');
  assert.ok(!('firefly-train-config' in got) && !('something-else' in got), 'keys FireFly doesn’t import are ignored');
 });
+
+test('the first start with global settings takes the last window’s setup, or the fullest; once, and never over settings',async()=>{
+ const {migrateSettings,setupOf,SETTINGS}=await import('../src/windowSetup.ts');
+ const s=saved();
+ assert.equal(migrateSettings(s),old,'the window with States and Regions, though another has only graphs');
+ const got=s.dump();
+ assert.deepEqual([setupOf(s,SETTINGS).states,setupOf(s,SETTINGS).regions,setupOf(s,SETTINGS).graphs],[2,1,2]);
+ assert.equal(got[`firefly-record-setup-${enc(SETTINGS)}`],JSON.stringify({buttons:['left','alt'],hz:20}));
+ assert.equal(got[`firefly-policy-graph-${enc(SETTINGS)}-document-g1-view`],'{"x":1}');
+ assert.ok(got[`firefly-states-${enc(old)}`],'the window keeps its own');
+ // Once: what's changed in the settings since isn't replaced
+ s.setItem(`firefly-states-${enc(SETTINGS)}`,'[]');
+ assert.equal(migrateSettings(s),null);
+ assert.equal(s.getItem(`firefly-states-${enc(SETTINGS)}`),'[]');
+
+ // The last window used wins when it has a setup, even a smaller one
+ const t=saved();
+ t.setItem(`firefly-states-${enc(fresh)}`,JSON.stringify([{id:'a',name:'a'}]));
+ t.setItem('firefly-last-window',fresh);
+ assert.equal(migrateSettings(t),fresh);
+ assert.equal(setupOf(t,SETTINGS).states,1);
+ assert.equal(setupOf(t,SETTINGS).graphs,1,'with its own graphs');
+
+ // Settings already there (a new install that imported some) aren't replaced; nothing to take is no change
+ const u=saved();u.setItem(`firefly-regions-${enc(SETTINGS)}`,'[{"id":"mine"}]');
+ assert.equal(migrateSettings(u),null);
+ assert.equal(u.getItem(`firefly-regions-${enc(SETTINGS)}`),'[{"id":"mine"}]');
+ const empty=store({});
+ assert.equal(migrateSettings(empty),null);
+ assert.deepEqual(Object.keys(empty.dump()),['firefly-settings-migrated']);
+});

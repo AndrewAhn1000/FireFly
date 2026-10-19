@@ -107,11 +107,11 @@ app.whenReady().then(async () => {
     assert.deepEqual([vk('f1'), vk('f2'), vk('insert'), vk('enter'), vk('bracketleft'), vk('h'), vk('shift'), vk('ctrl')], [112, 113, 45, 13, 219, 72, 16, 17]);
     assert.ok(ids.indexOf('c') < ids.indexOf('h'), 'the original buttons keep their place');
     // Kept for the window
-    const saved = JSON.parse(await js(`localStorage.getItem('firefly-record-setup-' + encodeURIComponent('Keyboard fixture'))`));
+    const saved = JSON.parse(await js(`localStorage.getItem('firefly-record-setup-%7Bsettings%7D')`));
     assert.ok(saved.buttons.includes('f2') && !saved.buttons.includes('b'));
 
     assert.deepEqual(errors, []);
-    console.log('PASS: whole keyboard, Shift/Ctrl/Alt choosable, blocked keys explained, click and press to choose, both Enters one key, no 24 limit, chips, record.start in the old order with key codes, kept per window.');
+    console.log('PASS: whole keyboard, Shift/Ctrl/Alt choosable, blocked keys explained, click and press to choose, both Enters one key, no 24 limit, chips, record.start in the old order with key codes, kept with the settings.');
     clearTimeout(watchdog); win.destroy(); app.exit(0);
   } catch (e) {
     console.error(e); clearTimeout(watchdog);

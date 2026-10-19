@@ -138,13 +138,12 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
     <aside className="graph-directory" aria-label="Graph directory" onDragOver={e => { if (e.dataTransfer.types.includes('application/firefly-graph')) e.preventDefault(); }} onDrop={e => { e.preventDefault(); move(e.dataTransfer.getData('application/firefly-graph'), null); }}>
       <div className="graph-directory-title">Graphs <button title="New folder" aria-label="New folder" onClick={() => create('folder', null)}>＋</button></div>
       <input aria-label="Find graphs" placeholder="Find graphs…" value={query} onChange={e => setQuery(e.target.value)} />
-      <div className="graph-game">{props.graphOf || 'No game selected'}</div>
       <div className="graph-tree">{tree(null)}</div>
       <div className="graph-new"><button onClick={() => create('policy')}>+ Policy</button><button onClick={() => create('collection')}>+ Collection</button></div>
       <small>Right-click to organize. Drag graphs into folders.</small>
     </aside>
     <section className="graph-workspace">
-      <div className="graph-breadcrumb"><span>{props.graphOf} / {ancestors.join(' / ')}</span>{selected && <><b>{selected.kind === 'policy' ? 'Policy' : 'Data Collection'}</b><button title="Graph options" aria-label="Graph options" onClick={e => setMenu({ id: selected.id, x: e.clientX - 150, y: e.clientY + 10 })}>⋯</button></>}</div>
+      <div className="graph-breadcrumb"><span>{['Graphs', ...ancestors].join(' / ')}</span>{selected && <><b>{selected.kind === 'policy' ? 'Policy' : 'Data Collection'}</b><button title="Graph options" aria-label="Graph options" onClick={e => setMenu({ id: selected.id, x: e.clientX - 150, y: e.clientY + 10 })}>⋯</button></>}</div>
       {error && <div className="collection-error">{error}</div>}
       {/* Open policy editors stay mounted so training state survives navigation. */}
       {library.entries.filter(e => e.kind === 'policy' && (opened.includes(e.id) || props.active && library.selected === e.id)).map(entry => <div key={entry.id} className={`graph-page ${library.selected === entry.id ? '' : 'pg-off'}`}><PolicyGraph {...props} active storageKey={documentKey(props.storageKey, entry.id)} graphId={entry.id} /></div>)}

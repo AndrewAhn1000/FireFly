@@ -154,6 +154,14 @@ int main() {
           "Dataset paging/count mismatch");
     Catalog reopened(root);
     check(reopened.list()[0]["status"] == "complete", "Reopen status mismatch");
+    // The list leaves out what each recording was recorded with (most of its metadata); the recording itself has it
+    {
+      auto listed = reopened.list()[0]["metadata"]["observationSchema"];
+      check(!listed.contains("definition") && listed["identity"] == first["identity"] && listed.contains("fields"),
+            "Listed metadata kept the definition, or lost the identity or fields");
+      check(reopened.read("record-one", 0, 1)["metadata"]["observationSchema"].contains("definition"),
+            "A recording read lost its definition");
+    }
     std::ifstream stream(root / "recordings" / "record-one" / "sequence.jsonl");
     std::string line;
     int count = 0;

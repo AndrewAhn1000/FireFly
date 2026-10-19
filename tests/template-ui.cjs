@@ -39,12 +39,12 @@ app.whenReady().then(async()=>{
   const until=async(code)=>{for(let i=0;i<60;i++){if(await js(code))return;await wait(50);}throw Error('UI condition failed: '+code);};
   const clickText=async(text)=>{await js(`(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(text)});if(!b)throw Error('Button missing: '+${JSON.stringify(text)});b.click();})()`);await wait(150);};
   const toggle=async(group,template)=>{const selector=`[aria-label="${group}"] ${template ? `[aria-label="Template ${template}"]` : '.template-picker-any input'}`;await js(`document.querySelector(${JSON.stringify(selector)}).click()`);await wait(100);};
-  const savedRegion=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-Template%20fixture'))[0]`);
-  const savedState=()=>js(`JSON.parse(localStorage.getItem('firefly-states-Template%20fixture'))[0]`);
+  const savedRegion=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-%7Bsettings%7D'))[0]`);
+  const savedState=()=>js(`JSON.parse(localStorage.getItem('firefly-states-%7Bsettings%7D'))[0]`);
   const emit=async(payload,token=context,others=[],timestamp)=>{win.webContents.send('runtime:event',{event:'template.match',result:{timestamp,regions:[{region:'region',context:token,...payload},...others]}});await wait(180);};
   const start=async()=>{await until(`!!document.querySelector('.win-item')`);await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);await clickText('Start Session');await until(`document.body.textContent.includes('Capturing:')`);await wait(250);};
   await win.loadFile(path.join(root,'dist/index.html'));
-  await js(`localStorage.clear();localStorage.setItem('firefly-regions-Template%20fixture',${JSON.stringify(JSON.stringify([fixture,second]))})`);
+  await js(`localStorage.clear();localStorage.setItem('firefly-regions-%7Bsettings%7D',${JSON.stringify(JSON.stringify([fixture,second]))})`);
   win.reload();await wait(400);await start();assert.ok(context);assert.equal(configuration.multiMatch,true);
   // Recording is set up in the Recordings tab, not the Inspector: what it holds is chosen per State and
   // per other observation; images are left out unless ticked, and the choices are kept per window
@@ -58,15 +58,15 @@ app.whenReady().then(async()=>{
   const tick=name=>js(`[...document.querySelectorAll('.recordings-setup .rec-field')].find(l=>l.querySelector('.rec-field-name').textContent===${JSON.stringify(name)}).querySelector('input').click()`);
   await tick('hp');await wait(300);assert.deepEqual(excludedSent,['frame','hp']);
   await tick('frame');await wait(300);assert.deepEqual(excludedSent,['hp']);
-  assert.deepEqual(await js(`JSON.parse(localStorage.getItem('firefly-recorded-Template%20fixture'))`),{hp:false,frame:true});
+  assert.deepEqual(await js(`JSON.parse(localStorage.getItem('firefly-recorded-%7Bsettings%7D'))`),{hp:false,frame:true});
   await js(`document.querySelector('[aria-label="Samples per second"]')&&(()=>{const i=document.querySelector('[aria-label="Samples per second"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,'25');i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(150);
-  assert.equal((await js(`JSON.parse(localStorage.getItem('firefly-record-setup-Template%20fixture'))`)).hz,25,'The sample rate is not kept');
+  assert.equal((await js(`JSON.parse(localStorage.getItem('firefly-record-setup-%7Bsettings%7D'))`)).hz,25,'The sample rate is not kept');
   // A recording can be deleted, after confirming
   await until(`!!document.querySelector('.recordings-delete:not(:disabled)')`);
   await js(`window.confirm=()=>true;document.querySelector('.recordings-delete').click()`);await wait(300);
   assert.deepEqual(deleted,['rec1']);assert.ok(await js(`document.body.textContent.includes('No saved recordings yet')`),'Deleted recording still listed');
   assert.ok(configured['region-2']&&configured['region-2'].context!==context,'Both regions should be followed, each with its own context');
-  const savedSecond=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-Template%20fixture'))[1]`);
+  const savedSecond=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-%7Bsettings%7D'))[1]`);
   // Following an object moves the box on screen, which the region editor shows in frame px (the frame is 320 wide)
   const shownX=async i=>{await js(`document.querySelectorAll('.region-row')[${i}].click()`);await wait(60);
    return js(`(()=>{const s=[...document.querySelectorAll('span')].find(s=>/^X [0-9]+px$/.test(s.textContent));return s?parseInt(s.querySelector('b').textContent):null})()`);};
@@ -142,7 +142,7 @@ app.whenReady().then(async()=>{
   win.reload();await wait(400);await start();assert.deepEqual((await savedState()).templateIds,['t1','t2']);
   await emit({matches:[best]});assert.equal(await js(`document.querySelector('.state-val-chip').classList.contains('state-val-true')`),true);
   win.webContents.invalidate();await wait(150);fs.writeFileSync(path.join(root,'build/template-tracking-ui.png'),(await win.webContents.capturePage()).toPNG());
-  await js(`(()=>{const key='firefly-states-Template%20fixture';const states=JSON.parse(localStorage.getItem(key));delete states[0].templateIds;states[0].templateId='t2';states[0].settleMs=250;
+  await js(`(()=>{const key='firefly-states-%7Bsettings%7D';const states=JSON.parse(localStorage.getItem(key));delete states[0].templateIds;states[0].templateId='t2';states[0].settleMs=250;
    states.push({id:'second-seen',name:'Second seen',type:'boolean',source:'region',regionId:'region-2',output:'@template-detected'},{id:'where',name:'Where',type:'vector',source:'region',regionId:'region',output:'@position'},{id:'speed',name:'Speed',type:'vector',source:'region',regionId:'region',output:'@velocity'});
    localStorage.setItem(key,JSON.stringify(states));})()`);
   win.reload();await wait(400);await start();await emit({matches:[best]});

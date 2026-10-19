@@ -28,7 +28,7 @@ app.whenReady().then(async()=>{
   const js=code=>win.webContents.executeJavaScript(code);
   const until=async code=>{for(let i=0;i<60;i++){if(await js(code))return;await wait(50);}throw Error('UI condition failed: '+code);};
   const emit=async box=>{win.webContents.send('runtime:event',{event:'template.match',result:{timestamp:Date.now(),regions:[{region:'region',context,...box,confidence:.9,found:true,templateId:'t1'}]}});await wait(250);};
-  const saved=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-Paused%20fixture'))[0]`);
+  const saved=()=>js(`JSON.parse(localStorage.getItem('firefly-regions-%7Bsettings%7D'))[0]`);
   // The box the region editor shows, in frame px
   const shown=async()=>{await js(`document.querySelector('.region-row').click()`);await wait(60);
    return js(`(()=>{const v=k=>{const s=[...document.querySelectorAll('span')].find(s=>new RegExp('^'+k+' [0-9]+px$').test(s.textContent));return s?parseInt(s.querySelector('b').textContent):null};return {x:v('X'),y:v('Y'),w:v('W'),h:v('H')}})()`);};
@@ -48,7 +48,7 @@ app.whenReady().then(async()=>{
   const transport=()=>js(`document.querySelector('.tp-btn-main').click()`).then(()=>wait(150));
 
   await win.loadFile(path.join(root,'dist/index.html'));
-  await js(`localStorage.clear();localStorage.setItem('firefly-regions-Paused%20fixture',${JSON.stringify(JSON.stringify([fixture]))})`);
+  await js(`localStorage.clear();localStorage.setItem('firefly-regions-%7Bsettings%7D',${JSON.stringify(JSON.stringify([fixture]))})`);
   win.reload();await wait(400);
   await until(`!!document.querySelector('.win-item')`);await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);
   await js(`[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Start Session').click()`);

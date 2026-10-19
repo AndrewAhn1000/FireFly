@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from PIL import Image
-from collection import Graph, Tables, save, pattern_path
+from collection import Graph, SETTINGS_SCOPE, Tables, save, pattern_path
 
 
 def document(mode='rise', initial=False):

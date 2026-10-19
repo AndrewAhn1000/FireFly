@@ -1,4 +1,4 @@
-// A window's setup as a file to share (Export… / Import… in the Inspector's Capture Target): the renderer's
+// The settings as a file to share (File › Export Settings… / Import Settings…): the renderer's
 // entries (src/windowSetup.ts: its States and Regions, Graphs and recording setup, keyed by {window}) and the
 // trained models chosen, each with its .onnx. Nothing in it is a path on the PC it came from: a model's
 // source path and dataset folder are left out (the renderer clears Dataset Output folders), and so is the

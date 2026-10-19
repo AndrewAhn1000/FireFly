@@ -31,11 +31,11 @@ app.whenReady().then(async()=>{
   const edit=async name=>{await js(`document.querySelector('[aria-label="Edit ${name}"]').click()`);await wait(80);};
   const input=async(label,value)=>{await js(`(()=>{const i=document.querySelector('[aria-label="${label}"]');Object.getOwnPropertyDescriptor(i.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,'value').set.call(i,${JSON.stringify(value)});i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(50);};
   const selectType=async value=>{await js(`(()=>{const i=document.querySelector('[aria-label="State type"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(i,${JSON.stringify(value)});i.dispatchEvent(new Event('change',{bubbles:true}));})()`);await wait(50);};
-  const key='firefly-states-State%20editing%20fixture';
+  const key='firefly-states-%7Bsettings%7D';
   const saved=()=>js(`JSON.parse(localStorage.getItem('${key}'))`);
   const original=[{id:'mobs',name:'Monsters',type:'collection',source:'script',script:'return {{x=1,y=2,w=3,h=4}}'},{id:'hp',name:'HP',type:'number',source:'memory',address:'0x1000',offsets:['0x24','0x10'],byteType:'i32'}];
   await win.loadFile(path.join(root,'dist/index.html'));
-  await js(`localStorage.clear();localStorage.setItem('${key}',${JSON.stringify(JSON.stringify(original))});localStorage.setItem('firefly-regions-State%20editing%20fixture',JSON.stringify([{id:'ui',label:'Mini Map',x:0,y:0,w:.2,h:.2,templates:[]}]))`);win.reload();await wait(500);
+  await js(`localStorage.clear();localStorage.setItem('${key}',${JSON.stringify(JSON.stringify(original))});localStorage.setItem('firefly-regions-%7Bsettings%7D',JSON.stringify([{id:'ui',label:'Mini Map',x:0,y:0,w:.2,h:.2,templates:[]}]))`);win.reload();await wait(500);
   await until(`document.querySelector('.win-item')`);await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);await click('Start Session');
   await until(`document.querySelector('[aria-label="Edit Monsters"]')`);
   const monsterRow=`[...document.querySelectorAll('.state-row')].find(r=>r.querySelector('.state-name')?.textContent==='Monsters')`;

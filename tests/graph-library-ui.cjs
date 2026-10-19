@@ -15,7 +15,7 @@ app.whenReady().then(async()=>{
   const input=async(label,value)=>{await js(`(()=>{const i=document.querySelector('[aria-label="${label}"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,${JSON.stringify(value)});i.dispatchEvent(new Event('input',{bubbles:true}));})()`);await wait(50);};
   await win.loadFile(path.join(root,'dist/index.html'));
   const legacy={version:1,nodes:[{id:'legacy',type:'policy',position:{x:80,y:90},data:{kind:'policy',name:'Original policy',buttons:null,off:[],stepMs:null,history:2,delayMs:0,epochs:60}}],edges:[]};
-  await js(`localStorage.clear();localStorage.setItem('firefly-last-window','Test Game');localStorage.setItem('firefly-policy-graph-Test%20Game',${JSON.stringify(JSON.stringify(legacy))})`);
+  await js(`localStorage.clear();localStorage.setItem('firefly-last-window','Test Game');localStorage.setItem('firefly-policy-graph-%7Bsettings%7D',${JSON.stringify(JSON.stringify(legacy))})`);
   win.reload();await wait(600);await click('Graphs');
   await until(`document.querySelector('[aria-label="policy: Policy graph"]')`);
   assert.ok(await js(`[...document.querySelectorAll('input')].some(i=>i.value==='Original policy')`),'Legacy policy not migrated');
@@ -23,7 +23,7 @@ app.whenReady().then(async()=>{
   await until(`document.querySelector('[aria-label="collection: Combat screenshots"]')`);
   assert.ok(await js(`document.querySelector('.collection-editor')`));
   await click('Condition');await wait(350);
-  const scope='firefly-policy-graph-Test%20Game';
+  const scope='firefly-policy-graph-%7Bsettings%7D';
   const selected=await js(`JSON.parse(localStorage.getItem('${scope}-library')).selected`);
   assert.equal(await js(`JSON.parse(localStorage.getItem('${scope}-document-${selected}')).nodes.length`),4);
   await js(`document.querySelector('[aria-label="policy: Policy graph"]').click()`);await wait(100);

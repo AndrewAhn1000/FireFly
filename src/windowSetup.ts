@@ -1,6 +1,7 @@
-// A window's setup is saved under its title (App.tsx Persistence; the Graphs' library in GraphLibrary.tsx), so
-// another window of the same game, titled differently, starts with none. These find the windows that have
-// one, and copy one's setup to another, in place of what that one had.
+// FireFly's settings (States and Regions, Graphs, recording setup) are global: one set, used for whatever window
+// a session is on. They're saved under SETTINGS where a window's title used to go (App.tsx Persistence; the
+// Graphs' library in GraphLibrary.tsx), so the keys and the file format are as they were. Before, each window
+// had its own: migrateSettings makes one of those the settings, once. The helpers below take any scope.
 
 export type SetupPart = 'states' | 'graphs' | 'recording';
 export const SETUP_PARTS: { id: SetupPart; label: string; hint: string }[] = [
@@ -80,6 +81,34 @@ export function copySetup(store: Store, from: string, to: string, parts: SetupPa
       if (value === null) store.removeItem(target[i]); else store.setItem(target[i], value);
     });
   }
+}
+
+// The settings' scope: not a title a window can have, as the window list only holds titled windows
+export const SETTINGS = '{settings}';
+const MIGRATED = 'firefly-settings-migrated';
+
+// The first time FireFly starts with global settings: the setup of the last window a session was on, or else of
+// the window with the most States and Regions (then graphs), becomes the settings. The windows' own are left as
+// they were. Returns the title it came from, or null when there was nothing to take or it was done before.
+export function migrateSettings(store: Store): string | null {
+  if (store.getItem(MIGRATED)) return null;
+  store.setItem(MIGRATED, '1');
+  const mine = setupOf(store, SETTINGS);
+  if (mine.states + mine.regions + mine.graphs > 0 || store.getItem(keysOf(SETTINGS).recording[0])) return null;
+  const titles = new Set<string>();
+  for (let i = 0; i < store.length; i++) {
+    const m = /^firefly-(?:states|regions|record-setup)-(.*)$/.exec(store.key(i) ?? '') ?? /^firefly-policy-graph-(.*)-library$/.exec(store.key(i) ?? '');
+    if (!m) continue;
+    try { titles.add(decodeURIComponent(m[1])); } catch { /* not a title */ }
+  }
+  titles.delete(SETTINGS);
+  const setups = [...titles].map(t => setupOf(store, t));
+  const last = store.getItem('firefly-last-window');
+  const from = setups.find(s => s.title === last && s.states + s.regions + s.graphs > 0)
+    ?? setups.sort((a, b) => b.states + b.regions - (a.states + a.regions) || b.graphs - a.graphs)[0];
+  if (!from) return null;
+  copySetup(store, from.title, SETTINGS, SETUP_PARTS.map(p => p.id));
+  return from.title;
 }
 
 // ── A setup as a file, to share with someone else (Export… and Import… from a file) ────────────────────────

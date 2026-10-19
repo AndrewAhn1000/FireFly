@@ -47,7 +47,7 @@ app.whenReady().then(async()=>{
   await win.loadFile(path.join(root,'dist/index.html'));
   const states=[{id:'mobs',name:'Monsters',type:'collection',source:'script',script:'return {}'}, {id:'hp',name:'HP',type:'number',source:'memory',address:'0x1000',byteType:'i32'}, {id:'matches',name:'Matches',type:'collection',source:'region',regionId:'tracked',output:'@matches'}];
   const regions=[{id:'boxes',label:'Monsters',source:'script',script:'return {}',templates:[],visible:true,x:0,y:0,w:0,h:0}, {id:'tracked',label:'Tracked',source:'manual',templates:[{id:'t',cropUrl:images[0].toDataURL()}],match:true,multiMatch:true,matchThreshold:.5,x:.1,y:.2,w:.1,h:.1}];
-  await js(`localStorage.clear();localStorage.setItem('firefly-states-Rewind%20fixture',${JSON.stringify(JSON.stringify(states))});localStorage.setItem('firefly-regions-Rewind%20fixture',${JSON.stringify(JSON.stringify(regions))})`);
+  await js(`localStorage.clear();localStorage.setItem('firefly-states-%7Bsettings%7D',${JSON.stringify(JSON.stringify(states))});localStorage.setItem('firefly-regions-%7Bsettings%7D',${JSON.stringify(JSON.stringify(regions))})`);
   win.reload();await wait(500);await until(`document.querySelector('.win-item')`);
   await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}))`);await click('Start Session');
   await until(`${chip('Monsters')}==='2 items'`);

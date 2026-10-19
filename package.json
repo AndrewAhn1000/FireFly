@@ -28,7 +28,6 @@
     "test:region-edit-ui": "electron tests/region-edit-ui.cjs",
     "test:paused-region-edit-ui": "electron tests/paused-region-edit-ui.cjs",
     "test:window-setup": "node --test tests/window-setup.test.cjs",
-    "test:window-import-ui": "electron tests/window-import-ui.cjs",
     "test:script-regions": "node --test tests/script-regions.test.cjs",
     "test:lua-editing": "node --test tests/lua-editing.test.cjs",
     "test:collection-runtime": "electron tests/collection-runtime.cjs",

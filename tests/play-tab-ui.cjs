@@ -71,7 +71,7 @@ app.whenReady().then(async () => {
 
     await win.loadFile(path.join(root, 'dist/index.html'));
     const graph = { version: 1, nodes: [{ id: 'legacy', type: 'policy', position: { x: 80, y: 90 }, data: { kind: 'policy', name: 'Walker', buttons: null, off: [], stepMs: null, history: 2, delayMs: 0, epochs: 5 } }], edges: [] };
-    await js(`localStorage.clear();localStorage.setItem('firefly-last-window','Test Game');localStorage.setItem('firefly-policy-graph-Test%20Game',${JSON.stringify(JSON.stringify(graph))});0`);
+    await js(`localStorage.clear();localStorage.setItem('firefly-last-window','Test Game');localStorage.setItem('firefly-policy-graph-%7Bsettings%7D',${JSON.stringify(JSON.stringify(graph))});0`);
     await win.reload();
     await until(`!!document.querySelector('.win-item')`);
     await js(`document.querySelector('.win-item').dispatchEvent(new MouseEvent('dblclick',{bubbles:true}));0`);
@@ -114,6 +114,12 @@ app.whenReady().then(async () => {
     await slide('.play-share input', .7);
     await until(`document.querySelector('.play-share').textContent.includes('70% of training')`, 'the chosen share shown');
 
+    // The graph opened before training here: it stays mounted while hidden, and has to show the new version too
+    await click('Graphs');
+    await until(`document.querySelectorAll('.pg-version').length===2`, 'the graph showing v2 and v1');
+    await click('Game View');
+    await until(`!!document.querySelector('.play-detail')`, 'back to the Play tab');
+
     // Train a new version with the corrections: what this version was trained from, plus every Walker correction,
     // counting as much as was chosen
     await play('Train a new version with my corrections');
@@ -143,13 +149,16 @@ app.whenReady().then(async () => {
     // The Policy node: its versions newest first, and Delete all deletes them with their corrections only
     await click('Graphs');
     await until(`!!document.querySelector('.pg-delete-all')`, 'the Policy node’s Delete all');
-    assert.deepEqual(await js(`[...document.querySelectorAll('.pg-version b')].map(b=>b.textContent)`), ['v3', 'v2', 'v1']);
+    // It reads the versions again every 5 s, so the one trained in the Play tab shows up without reopening it
+    const versionsShown = () => js(`[...document.querySelectorAll('.pg-version b')].map(b=>b.textContent).join()`);
+    for (let i = 0; i < 80 && await versionsShown() !== 'v3,v2,v1'; i++) await wait(100);
+    assert.equal(await versionsShown(), 'v3,v2,v1', 'the version trained in the Play tab shows on the Policy node');
     // The Policy node chooses how much its corrections count too, and keeps it with the graph
     assert.match(await text('.pg-share'), /40% of training/);
     await slide('.pg-share input', .25);
     await until(`document.querySelector('.pg-share').textContent.includes('25% of training')`, 'the node’s chosen share shown');
     // (the graph library keeps the graph under a key of its own)
-    const keptShare = () => js(`Object.keys(localStorage).filter(k=>k.startsWith('firefly-policy-graph-Test%20Game')).map(k=>{try{return JSON.parse(localStorage.getItem(k))}catch{return null}})
+    const keptShare = () => js(`Object.keys(localStorage).filter(k=>k.startsWith('firefly-policy-graph-%7Bsettings%7D')).map(k=>{try{return JSON.parse(localStorage.getItem(k))}catch{return null}})
       .flatMap(g=>g?.nodes??[]).find(n=>n.id==='legacy')?.data.correctionShare`);
     for (let i = 0; i < 50 && await keptShare() !== .25; i++) await wait(40);
     assert.equal(await keptShare(), .25, 'kept with the graph');

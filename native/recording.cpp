@@ -104,14 +104,28 @@ Catalog::Catalog(std::filesystem::path root) : root_(std::move(root)) {
           "json_extract(data,'$.valid')=0),inputs=(SELECT count(*) FROM inputs "
           "WHERE recording=recordings.id) WHERE status='recording';");
 }
+// Every recording, newest first, with what lists of them use: not the graph each was recorded with, which is
+// most of a recording's metadata (about 20 KB, 1.5 without) and comes with the recording itself (read).
+// Corrections are recordings too, a few seconds each, and a policy played for a while has hundreds: at 200 the
+// oldest fell off the list, and a Policy node let go of them as if deleted. 2000 is as many as worker.py trains
+// on at once (MAX_RECORDINGS).
 Json Catalog::list() const {
   Db db(root_);
   Statement query(
       db, "SELECT id,name,status,duration,samples,invalid,inputs,metadata FROM "
-          "recordings ORDER BY created DESC LIMIT 200");
+          "recordings ORDER BY created DESC LIMIT 2000");
   Json rows = Json::array();
-  while (query.next())
-    rows.push_back(summary(query));
+  while (query.next()) {
+    Json row = summary(query);
+    auto &metadata = row["metadata"];
+    if (metadata.is_object()) {
+      metadata.erase("graph");
+      metadata.erase("tracked");
+      if (metadata.contains("observationSchema") && metadata["observationSchema"].is_object())
+        metadata["observationSchema"].erase("definition");
+    }
+    rows.push_back(std::move(row));
+  }
   return rows;
 }
 void Catalog::remove(const std::string &id) const {

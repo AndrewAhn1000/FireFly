@@ -53,8 +53,9 @@ app.whenReady().then(async () => {
       { id: 'mobs', name: 'Mobs', type: 'number', source: 'script', script: 'return 2', scriptWidth: 0, scriptHeight: 0 },
     ];
     const regions = [{ id: 'mon', label: 'Monsters', x: 0, y: 0, w: 0, h: 0, templates: [], source: 'script', script: 'return {}', scriptWidth: 800, scriptHeight: 600 }];
-    await js(`localStorage.clear();localStorage.setItem('firefly-states-'+encodeURIComponent('States fixture'),${JSON.stringify(JSON.stringify(states))});
-      localStorage.setItem('firefly-regions-'+encodeURIComponent('States fixture'),${JSON.stringify(JSON.stringify(regions))});0`);
+    await js(`localStorage.clear();localStorage.setItem('firefly-states-%7Bsettings%7D',${JSON.stringify(JSON.stringify(states))});
+      localStorage.setItem('firefly-regions-%7Bsettings%7D',${JSON.stringify(JSON.stringify(regions))});0`);
+    await win.reload(); // the settings are read once, at start
     await start();
     await until(`!!${row('Camera')}`);
     let log = await lately();
