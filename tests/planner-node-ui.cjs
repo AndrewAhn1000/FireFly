@@ -22,7 +22,6 @@ app.whenReady().then(async()=>{
     if(op==='planner.preview'){asked.plan.push(params);const dest=params.goal.plan.destination;
       const places=[[0,200],[40,200],[80,200],[120,200],[160,100],[200,100]];
       return {places,moves:[[0,1],[1,2],[2,3],[3,4],[4,5]],count:{places:6,moves:5},recordings:params.recordingIds.length,level:null,error:null,
-        ...(params.goal.plan.places==='shapes'?{library:{along:2,hops:5,levels:1,coverage:{hops:10,replayed:8},scale:{jump:45,hopMs:340},snap:20,tolerance:25,solid:false,through:{flights:40,up:3},physics:{walk:0.127,jump:0.544,gravity:0.002004,fall:0.645,jumpKey:'space',fits:{jumps:77,of:145,falls:1}},physicsUsed:{walk:0.127,jump:0.544,gravity:0.002004,fall:0.645}}}:{}),
         position:[0,200],destination:dest?[200,100]:null,path:dest?places:null,target:dest?[80,200]:null,next:dest?{keys:['right'],ms:200,seen:7}:null,seconds:dest?1.4:null};}
     if(op==='preview'){asked.preview.push(params);return {samples:900,stepMs:66,recordings:[{id:'old',rows:900}],skipped:[],skippedReasons:{},values:params.columns,inputs:params.columns.length,buttons:[{id:'k1',pressed:.3}]};}
     return {};
@@ -153,48 +152,6 @@ app.whenReady().then(async()=>{
   await choose('Plan destination','input');
   for(let i=0;i<80&&asked.preview.at(-1).goal?.plan?.destination?.kind!=='input';i++)await wait(50);
   assert.deepEqual(asked.preview.at(-1).goal.plan,{cell:40,aheadS:2.5,level:'hp',destination:{kind:'input',name:'Player'}});
-  // Along shapes: the shapes you can be on, ticked from its Spatial node (wired into Map above); the library shown
-  await choose('Plan places','shapes');
-  await until(`${planner}.textContent.includes('You can be on:')`,'the shapes to tick');
-  await until(`document.querySelector('.react-flow__node[data-id="pol"]').textContent.includes('tick the shapes the player can be on')`,'none ticked is a problem');
-  await js(`[...${planner}.querySelectorAll('.pg-plan-on label')].find(l=>l.textContent==='platforms').querySelector('input').click()`);
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.places!=='shapes';i++)await wait(50);
-  plan=asked.plan.at(-1).goal.plan;
-  // snap and tolerance left blank: worked out from the recordings, so not sent; the node shows what they came to
-  assert.deepEqual([plan.places,plan.inputs,plan.snap,plan.tolerance,plan.solid],['shapes',[{alias:'platforms',shapes:['platforms']}],undefined,undefined,undefined]);
-  await until(`${planner}.querySelector('[aria-label="On a shape within"]').placeholder==='auto (20)'`,'what auto came to');
-  assert.equal(await js(`${planner}.querySelector('[aria-label="Reuse within"]').placeholder`),'auto (25)');
-  await type('On a shape within','12');
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.snap!==12;i++)await wait(50);
-  assert.equal(asked.plan.at(-1).goal.plan.snap,12,'set by hand, it is sent');
-  await type('On a shape within','');
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.snap!==undefined;i++)await wait(50);
-  assert.equal(asked.plan.at(-1).goal.plan.snap,undefined,'cleared, auto again');
-  // from below, platforms: worked out from the recordings unless chosen
-  assert.match(await js(`${planner}.querySelector('[aria-label="Platforms from below"] option[value="auto"]').textContent`),/Auto \(can jump through\)/);
-  assert.match(await js(`${planner}.textContent`),/3 of your 40 jumps went up through a platform/);
-  await choose('Platforms from below','solid');
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.solid!==true;i++)await wait(50);
-  assert.equal(asked.plan.at(-1).goal.plan.solid,true);
-  await choose('Platforms from below','auto');
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.solid!==undefined;i++)await wait(50);
-  assert.equal(asked.plan.at(-1).goal.plan.solid,undefined,'auto: not sent');
-  // the movement: measured values shown, one typed in its place (px/s, sent as px/ms), or jumps only as recorded
-  assert.equal(await js(`${planner}.querySelector('[aria-label="Walk speed"]').placeholder`),'measured: 127');
-  assert.equal(await js(`${planner}.querySelector('[aria-label="Gravity"]').placeholder`),'measured: 2004');
-  assert.match(await js(`${planner}.textContent`),/Measured from 77 of your 145 jumps \(jump key: Space\)/);
-  assert.equal(asked.plan.at(-1).goal.plan.physics,undefined,'nothing set: not sent');
-  await type('Jump speed','555');
-  for(let i=0;i<80&&!asked.plan.at(-1).goal.plan.physics;i++)await wait(50);
-  assert.deepEqual(asked.plan.at(-1).goal.plan.physics,{jump:0.555});
-  await choose('Jumps from','recorded');
-  for(let i=0;i<80&&asked.plan.at(-1).goal.plan.physics!==false;i++)await wait(50);
-  assert.equal(asked.plan.at(-1).goal.plan.physics,false);
-  assert.ok(!(await js(`${planner}.querySelector('[aria-label="Jump speed"]')`)),'no movement values for recorded jumps');
-  await choose('Jumps from','physics');
-  await until(`${planner}.textContent.includes('Library: 5 hops and 2 ways along shapes, from 1 level · plans 80% of your hops from your other recordings · your jumps up rise 45 px')`,'the library');
-  for(let i=0;i<80&&asked.preview.at(-1).goal?.plan?.places!=='shapes';i++)await wait(50);
-  assert.deepEqual(asked.preview.at(-1).goal.plan.inputs,[{alias:'platforms',shapes:['platforms']}]);
   // Keep away from, learning from failure, and the plan's next move as the policy's values reach the worker
   await js(`${planner}.querySelector('[aria-label="Shapes to keep away from"] input').click()`);
   await js(`${planner}.querySelector('[aria-label="Learn from failure"]').click()`);

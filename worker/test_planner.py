@@ -1,6 +1,6 @@
 import unittest
 
-from planner import Planner, ShapeMap, learn, learn_moves, level_graph, level_planner
+from planner import Planner, learn
 
 
 def walk(x0, x1, y, t0=0.0, speed=0.2, keys=('right',), level=None, step_ms=50):
@@ -115,86 +115,6 @@ class PlanTests(unittest.TestCase):
         way = p.path(start, goal, away=near)
         leaves = next(p.places[way[i]][1] for i in range(len(way) - 1) if p.places[way[i + 1]][2] < 200)
         self.assertGreater(leaves, 400)
-
-
-class ShapeTests(unittest.TestCase):
-    """Places along shapes, and moves reused wherever shapes are arranged alike."""
-    @staticmethod
-    def level(dx=0, dy=0, rise=80):
-        # A floor, and a ledge `rise` px up overlapping its right end
-        return [('platforms', [(0 + dx, 200 + dy), (400 + dx, 200 + dy)]), ('platforms', [(300 + dx, 200 - rise + dy), (500 + dx, 200 - rise + dy)])]
-
-    def recorded(self):
-        lines = self.level()
-        on_floor = [(t, x, y - 5, lines, k) for t, x, y, _, k in walk(0, 250, 200)]
-        t0 = on_floor[-1][0]
-        # Up onto the ledge: 4 samples in the air, landing 80 px on and 80 up
-        jump = [(t0 + 50 * k, 250 + 20 * k, 195 - 20 * k - (30 if 0 < k < 4 else 0), lines, ('right', 'space')) for k in range(1, 5)]
-        ledge = [(t, x, y - 5, lines, k) for t, x, y, _, k in walk(330, 480, 120, t0=t0 + 250)]
-        back = [(t, x, y - 5, lines, k) for t, x, y, _, k in walk(250, 0, 200, t0=t0 + 5000, keys=('left',))]
-        return learn_moves([on_floor + jump + ledge, back], cell=40, snap=12)
-
-    def test_it_learns_walking_each_way_and_the_hop(self):
-        moves = self.recorded()
-        self.assertEqual(moves['along']['platforms']['+']['keys'], ['right'])
-        self.assertEqual(moves['along']['platforms']['-']['keys'], ['left'])
-        self.assertAlmostEqual(moves['along']['platforms']['+']['speed'], 0.2, places=2)
-        (hop,) = moves['hops']
-        self.assertEqual((hop['from'], hop['to'], hop['keys']), ('platforms', 'platforms', ['right', 'space']))
-        self.assertAlmostEqual(hop['dy'], -75, delta=8); self.assertGreater(hop['dx'], 30)  # it lands once within snap of the ledge
-
-    def plan(self, lines, moves, start, end):
-        p = Planner(level_graph(ShapeMap(lines, 40, 12), moves))
-        return p.path(p.place_at(None, *start), p.place_at(None, *end))
-
-    def test_the_hop_is_used_on_a_level_never_recorded_with_shapes_alike(self):
-        moves = self.recorded()
-        way = self.plan(self.level(dx=1000, dy=100), moves, (1020, 295), (1480, 215))
-        self.assertIsNotNone(way)
-
-    def test_not_where_the_ledge_is_higher_than_any_hop_made(self):
-        moves = self.recorded()
-        self.assertIsNone(self.plan(self.level(rise=200), moves, (20, 195), (480, -5)))
-
-    def test_a_flight_with_a_rest_on_something_unseen_is_no_hop(self):
-        lines = [('platforms', [[0, 200], [100, 200]]), ('platforms', [[300, 100], [400, 100]])]
-        def flight(rest):
-            pts = [(0, 50, 195), (50, 60, 195), (100, 90, 160), (150, 120, 150)]
-            pts += [(200, 120, 150), (300, 120, 150)] if rest else [(200, 160, 140)]   # still for 150 ms, off every shape
-            pts += [(350, 200, 120), (400, 260, 100), (450, 310, 95), (500, 320, 95)]
-            return [(t, x, y, lines, ('right', 'space')) for t, x, y in pts]
-        self.assertEqual(len(learn_moves([flight(False)], 40, 12, 25)['hops']), 1)
-        self.assertEqual(learn_moves([flight(True)], 40, 12, 25)['hops'], [])  # two jumps, with a rest between
-
-    def test_getting_off_a_rope_onto_a_platform_between_its_places(self):
-        # a rope up to a platform whose places (every 40 px from x 66) are 20 px either side of it
-        lines = [('ropes', [[86, 300], [86, 100]]), ('platforms', [[66, 95], [306, 95]])]
-        climb = [(25 * k, 86, 300 - 10 * k, lines, ('up',)) for k in range(21)]           # up the rope to its top
-        off = [(525 + 25 * k, 86 + 4 * k, 90, lines, ('right',)) for k in range(1, 20)]   # straight onto the platform
-        moves = learn_moves([climb + off, climb + off], 40, 12, 25)
-        hop = next(h for h in moves['hops'] if h['from'] == 'ropes')
-        self.assertLessEqual(hop['far'], 8)
-        p = level_planner(lines, moves, 40, 12, 25)
-        top = min(p.map.of_line[0], key=lambda i: p.map.places[i][1])  # the rope's top place
-        self.assertTrue(any(a == top for a, _ in p.hop_of), 'the way off the rope, though no place is within its 8 px')
-
-    def test_a_flight_that_goes_up_again_while_falling_is_no_hop(self):
-        lines = [('platforms', [[0, 200], [100, 200]]), ('platforms', [[120, 60], [220, 60]])]
-        def flight(snap_up):
-            if snap_up:  # up, falling again below the ledge, then 80 px higher in 50 ms with nothing pressed
-                pts = [(0, 50, 195), (50, 60, 195), (100, 80, 140), (150, 100, 125), (200, 110, 135), (250, 130, 55)]
-            else:        # up past the ledge, and down onto it
-                pts = [(0, 50, 195), (50, 60, 195), (100, 80, 140), (150, 100, 90), (200, 115, 45), (250, 130, 40), (300, 135, 55)]
-            pts += [(400, 150, 55), (450, 160, 55)]
-            return [(t, x, y, lines, ()) for t, x, y in pts]
-        self.assertEqual(learn_moves([flight(True)], 40, 12, 25)['hops'], [])
-        self.assertEqual(len(learn_moves([flight(False)], 40, 12, 25)['hops']), 1)   # a jump onto the ledge
-
-    def test_on_a_shape_is_within_snap(self):
-        m = ShapeMap(self.level(), 40, 12)
-        self.assertEqual(m.on(100, 192)[0], 0)
-        self.assertIsNone(m.on(100, 150))
-        self.assertEqual(m.edge(0, 100), 100); self.assertEqual(m.edge(0, 390), 10)
 
 
 if __name__ == '__main__':

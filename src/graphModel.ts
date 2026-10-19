@@ -68,37 +68,12 @@ export type PlannerMode = 'route' | 'plan';
 // A clicked point keeps the level it was clicked on (the Level's value then, when one is wired), so on another level
 // it isn't taken for a place there
 export type PlanDestination = { kind: 'point'; x?: number; y?: number; level?: string | null } | { kind: 'input' } | { kind: 'end'; recording: string };
-// Places along shapes (`places: 'shapes'`): points along the shapes of the Spatial inputs in `on` (those the player can
-// be on), the player on one within `snap` px; moves learned relative to the shapes (along them each way, and hops
-// between them) and reused wherever shapes are arranged alike, landing within `tolerance` px
 export interface PlannerData {
   kind: 'planner'; name: string; mode: PlannerMode; route: { recording: string; aheadS: number };
-  plan?: { cell: number; aheadS: number; destination: PlanDestination; places?: 'grid' | 'shapes'; on?: string[]; snap?: number; tolerance?: number;
+  plan?: { cell: number; aheadS: number; destination: PlanDestination;
     avoid?: string[];  // its Map's inputs to keep away from, such as monsters
-    learn?: boolean;   // a move that doesn't happen in play costs more from then on (true unless false)
-    solid?: boolean;   // platforms can't be jumped up through (a reused hop's arc may pass no other platform); not set,
-                       // the worker works it out from the recordings (none of 20 or more jumps going up through one)
-    movement?: Movement }; // the movement jumps are planned from (worker/physics.py), as set over what's measured
+    learn?: boolean }; // a move that doesn't happen in play costs more from then on (true unless false)
   [key: string]: unknown;
-}
-// A Planner's movement, in px/s and px/s² (the worker's are px/ms and px/ms²): each set in place of what's measured from
-// the recordings, left out to use the measured one; `physics: false` plans jumps only as recorded, not by the physics
-export interface Movement { physics?: boolean; walk?: number; jump?: number; gravity?: number; fall?: number; slide?: number; precision?: number; }
-export const MOVEMENT_FIELDS: { key: 'walk' | 'jump' | 'gravity' | 'fall' | 'slide' | 'precision'; label: string; unit: string; scale: number; title: string }[] = [
-  { key: 'walk', label: 'Walk speed', unit: 'px/s', scale: 1000, title: 'How fast the player walks, and crosses the air' },
-  { key: 'jump', label: 'Jump speed', unit: 'px/s', scale: 1000, title: 'How fast a jump launches the player upward' },
-  { key: 'gravity', label: 'Gravity', unit: 'px/s²', scale: 1e6, title: 'How fast falling speeds up' },
-  { key: 'fall', label: 'Fastest fall', unit: 'px/s', scale: 1000, title: 'The fastest the player falls' },
-  { key: 'slide', label: 'Slides on', unit: 'px', scale: 1, title: 'How far the player goes on after letting go of the key walked with: Drive lets go that far short of a spot' },
-  { key: 'precision', label: 'Stops within', unit: 'px', scale: 1, title: 'How near a spot Drive can stop the player (the spread of the slides, and half a frame of walking): a jump that lands from only part of that around its start has that chance, and is planned as its time over its chance' },
-];
-// As the worker takes it: false, or the ones set, in px/ms (and px/ms²); undefined with nothing set
-export function movementSpec(m?: Movement): false | Record<string, number> | undefined {
-  if (!m) return undefined;
-  if (m.physics === false) return false;
-  const out: Record<string, number> = {};
-  for (const f of MOVEMENT_FIELDS) if (typeof m[f.key] === 'number' && m[f.key]! > 0) out[f.key] = m[f.key]! / f.scale;
-  return Object.keys(out).length ? out : undefined;
 }
 
 export interface PolicyData {
@@ -126,8 +101,7 @@ export interface SpatialSpec {
 }
 export interface PlanSpec {
   cell: number; aheadS: number; level?: string; recordings?: string[];
-  places?: 'grid' | 'shapes'; inputs?: { alias: string; shapes: string[]; read?: SpatialRead }[]; snap?: number; tolerance?: number;
-  avoid?: { alias: string; shapes: string[]; read?: SpatialRead }[]; learn?: false; solid?: boolean; physics?: false | Record<string, number>;
+  avoid?: { alias: string; shapes: string[]; read?: SpatialRead }[]; learn?: false;
   destination: { kind: 'point'; x: number; y: number; level?: string } | { kind: 'input'; name: string } | { kind: 'end'; recording: string };
 }
 export interface GoalSpec {
@@ -150,9 +124,6 @@ export const GOAL_POSITION = 'in:@position', GOAL_FACING = 'in:@facing', GOAL_TA
 export const GOAL_DEFAULTS = { lookAhead: [1, 4] as [number, number], targets: 3, minMove: 20 };
 export const PLANNER_MAP = 'in:@map', PLANNER_LEVEL = 'in:@level', PLANNER_DESTINATION = 'in:@destination', PLANNER_DATA = 'in:@data';
 export const PLAN_CELL = 40; // px, a place's side unless the node says otherwise
-// px: on a shape within, and a reused hop landing within, at MapleStory's scale: left blank, the worker works them out
-// from the recordings, as these at the game's own scale (planner.Scale)
-export const PLAN_SNAP = 20, PLAN_TOLERANCE = 25;
 export const planDefaults = (): NonNullable<PlannerData['plan']> => ({ cell: PLAN_CELL, aheadS: 2.5, destination: { kind: 'point' } });
 export const ROUTE_AHEAD_S = 2.5; // the middle of the default look-ahead
 // Whether a Spatial node's input takes several wires: its shapes inputs do, its point, facing and bounds don't
@@ -278,31 +249,24 @@ export function planSpec(doc: GraphDoc, planner: GraphNode & { data: PlannerData
     : d.kind === 'input' ? (from(PLANNER_DESTINATION) ? { kind: 'input' as const, name: from(PLANNER_DESTINATION)! } : null)
     : d.recording ? { kind: 'end' as const, recording: d.recording } : null;
   if (!destination) return null;
-  const shapes = planShapes(doc, planner), avoid = planShapes(doc, planner, p.avoid ?? []);
-  if (p.places === 'shapes' && !shapes?.length) return null;
+  const avoid = planShapes(doc, planner, p.avoid ?? []);
   return { cell: p.cell, aheadS: p.aheadS, destination, ...(level ? { level } : {}),
-    ...(p.places === 'shapes' ? { places: 'shapes' as const, inputs: shapes!, ...(p.snap != null ? { snap: p.snap } : {}),
-      ...(p.tolerance != null ? { tolerance: p.tolerance } : {}), ...(p.solid != null ? { solid: p.solid } : {}),
-      ...(movementSpec(p.movement) !== undefined ? { physics: movementSpec(p.movement) } : {}) } : {}),
     ...(avoid?.length ? { avoid } : {}), ...(p.learn === false ? { learn: false as const } : {}),
     ...(data?.data.kind === 'recordings' && data.data.ids.length ? { recordings: data.data.ids } : {}) };
 }
 
-// The Spatial inputs a Planner's places are along: those of its Map ticked as ones the player can be on (or, given
-// `aliases`, those inputs, such as the ones to keep away from)
-export function planShapes(doc: GraphDoc, planner: GraphNode & { data: PlannerData }, aliases?: string[]): PlanSpec['inputs'] | null {
+// Those of the Spatial inputs of a Planner's Map named, such as the ones to keep away from
+export function planShapes(doc: GraphDoc, planner: GraphNode & { data: PlannerData }, aliases: string[]): PlanSpec['avoid'] | null {
   const map = byId(doc).get(into(doc, planner.id, PLANNER_MAP)[0]?.source ?? '');
   const spec = map ? spatialSpec(doc, map) : null;
   if (!spec) return null;
-  const on = new Set(aliases ?? planner.data.plan?.on ?? []);
+  const on = new Set(aliases);
   return spec.sets.filter(s => on.has(s.alias)).map(s => ({ alias: s.alias, shapes: s.shapes, ...(s.read ? { read: s.read } : {}) }));
 }
 
 // What stops a Planner in plan mode, if anything
 export function planProblem(doc: GraphDoc, planner: GraphNode & { data: PlannerData }): string | null {
   const p = planner.data.plan ?? planDefaults(), name = nameOf(planner) ?? 'Its planner';
-  if (p.places === 'shapes' && !into(doc, planner.id, PLANNER_MAP).length) return `${name}: wire a Spatial node into its Map, for the shapes its places are along`;
-  if (p.places === 'shapes' && !planShapes(doc, planner)?.length) return `${name}: tick the shapes the player can be on, such as platforms and ropes`;
   const data = byId(doc).get(into(doc, planner.id, PLANNER_DATA)[0]?.source ?? '');
   if (p.destination.kind === 'point' && (p.destination.x == null || p.destination.y == null)) return `${name}: click its map where play heads`;
   if (p.destination.kind === 'input' && !into(doc, planner.id, PLANNER_DESTINATION).length) return `${name}: wire a position into its Destination`;

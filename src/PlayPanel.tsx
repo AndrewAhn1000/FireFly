@@ -138,7 +138,7 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
 
   const playingNow = status.playing ? versions.find(v => v.id === status.modelId) ?? null : null;
   const why = !capturing ? 'Start a capture session first' : !windowId ? 'Choose the game window first'
-    : recording ? 'Stop recording first' : status.playing ? (status.drive ? `${status.name ?? 'A planner'} is driving` : 'Another version is playing') : '';
+    : recording ? 'Stop recording first' : status.playing ? (status.behavior ? `${status.name ?? 'A behaviour tree'} is running` : 'Another version is playing') : '';
 
   if (!versions.length) return (
     <div className="play-panel play-empty">
@@ -201,7 +201,7 @@ export default function PlayPanel({ active, online, capturing, windowId, recordi
               <input type="checkbox" checked={keepSeen} disabled={isPlaying} onChange={e => setKeepSeen(e.target.checked)} />Keep what it sees, to compare with its training</label>
             {why && !isPlaying && <div className="play-hint">{why}.</div>}
             {isPlaying && <div className="play-live" role="status">{playingText(status)}</div>}
-            {!status.playing && status.reason && (!status.modelId && !status.drive || status.modelId === v.id) && <div className="play-stopped">Stopped: {status.reason}</div>}
+            {!status.playing && status.reason && (!status.modelId && !status.behavior || status.modelId === v.id) && <div className="play-stopped">Stopped: {status.reason}</div>}
             {!isPlaying && <button className="train-btn-sm" disabled={report?.busy}
               title="Its last play that kept what it saw, beside what it trained on" onClick={() => void compare(v)}>
               {report?.busy && report.versionId === v.id ? 'Comparing…' : 'Compare what it saw with its training'}</button>}

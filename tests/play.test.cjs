@@ -7,8 +7,7 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 
 function harness(options = {}) {
   const calls = [], statuses = [];
-  const state = {focused: true, idleMs: 0, held: false, predict: () => ({buttons: [true, false]}), clock: 0,
-    step: () => ({buttons: [true, false], status: {phase: 'walk', text: 'walking to the destination: 80 px', done: 0, missed: 0, misses: []}})};
+  const state = {focused: true, idleMs: 0, held: false, predict: () => ({buttons: [true, false]}), clock: 0};
   const log = (who, op, params) => { calls.push({who, op, params}); };
   const play = createPlay({
     runtime: async (op, params) => {
@@ -27,9 +26,8 @@ function harness(options = {}) {
         actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}]}}];
       if (op === 'load' && params.trace) return {trace: 'C:/traces/p/1.jsonl'};
       if (op === 'predict') return state.predict();
-      if (op === 'drive.load') return {buttons: [{id: 'right', vk: 39}, {id: 'space', vk: 32}], hops: 2, examples: 3,
-        actionSchema: {identity: 'act', buttons: [{id: 'left', vk: 37}, {id: 'right', vk: 39}, {id: 'space', vk: 32}]}};
-      if (op === 'drive.step') return state.step();
+      if (op === 'behavior.load') return {buttons: [{id: 'space', vk: 32}], trace: 'C:/traces/behavior/1.jsonl'};
+      if (op === 'behavior.step') return state.tick();
       return {};
     },
     guard: async (op, params) => {
@@ -403,26 +401,25 @@ test('a button the player tapped is tapped to their rhythm while the policy hold
   h.play.stop('Done');
 });
 
-test('driving: the planner presses what its step says, with the frame’s age, and taking over stops it', async () => {
+test('a behaviour tree presses what each frame of it says, lights its nodes, and ends play when it ends', async () => {
   const h = harness();
   h.state.monotonic = 1100;
-  await h.play.start({windowId: '42', drive: {goal: {name: 'goal'}, recordingIds: ['a']}, name: 'Way up'});
-  assert.deepEqual(h.ops('worker', 'drive.load')[0].params, {goal: {name: 'goal'}, recordingIds: ['a']});
-  assert.deepEqual(h.ops('guard', 'configure')[0].params.buttons, [{id: 'right', vk: 39}, {id: 'space', vk: 32}], 'Only the buttons it learned moves with');
-  assert.equal(h.ops('worker', 'load').length, 0, 'No policy is loaded');
-  assert.deepEqual(h.ops('runtime', 'session.schemas')[0].params.buttons, [{id: 'right', vk: 39}, {id: 'space', vk: 32}],
-    'Frames carry the action schema of the buttons the guard is configured with');
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [150, 0, false]], status: {text: 'pressing space 0/150 ms', nodes: {root: 'running', p: 'running'}, done: null}});
+  await h.play.start({windowId: '42', behavior: {tree: {root: 'root', nodes: {}}, fields: [], buttons: [{id: 'space', vk: 32}]}, name: 'Jump quest', treeId: 'g1'});
+  assert.equal(h.ops('worker', 'behavior.load').length, 1);
+  assert.deepEqual(h.ops('guard', 'configure')[0].params.buttons, [{id: 'space', vk: 32}], 'only the keys its nodes press');
   h.frame(1000); await wait(10);
-  const step = h.ops('worker', 'drive.step')[0].params;
+  const step = h.ops('worker', 'behavior.step')[0].params;
   assert.ok(step.ageMs >= 100 && step.ageMs < 120, `the frame's age and a step's time: ${step.ageMs}`);
-  assert.deepEqual(h.ops('guard', 'apply')[0].params.buttons, [true, false]);
-  assert.equal(h.ops('guard', 'apply')[0].params.actionSchema, 'act-right+space');
+  const applied = h.ops('guard', 'apply')[0].params;
+  assert.deepEqual(applied.buttons, [true]);
+  assert.deepEqual(applied.sequence, [[0, 0, true], [150, 0, false]], 'its presses for the guard to play to the ms');
   const s = h.statuses.at(-1);
-  assert.equal(s.drive, true); assert.equal(s.name, 'Way up'); assert.equal(s.driving.text, 'walking to the destination: 80 px');
-  h.state.step = () => ({buttons: [false, false], status: {phase: 'missing', text: 'Invalid or missing observation: player', done: 0, missed: 0, misses: []}});
-  h.frame(1050); await wait(10);
-  assert.equal(h.statuses.at(-1).driving.phase, 'missing');
-  h.play.guardStopped('Player takeover (a key)');
+  assert.equal(s.behavior, true); assert.equal(s.treeId, 'g1'); assert.equal(s.name, 'Jump quest');
+  assert.deepEqual(s.tree.nodes, {root: 'running', p: 'running'});
+  h.state.tick = () => ({buttons: [false], status: {text: null, nodes: {root: 'success'}, done: 'success'}});
+  h.state.clock = 500; h.frame(1100); await wait(10);
   assert.equal(h.statuses.at(-1).playing, false);
-  assert.equal(h.ops('runtime', 'record.start').length, 0, 'Driving records no corrections');
+  assert.equal(h.statuses.at(-1).reason, 'The tree succeeded');
+  assert.equal(h.statuses.at(-1).treeId, 'g1');
 });

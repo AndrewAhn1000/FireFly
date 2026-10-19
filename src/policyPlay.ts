@@ -2,6 +2,7 @@
 // says, deleting versions (with the corrections recorded while they played), and training a version again
 // with those corrections. The worker (worker/worker.py) trains, lists and plays them.
 import { buttonLabel } from './Keyboard';
+import type { MapLive } from './mapModel';
 import { playGoal, readGraph } from './graphModel';
 
 export const POLICY_VERSION = 3; // what the worker plays (worker.py VERSION)
@@ -60,13 +61,11 @@ export interface PlayStatus { playing: boolean; waiting?: boolean; correcting?: 
   heading?: { kind: 'plan' | 'route' | 'target'; x: number; y: number; distance: number } | null;
   trace?: string | null; // where what it sees is being kept, if it is
   taps?: string[];  // the buttons it taps rather than holds, as the player did
-  // Driving (a Planner node's Drive, worker/executor.py): its node and name, and what it's doing in the latest frame
-  drive?: boolean; name?: string; driverId?: string | null; driving?: Driving | null; }
-export interface Driving {
-  phase: 'walk' | 'position' | 'jump' | 'air' | 'arrived' | 'noway' | 'stuck' | 'missing'; text: string; done: number; missed: number;
-  misses: { from: [number, number]; to: [number, number]; why: string }[];
-  hop?: { from: [number, number]; to: [number, number]; example: number; anchor: [number, number] };
-}
+  name?: string;
+  // A behaviour tree running (the Graphs view's, worker/behavior.py): its graph, and in the latest frame what's
+  // running and how each node it reached answered
+  behavior?: boolean; treeId?: string | null; tree?: { text: string | null; nodes: Record<string, 'running' | 'success' | 'failure'>; done: string | null;
+    trees?: Record<string, Record<string, 'running' | 'success' | 'failure'>>; maps?: Record<string, MapLive> } | null; }
 
 // What a version saw while it played beside what it trained on (worker.py, trace_report)
 export interface TraceReport {
@@ -87,14 +86,11 @@ export const latencyText = (l?: Latency | null) => {
 // What a playing policy is doing, in a line
 export function playingText(status: PlayStatus): string {
   if (status.waiting) return 'Switch to the game to start (10 s)';
-  if (status.drive) {
-    const d = status.driving, last = d?.misses?.[d.misses.length - 1];
-    return `● ${status.name ?? 'The planner'} is driving: ${d?.text ?? 'starting'}`
-      + (d ? ` · ${d.done} hop${d.done === 1 ? '' : 's'} done, ${d.missed} missed${last ? ` (last: from (${last.from.join(', ')}) to (${last.to.join(', ')}), ${last.why})` : ''}` : '')
+  if (status.behavior)
+    return `● ${status.name ?? 'The tree'} is running: ${status.tree?.text ?? 'deciding'}`
       + (status.keyboardFocus === false ? ' · ⚠ the game is in front but doesn’t have the keyboard, so its keys go nowhere: click in the game once' : '')
       + (status.released ? ` · ${status.released} frames it couldn’t act on, lately: ${status.missed ?? '?'}` : '')
       + latencyText(status.latency);
-  }
   if (status.correcting) return '✋ You’re in control: recording your correction';
   const pressed = Object.entries(status.pressed ?? {});
   return `● Playing${status.keyboardFocus === false ? ' · ⚠ the game is in front but doesn’t have the keyboard, so its keys go nowhere: click in the game once' : ''}`

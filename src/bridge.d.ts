@@ -51,8 +51,9 @@ interface Bridge {
   };
   policy: {
     invoke(op: string, params?: Record<string, unknown>): Promise<unknown>;
-    // With `drive` (a Planner node's request) instead of a version, the planner moves the player itself (worker/executor.py)
-    play(params: { modelId?: string; windowId: string; corrections?: boolean; trace?: boolean; graphId?: string; goal?: unknown; drive?: unknown; name?: string; driverId?: string }): Promise<{ ok: boolean; error?: string }>;
+    // With `behavior` (a behaviour tree, worker/behavior.py) instead of a version, the tree presses the keys
+    play(params: { modelId?: string; windowId: string; corrections?: boolean; trace?: boolean; graphId?: string; goal?: unknown; name?: string;
+      behavior?: unknown; treeId?: string }): Promise<{ ok: boolean; error?: string }>;
     stop(how?: 'key' | 'click'): Promise<void>;
     exportDataset(params: Record<string, unknown>): Promise<{ ok: boolean; canceled?: boolean; error?: string; path?: string; manifest?: string; samples?: number; features?: number; buttons?: number; skipped?: string[]; skippedReasons?: Record<string, number>; stepMs?: number }>;
     reveal(file: string): Promise<void>;

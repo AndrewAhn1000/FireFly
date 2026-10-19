@@ -1,10 +1,16 @@
 import { useEffect, useState } from 'react';
 import PolicyGraph, { type PolicyGraphProps } from './PolicyGraph';
 import CollectionGraph from './CollectionGraph';
+import BehaviorTree from './BehaviorTree';
+import MapGraph from './MapGraph';
+import { emptyTree } from './behaviorModel';
+import { emptyMap } from './mapModel';
 import { emptyGraph } from './graphModel';
 import { emptyCollection, type CaptureRegion, type CollectionStatus } from './collectionModel';
 
-type Kind = 'folder' | 'policy' | 'collection';
+type Kind = 'folder' | 'policy' | 'collection' | 'behavior' | 'map';
+const KIND_NAMES: Record<Exclude<Kind, 'folder'>, string> = { policy: 'Policy', collection: 'Data Collection', behavior: 'Behavior tree', map: 'Map' };
+const NEW_NAMES: Record<Kind, string> = { folder: 'New folder', policy: 'New policy', collection: 'New collection', behavior: 'New behavior tree', map: 'New map' };
 interface Entry { id: string; parent: string | null; name: string; kind: Kind; collapsed?: boolean; }
 interface Library { version: 1; entries: Entry[]; selected: string; }
 interface Props extends PolicyGraphProps { regions: CaptureRegion[]; }
@@ -32,7 +38,7 @@ function readLibrary(scope: string): Library {
 
 export default function GraphLibrary(props: Props) {
   const [statuses, setStatuses] = useState<CollectionStatus[]>([]);
-  const [play, setPlay] = useState<{ playing: boolean; graphId?: string }>({ playing: false });
+  const [play, setPlay] = useState<{ playing: boolean; graphId?: string; treeId?: string | null; behavior?: boolean; name?: string }>({ playing: false });
   useEffect(() => {
     void window.bridge.collection.status().then(setStatuses).catch(() => {});
     const a = window.bridge.on('collection:status', s => setStatuses(s as CollectionStatus[]));
@@ -42,10 +48,10 @@ export default function GraphLibrary(props: Props) {
   const running = statuses.filter(s => s.running);
   return <>
     {(running.length > 0 || play.playing) && <div className="graph-activity" aria-label="Active graphs">
-      {play.playing && <span>● Policy playing <button onClick={() => void window.bridge.policy.stop()}>Stop policy</button></span>}
+      {play.playing && <span>● {play.behavior ? `${play.name ?? 'A behavior tree'} running` : 'Policy playing'} <button onClick={() => void window.bridge.policy.stop()}>{play.behavior ? 'Stop tree' : 'Stop policy'}</button></span>}
       {running.map(s => <span key={s.graphId}>● {s.name} · {s.test ? `${s.fired} test events` : `${s.saved} images`} <button onClick={() => void window.bridge.collection.stop(s.graphId)}>Stop</button></span>)}
     </div>}
-    <LibraryEditor key={props.storageKey} {...props} statuses={statuses} playingId={play.playing ? play.graphId : undefined} />
+    <LibraryEditor key={props.storageKey} {...props} statuses={statuses} playingId={play.playing ? play.graphId ?? play.treeId ?? undefined : undefined} />
   </>;
 }
 
@@ -70,7 +76,9 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
     else { save({ ...library, selected: entry.id }); setOpened(ids => ids.includes(entry.id) ? ids : [...ids, entry.id]); }
   };
   const parent = selected?.kind === 'folder' ? selected.id : selected?.parent ?? null;
-  const create = (kind: Kind, folder = parent) => { setMenu(null); setDialog({ action: 'create', kind, name: kind === 'folder' ? 'New folder' : kind === 'policy' ? 'New policy' : 'New collection', parent: folder }); };
+  const create = (kind: Kind, folder = parent) => { setMenu(null); setDialog({ action: 'create', kind, name: NEW_NAMES[kind], parent: folder }); };
+  // the graphs a behaviour tree can run or go over
+  const graphs = library.entries.filter(e => e.kind === 'behavior' || e.kind === 'map').map(e => ({ id: e.id, name: e.name, kind: e.kind }));
   const manage = (action: 'rename' | 'move' | 'delete', entry: Entry) => { setMenu(null); setDialog({ action, kind: entry.kind, id: entry.id, name: entry.name, parent: entry.parent }); };
   const duplicate = (entry: Entry) => {
     setMenu(null);
@@ -97,7 +105,7 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
     try {
       if (d.action === 'create') {
         const id = crypto.randomUUID();
-        if (d.kind !== 'folder') localStorage.setItem(documentKey(props.storageKey, id), JSON.stringify(d.kind === 'policy' ? newPolicy(d.name.trim()) : emptyCollection()));
+        if (d.kind !== 'folder') localStorage.setItem(documentKey(props.storageKey, id), JSON.stringify(d.kind === 'policy' ? newPolicy(d.name.trim()) : d.kind === 'behavior' ? emptyTree() : d.kind === 'map' ? emptyMap() : emptyCollection()));
         save({ ...library, selected: d.kind === 'folder' ? library.selected : id, entries: [...library.entries.map(e => e.id === d.parent ? { ...e, collapsed: false } : e), { id, parent: d.parent, name: d.name.trim(), kind: d.kind }] });
         if (d.kind !== 'folder') setOpened(ids => [...ids, id]);
       } else if (d.action === 'delete') {
@@ -127,7 +135,7 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
         onDragOver={e => { if (entry.kind === 'folder' && e.dataTransfer.types.includes('application/firefly-graph')) e.preventDefault(); }}
         onDrop={e => { e.preventDefault(); e.stopPropagation(); move(e.dataTransfer.getData('application/firefly-graph'), entry.kind === 'folder' ? entry.id : entry.parent); }}
         onClick={() => select(entry)} onContextMenu={e => { e.preventDefault(); setMenu({ id: entry.id, x: e.clientX, y: e.clientY }); }}>
-        <span>{entry.kind === 'folder' ? entry.collapsed && !query ? '▸' : '▾' : entry.kind === 'policy' ? '◇' : '▣'}</span><span className={query && matches ? 'graph-match' : ''}>{entry.name}</span>{isRunning(entry.id) && <span className="graph-running" title="Running">●</span>}
+        <span>{entry.kind === 'folder' ? entry.collapsed && !query ? '▸' : '▾' : entry.kind === 'policy' ? '◇' : entry.kind === 'behavior' ? '⑂' : entry.kind === 'map' ? '⌖' : '▣'}</span><span className={query && matches ? 'graph-match' : ''}>{entry.name}</span>{isRunning(entry.id) && <span className="graph-running" title="Running">●</span>}
       </button>
       {entry.kind === 'folder' && (!entry.collapsed || query) && tree(entry.id, depth + 1)}
     </div>;
@@ -141,23 +149,28 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
       <div className="graph-directory-title">Graphs <button title="New folder" aria-label="New folder" onClick={() => create('folder', null)}>＋</button></div>
       <input aria-label="Find graphs" placeholder="Find graphs…" value={query} onChange={e => setQuery(e.target.value)} />
       <div className="graph-tree">{tree(null)}</div>
-      <div className="graph-new"><button onClick={() => create('policy')}>+ Policy</button><button onClick={() => create('collection')}>+ Collection</button></div>
+      <div className="graph-new"><button onClick={() => create('policy')}>+ Policy</button><button onClick={() => create('collection')}>+ Collection</button><button onClick={() => create('behavior')}>+ Behavior</button><button onClick={() => create('map')}>+ Map</button></div>
       <small>Right-click to organize. Drag graphs into folders.</small>
     </aside>
     <section className="graph-workspace">
-      <div className="graph-breadcrumb"><span>{['Graphs', ...ancestors].join(' / ')}</span>{selected && <><b>{selected.kind === 'policy' ? 'Policy' : 'Data Collection'}</b><button title="Graph options" aria-label="Graph options" onClick={e => setMenu({ id: selected.id, x: e.clientX - 150, y: e.clientY + 10 })}>⋯</button></>}</div>
+      <div className="graph-breadcrumb"><span>{['Graphs', ...ancestors].join(' / ')}</span>{selected && <><b>{selected.kind === 'folder' ? 'Folder' : KIND_NAMES[selected.kind]}</b><button title="Graph options" aria-label="Graph options" onClick={e => setMenu({ id: selected.id, x: e.clientX - 150, y: e.clientY + 10 })}>⋯</button></>}</div>
       {error && <div className="collection-error">{error}</div>}
       {/* Open policy editors stay mounted so training state survives navigation. */}
       {library.entries.filter(e => e.kind === 'policy' && (opened.includes(e.id) || props.active && library.selected === e.id)).map(entry => <div key={entry.id} className={`graph-page ${library.selected === entry.id ? '' : 'pg-off'}`}><PolicyGraph {...props} active storageKey={documentKey(props.storageKey, entry.id)} graphId={entry.id} /></div>)}
       {selected?.kind === 'collection' && (props.active || opened.includes(selected.id)) && <CollectionGraph key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name} scope={props.storageKey} windowId={props.windowId} capturing={props.capturing} observed={props.observed} stateLabels={props.stateLabels} regions={props.regions} status={props.statuses.find(s => s.graphId === selected.id)} />}
-      {!selected && <div className="graph-empty">Create a Policy or Data Collection graph to get started.</div>}
+      {selected?.kind === 'behavior' && (props.active || opened.includes(selected.id)) && <BehaviorTree key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name}
+        windowId={props.windowId} capturing={props.capturing} recording={props.recording} online={props.online} observed={props.observed} stateLabels={props.stateLabels}
+        scope={props.storageKey} graphs={graphs} />}
+      {selected?.kind === 'map' && (props.active || opened.includes(selected.id)) && <MapGraph key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name}
+        scope={props.storageKey} graphs={graphs} capturing={props.capturing} online={props.online} observed={props.observed} stateLabels={props.stateLabels} />}
+      {!selected && <div className="graph-empty">Create a Policy, Data Collection, Behavior tree or Map graph to get started.</div>}
     </section>
     {menu && <div className="graph-menu-shade" onClick={() => setMenu(null)}><div className="graph-menu" style={{ left: Math.min(menu.x, window.innerWidth - 190), top: Math.min(menu.y, window.innerHeight - 270) }} onClick={e => e.stopPropagation()}>{(() => {
       const entry = library.entries.find(e => e.id === menu.id); if (!entry) return null;
-      return <>{entry.kind === 'folder' ? <><button onClick={() => create('folder', entry.id)}>New folder</button><button onClick={() => create('policy', entry.id)}>New policy</button><button onClick={() => create('collection', entry.id)}>New collection</button></> : <><button onClick={() => duplicate(entry)}>Duplicate</button><button onClick={() => exportGraph(entry)}>Export graph</button></>}<button onClick={() => manage('rename', entry)}>Rename</button><button onClick={() => manage('move', entry)}>Move to…</button><button onClick={() => manage('delete', entry)}>Delete</button></>;
+      return <>{entry.kind === 'folder' ? <><button onClick={() => create('folder', entry.id)}>New folder</button><button onClick={() => create('policy', entry.id)}>New policy</button><button onClick={() => create('collection', entry.id)}>New collection</button><button onClick={() => create('behavior', entry.id)}>New behavior tree</button><button onClick={() => create('map', entry.id)}>New map</button></> : <><button onClick={() => duplicate(entry)}>Duplicate</button><button onClick={() => exportGraph(entry)}>Export graph</button></>}<button onClick={() => manage('rename', entry)}>Rename</button><button onClick={() => manage('move', entry)}>Move to…</button><button onClick={() => manage('delete', entry)}>Delete</button></>;
     })()}</div></div>}
     {dialog && <div className="graph-dialog-shade"><form className="graph-dialog" onSubmit={e => { e.preventDefault(); submit(); }}>
-      <b>{dialog.action === 'create' ? `New ${dialog.kind === 'collection' ? 'Data Collection graph' : dialog.kind}` : `${dialog.action[0].toUpperCase() + dialog.action.slice(1)} ${dialog.name}`}</b>
+      <b>{dialog.action === 'create' ? `New ${dialog.kind === 'collection' ? 'Data Collection graph' : dialog.kind === 'behavior' ? 'behavior tree' : dialog.kind}` : `${dialog.action[0].toUpperCase() + dialog.action.slice(1)} ${dialog.name}`}</b>
       {dialog.action === 'delete' ? <p>Remove this {dialog.kind === 'folder' ? 'folder and its graphs' : 'graph'} from the directory? Saved images, recordings and trained models are kept.</p> : <><label>Name<input autoFocus aria-label="Graph name" value={dialog.name} onChange={e => setDialog({ ...dialog, name: e.target.value })} /></label><label>Folder<select aria-label="Parent folder" value={dialog.parent ?? ''} onChange={e => setDialog({ ...dialog, parent: e.target.value || null })}><option value="">Game root</option>{library.entries.filter(e => e.kind === 'folder' && (!dialog.id || !childrenOf(dialog.id).includes(e.id))).map(e => <option key={e.id} value={e.id}>{e.name}</option>)}</select></label></>}
       <div><button type="button" onClick={() => setDialog(null)}>Cancel</button><button type="submit">{dialog.action === 'delete' ? 'Delete' : 'Save'}</button></div>
     </form></div>}

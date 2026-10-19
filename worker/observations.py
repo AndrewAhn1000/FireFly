@@ -9,7 +9,6 @@ every recording and in play. Nothing here knows any game.
 import bisect
 import json
 import math
-import threading
 import time
 from bisect import bisect_left
 
@@ -125,7 +124,6 @@ def level_key(value):
 
 
 PLAN_DESTINATIONS = ('point', 'input', 'end')
-PLAN_WAIT_S = 0.03  # how long a frame waits for a level's planner being made, before going without
 
 
 def goal_names(g):
@@ -135,26 +133,6 @@ def goal_names(g):
     hint = (g.get('hint') or {}).get('buttons') or []
     return ([f"{g['name']}.forward" if 'facing' in g else f"{g['name']}.dx", f"{g['name']}.dy", f"{g['name']}.dist"]
             + [f"{g['name']}.next.{b}" for b in hint] + [f"{g['name']}.soon.{b}" for b in hint])
-
-
-def _physics_of(given, name):
-    """A Planner's movement as set: False (jumps only as recorded), or any of walk, jump, fall (px/ms) and gravity
-    (px/ms^2), each a positive number, in place of what's measured."""
-    if given is False:
-        return False
-    if not isinstance(given, dict) or any(k not in ('walk', 'jump', 'gravity', 'fall', 'slide', 'precision') for k in given) or \
-            any(not (isinstance(v, (int, float)) and math.isfinite(v) and v > 0) for v in given.values()):
-        raise ValueError(f'{name}: its movement is walk, jump and fall speeds, gravity, slide and precision, each above 0')
-    return {k: float(v) for k, v in given.items()}
-
-
-def settle(plan):
-    """A plan's snap and tolerance left to work out (`auto`), as what it learned worked them out to."""
-    moves = (plan.get('graph') or {}).get('moves')
-    settings = (moves.get('settings') if isinstance(moves, dict) else None) or {}  # a grid's moves are a list, never auto
-    for k in plan.get('auto') or ():
-        if settings.get(k):
-            plan[k] = float(settings[k])
 
 
 def no_hint(g):
@@ -328,35 +306,13 @@ class Featurizer:
                 raise ValueError(f'{name}: choose the recording whose end play heads for')
             if plan.get('level') is not None and plan['level'] not in names:
                 raise ValueError(f'{name}: its Level, {plan["level"]}, isn’t observed')
-            places = plan.get('places', 'grid')
-            if places not in ('grid', 'shapes'):
-                raise ValueError(f'{name}: places are a grid or along shapes')
-            if places == 'shapes':
-                inputs = plan.get('inputs')
-                if not (isinstance(inputs, list) and inputs and all(isinstance(e, dict) and isinstance(e.get('alias'), str) and isinstance(e.get('shapes'), list)
-                                                                    and e['shapes'] and all(n in names for n in e['shapes']) for e in inputs)):
-                    raise ValueError(f'{name}: tick the shapes the player can be on, such as platforms and ropes, in its Spatial node')
-                if not (finite(plan.get('snap', planner_.SNAP)) and 1 <= plan.get('snap', planner_.SNAP) <= 200
-                        and finite(plan.get('tolerance', planner_.TOLERANCE)) and 1 <= plan.get('tolerance', planner_.TOLERANCE) <= 500):
-                    raise ValueError(f'{name}: on a shape within 1..200 px, and moves reused within 1..500 px')
-            # along shapes, snap and tolerance not given are worked out from the recordings (`auto`: Worker._learn_moves,
-            # the defaults at the game's own scale), and kept with what it learned
-            auto = [k for k in ('snap', 'tolerance') if plan.get(k) is None] if places == 'shapes' else []
-            spec['plan'] = {'places': places, 'cell': float(plan.get('cell', planner_.CELL)), 'aheadS': float(plan['aheadS']),
-                            **({'auto': auto} if auto else {}),
-                            # platforms solid from below: true, false, or not given (worked out from the recordings)
-                            **({'solid': bool(plan['solid'])} if places == 'shapes' and plan.get('solid') is not None else {}),
-                            # the movement: what's set of it in place of what's measured (px, ms), or False for jumps as
-                            # recorded only (physics.py)
-                            **({'physics': _physics_of(plan['physics'], name)} if places == 'shapes' and plan.get('physics') is not None else {}),
-                            **({'inputs': [{'alias': e['alias'], 'shapes': list(e['shapes']), **({'read': e['read']} if e.get('read') else {})} for e in plan['inputs']],
-                                'snap': float(plan.get('snap', planner_.SNAP)), 'tolerance': float(plan.get('tolerance', planner_.TOLERANCE))}
-                               if places == 'shapes' else {}),
+            if plan.get('places', 'grid') != 'grid':
+                raise ValueError(f'{name}: places along shapes were taken out: its Planner plans on a grid (a behaviour tree’s Go to plans over a map you make)')
+            spec['plan'] = {'places': 'grid', 'cell': float(plan.get('cell', planner_.CELL)), 'aheadS': float(plan['aheadS']),
                             'destination': {k: v for k, v in dest.items() if k in ('kind', 'x', 'y', 'name', 'recording', 'level')},
                             **({'level': plan['level']} if plan.get('level') is not None else {}),
                             **({'recordings': list(plan['recordings'])} if plan.get('recordings') else {}),
                             **({'graph': plan['graph']} if isinstance(plan.get('graph'), dict) else {})}
-            settle(spec['plan'])
         if 'plan' in spec:
             plan = g['plan']
             # Keep away from: inputs whose shapes the way avoids, as they are each frame (monsters)
@@ -414,66 +370,11 @@ class Featurizer:
             raise Missing(f'{self.goal["name"]}: its destination is on another level ({dest["level"]}; you’re on {here})')
         return float(dest['x']), float(dest['y'])
 
-    def plan_lines_by_input(self, values, held=None):
-        """Each ticked input's lines in a sample, by input: {input: [points]}. An input whose States weren't read in
-        this sample (a Lua State is read at most every 30 ms, so some frames go without) keeps the lines it last had,
-        in `held` (play's own, unless given): taken as the level changing, they had its places made again frame
-        after frame, and play never got a target."""
-        held = self.__dict__.setdefault('_held_lines', {}) if held is None else held
-        out = {}
-        for entry in self.goal['plan']['inputs']:
-            read = all((values.get(name) or {}).get('valid') for name in entry['shapes'])
-            if not read and entry['alias'] in held:
-                out[entry['alias']] = held[entry['alias']]
-                continue
-            out[entry['alias']] = held[entry['alias']] = [points for points, _ in spatial_.shapes_of(self.shapes_of_set(entry, values))]
-        return out
-
-    def plan_lines(self, values):
-        """The lines the player can be on in a sample, for places along shapes: [(input, points)], but those of
-        inputs whose shapes move (`moving`, found when it learned: a level's places can't be where things move)."""
-        moving = set((self.goal['plan'].get('graph') or {}).get('moving') or ())
-        return [(alias, points) for alias, lines in self.plan_lines_by_input(values).items() if alias not in moving for points in lines]
-
     def plan_planner(self, values, wait=False):
-        """The planner for a sample: one for the whole learned grid, or, along shapes, one for the level the sample's
-        lines are (made again when they change: another level); `wait` (training) waits for one being made."""
-        p = self.goal['plan']
-        if p.get('places') != 'shapes':
-            if getattr(self, '_planner', None) is None:
-                self._planner = planner_.Planner(p['graph'])
-            return self._planner
-        lines = self.plan_lines(values)
-        key = json.dumps(lines)
-        if getattr(self, '_plan_level', None) == key:
-            return self._planner
-        # A level's planner is made away from the frame asking (a big level's takes a while, and a frame held up
-        # that long stopped play): this frame waits a moment for it, then goes without, until it's ready
-        # One at a time: a level being made is let finish, and the newest lines made after it
-        building = getattr(self, '_plan_building', None)
-        if building is not None and 'planner' in building[2]:
-            self._plan_level, self._planner, self._plan_building = building[0], building[2]['planner'], None
-            building = None
-            if self._plan_level == key:
-                return self._planner
-        if building is None:
-            done = {}
-
-            def build(lines=lines, done=done):
-                done['planner'] = planner_.level_planner(lines, p['graph']['moves'], p['cell'], p['snap'], p['tolerance'], p.get('solid'), p.get('physics'))
-
-            worker = threading.Thread(target=build, daemon=True)
-            worker.start()
-            building = self._plan_building = (key, worker, done)
-        if building[0] == key or wait:
-            building[1].join(None if wait else PLAN_WAIT_S)
-            if wait and building[0] != key:  # training: the one being made was another level's; this one's now
-                self._plan_level, self._planner, self._plan_building = building[0], building[2].get('planner'), None
-                return self.plan_planner(values, wait=True)
-            if 'planner' in building[2]:
-                self._plan_level, self._planner, self._plan_building = key, building[2]['planner'], None
-                return self._planner
-        raise Missing(f'{self.goal["name"]}: planning this level…')
+        """The planner for what was learned (one for the whole grid)."""
+        if getattr(self, '_planner', None) is None:
+            self._planner = planner_.Planner(self.goal['plan']['graph'])
+        return self._planner
 
     def plan_target(self, values, frames, position):
         """Where play aims planning from what the player has done (planner.py)."""
@@ -482,8 +383,7 @@ class Featurizer:
             raise Missing(f'{g["name"]}: its places and moves are learned when it trains')
         self.plan_planner(values)
         planner = self._planner
-        # along shapes a level's places are its own lines' (no level key); on a grid, the Level's value
-        level = None if g['plan'].get('places') == 'shapes' else self.plan_level(values)
+        level = self.plan_level(values)
         target, way = planner.target(level, position, self.plan_destination(values, frames),
                                      1000 * g['plan']['aheadS'], self.plan_away(values, planner))
         if target is None:
@@ -536,7 +436,7 @@ class Featurizer:
             planner = self.plan_planner(values, wait=True)
         except Missing:
             return no_hint(g)
-        level = None if g['plan'].get('places') == 'shapes' else self.plan_level(values)
+        level = self.plan_level(values)
         start, goal = planner.place_at(level, *position), planner.place_at(level, *target)
         way = planner.path(start, goal) if start is not None and goal is not None else None
         return planner.hint(way, g['hint']['buttons']) if way else no_hint(g)

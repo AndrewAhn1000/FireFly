@@ -12,6 +12,10 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 using firefly::Json;
 static constexpr ULONG_PTR marker = 0x46495245464C59;
 // Shared between the hooks' thread and the main loop
@@ -183,10 +187,88 @@ static bool emit(int vk, bool down) {
   }
   return SendInput(1, &input, sizeof(input)) == 1;
 }
+// A run of presses played on the guard's own clock, to the millisecond: a hop done as the player did it, from where
+// they stood still, every press and let-go at its time. Pressed once a frame (every 30-60 ms), a press was up to half
+// a frame off its time, a few px at walking speed, and a jump with a few px of room missed. Its thread waits on a
+// high-resolution timer to about a millisecond before each press and then spins to it.
+struct Playback {
+  struct Press {
+    double at; // ms from the start
+    int vk;
+    bool down;
+  };
+  std::thread thread;
+  HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::atomic<bool> running = false;
+  std::atomic<double> lateMs = 0; // the latest any press went, for `apply`'s reply
+  double started = 0;
+  void stop() {
+    if (thread.joinable()) {
+      SetEvent(cancel);
+      thread.join();
+    }
+    ResetEvent(cancel);
+    running = false;
+  }
+  ~Playback() {
+    stop();
+    CloseHandle(cancel);
+  }
+};
+static std::mutex keysLock; // the guard's held keys, between the main loop and a playback's thread
 struct Guard {
   std::set<int> held;
+  Playback playback;
+  // Presses played from now, on the playback's thread (any playing before stops first)
+  void play(std::vector<Playback::Press> presses) {
+    playback.stop();
+    playback.started = firefly::monotonicMs();
+    playback.lateMs = 0;
+    playback.running = true;
+    playback.thread = std::thread([this, presses = std::move(presses)] {
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+      HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+      if (!timer) // before Windows 10 1803: a timer of the system's own tick, the spin making up the rest
+        timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+      const double start = playback.started;
+      const auto cancelled = [&] { return WaitForSingleObject(playback.cancel, 0) == WAIT_OBJECT_0; };
+      for (const auto &p : presses) {
+        const double due = start + p.at;
+        const double wait = due - firefly::monotonicMs();
+        if (wait > 1.5 && timer) {
+          LARGE_INTEGER when;
+          when.QuadPart = -static_cast<LONGLONG>((wait - 1.0) * 10000); // relative, in 100 ns
+          SetWaitableTimer(timer, &when, 0, nullptr, nullptr, FALSE);
+          HANDLE both[] = {playback.cancel, timer};
+          if (WaitForMultipleObjects(2, both, FALSE, INFINITE) == WAIT_OBJECT_0)
+            break;
+        }
+        bool stopped = false;
+        while (firefly::monotonicMs() < due)
+          if ((stopped = cancelled()))
+            break;
+          else
+            YieldProcessor();
+        std::lock_guard lock(keysLock);
+        if (stopped || cancelled())
+          break;
+        if (p.down != held.contains(p.vk)) {
+          emit(p.vk, p.down);
+          if (p.down) held.insert(p.vk);
+          else held.erase(p.vk);
+        }
+        const double late = firefly::monotonicMs() - due;
+        if (late > playback.lateMs) playback.lateMs = late;
+      }
+      if (timer)
+        CloseHandle(timer);
+      playback.running = false;
+    });
+  }
   // Every key up, the guard still in charge: while the game is out of front for a moment
   void letGo() {
+    playback.stop();
+    std::lock_guard lock(keysLock);
     for (bool modifiers : {false, true})
       for (int vk : held)
         if ((vk >= VK_SHIFT && vk <= VK_MENU) == modifiers)
@@ -194,6 +276,8 @@ struct Guard {
     held.clear();
   }
   void release() {
+    playback.stop();
+    std::lock_guard lock(keysLock);
     // The other keys first, then Shift, Ctrl and Alt (16-18), so letting go makes no combination either
     for (bool modifiers : {false, true})
       for (int vk : held)
@@ -354,6 +438,7 @@ int main() {
         observation = request.at("observationSchema");
         configured = true;
         takeover = false;
+        response["actionSchema"] = schema["identity"]; // what `apply` must carry
       } else if (op == "apply") {
         if (!configured)
           throw std::runtime_error("Input guardian is not configured");
@@ -402,8 +487,9 @@ int main() {
         // A Ctrl or Alt the player holds would make shortcuts of the policy's keys. Windows reports the
         // guard's own presses as held too, and a policy can press Ctrl and Alt itself, so only those it
         // isn't holding count.
-        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000 && !guard.held.contains(VK_CONTROL)) ||
-            (GetAsyncKeyState(VK_MENU) & 0x8000 && !guard.held.contains(VK_MENU)) ||
+        const auto holds = [&](int vk) { std::lock_guard lock(keysLock); return guard.held.contains(vk); };
+        if ((GetAsyncKeyState(VK_CONTROL) & 0x8000 && !holds(VK_CONTROL)) ||
+            (GetAsyncKeyState(VK_MENU) & 0x8000 && !holds(VK_MENU)) ||
             GetAsyncKeyState(VK_LWIN) & 0x8000 ||
             GetAsyncKeyState(VK_RWIN) & 0x8000)
           throw std::runtime_error(
@@ -411,6 +497,34 @@ int main() {
         auto states = request.at("buttons");
         if (!states.is_array() || states.size() != schema["buttons"].size())
           throw std::runtime_error("Invalid action shape");
+        // Presses to play on the guard's own clock (see Playback), [[ms from now, button, down]], once the buttons
+        // are as `buttons` says: while they play, `apply` keeps the guard going but leaves the keys to them. An empty
+        // one stops what plays, and the buttons are as `buttons` says
+        std::vector<Playback::Press> presses;
+        if (request.contains("sequence")) {
+          const auto &sequence = request.at("sequence");
+          if (!sequence.is_array() || sequence.size() > 512)
+            throw std::runtime_error("Invalid key sequence");
+          double at = 0;
+          for (const auto &e : sequence) {
+            if (!e.is_array() || e.size() != 3 || !e[0].is_number() || !e[1].is_number_integer() || !e[2].is_boolean())
+              throw std::runtime_error("Invalid key sequence");
+            const int i = e[1].get<int>();
+            const double t = e[0].get<double>();
+            if (i < 0 || i >= static_cast<int>(schema["buttons"].size()) || !std::isfinite(t) || t < at || t > 10000)
+              throw std::runtime_error("Invalid key sequence: buttons in its order, times in order from 0 to 10 s");
+            at = t;
+            presses.push_back({t, schema["buttons"][i]["vk"].get<int>(), e[2].get<bool>()});
+          }
+        } else if (guard.playback.running) {
+          last = firefly::monotonicMs();
+          active = true;
+          response["playing"] = true;
+          response["lateMs"] = guard.playback.lateMs.load();
+          reply(response);
+          continue;
+        }
+        guard.playback.stop(); // one that ended (or before a new one): its thread is done with the keys
         std::set<int> desired;
         for (size_t i = 0; i < states.size(); ++i) {
           if (!states[i].is_boolean())
@@ -419,6 +533,7 @@ int main() {
             desired.insert(schema["buttons"][i]["vk"].get<int>());
         }
         desired = firefly::withoutShortcuts(std::move(desired));
+        std::unique_lock keys(keysLock);
         // Shift, Ctrl and Alt go down before the other keys and up after them, as a player presses
         // them, so a game sees a combination rather than the key alone
         const auto modifier = [](int vk) { return vk >= VK_SHIFT && vk <= VK_MENU; };
@@ -438,9 +553,17 @@ int main() {
                 throw std::runtime_error(
                     "Application does not accept synthetic input");
             }
+        keys.unlock();
         last = firefly::monotonicMs();
         active = true;
         response["held"] = desired.size();
+        if (!presses.empty()) {
+          char note[96];
+          snprintf(note, sizeof(note), "the guard began playing %zu presses over %.0f ms", presses.size(), presses.back().at);
+          see({firefly::monotonicMs(), Seen::Note, 0, false, 0, false, note});
+          guard.play(std::move(presses));
+          response["playing"] = true;
+        }
       } else if (op == "idle") {
         // How long since the player last used the keyboard or mouse, and whether they still hold
         // any of the configured buttons; changes nothing

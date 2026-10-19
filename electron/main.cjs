@@ -61,20 +61,12 @@ function logCrash(message) {
 let playLogged = { playing: false, correcting: false };
 function logPlay(status) {
   let line = null;
-  // Driving: each hop missed, with where from and to and why, so a hop that keeps failing can be found
-  const missed = status.driving?.missed ?? 0;
-  if (status.playing && status.drive && missed > (playLogged.missed ?? 0)) {
-    const last = status.driving.misses?.at(-1);
-    if (last) appendPlayLog(`Missed a hop from (${last.from.join(', ')}) to (${last.to.join(', ')}): ${last.why} (${missed} missed, ${status.driving.done ?? 0} done)`);
-  }
-  if (status.playing && !playLogged.playing) line = status.drive ? `Driving with ${status.name ?? 'the planner'}${status.trace ? `, keeping what it does in ${status.trace}` : ''}`
+  if (status.playing && !playLogged.playing) line = status.behavior ? `Running the tree ${status.name ?? ''}${status.trace ? `, keeping what each node did in ${status.trace}` : ''}`
     : status.trace ? `Playing, keeping what it sees in ${status.trace}` : 'Playing';
   else if (status.playing && !!status.correcting !== playLogged.correcting)
     line = status.correcting ? 'Correction began' : `Correction ended (${status.corrected ?? 0} so far)`;
   else if (!status.playing && playLogged.playing) line = `Stopped: ${status.reason ?? 'no reason given'}`;
-  else if (!status.playing && playLogged.playing && playLogged.driving) line = `Stopped driving: ${status.reason ?? 'no reason given'} (${playLogged.done ?? 0} hops done, ${playLogged.missed ?? 0} missed)`;
-  playLogged = { playing: !!status.playing, correcting: !!status.correcting, driving: !!status.drive,
-    missed: status.playing ? missed : 0, done: status.playing ? status.driving?.done ?? 0 : 0 };
+  playLogged = { playing: !!status.playing, correcting: !!status.correcting };
   if (line) appendPlayLog(line);
 }
 function appendPlayLog(line) {

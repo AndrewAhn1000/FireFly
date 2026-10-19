@@ -10,9 +10,9 @@
 // none of its buttons held), and then the policy carries on. Training on the policy's recordings and its
 // corrections teaches it what to do where it went wrong.
 //
-// Driving: with `drive` (a Planner node's request) instead of a policy, the planner moves the player itself
-// (worker/executor.py: drive.load, then drive.step each frame), behind the same guard; the player taking over
-// stops it.
+// A behaviour tree: with `behavior` (from the Graphs view: worker/behavior.py, behavior.load and behavior.step)
+// instead of a policy, the tree presses the keys, behind the same guard; the player taking over stops it. Each frame's
+// node statuses go with the status, for the editor to light up.
 //
 // The runtime, guard and worker are passed in (each `(op, params) => Promise`), so this can be tested
 // without them; `send(channel, value)` tells the app.
@@ -31,13 +31,13 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       ? { playing: true, waiting: !play.engaged, correcting: !!play.correcting, corrected: play.corrected,
           modelId: play.modelId, actions: play.actions, released: play.released, missed: play.missed ?? null, holding: play.holding ?? [], pressed: play.counts ?? {}, keyboardFocus: play.keyboardFocus ?? null, started: play.started, latency: play.latency ?? null, top: play.top ?? null, heading: play.heading ?? null,
           trace: play.trace ?? null, taps: Object.keys(play.taps ?? {}),
-          ...(play.drive ? { drive: true, name: play.policyName, driverId: play.driverId ?? null, driving: play.driving ?? null } : {}) }
+          ...(play.behavior ? { behavior: true, name: play.policyName, treeId: play.treeId ?? null, tree: play.tree ?? null } : {}) }
       : { playing: false, reason: reason ?? null, ...stopped });
   }
 
-  async function start({ modelId, windowId, corrections = false, trace = false, goal = null, drive = null, name = null, driverId = null }) {
+  async function start({ modelId, windowId, corrections = false, trace = false, goal = null, name = null, behavior = null, treeId = null }) {
     if (play) stop('Restarted');
-    if (drive) return startDriving({ windowId, drive, name, driverId });
+    if (behavior) return startTree({ windowId, behavior, name, treeId });
     const model = (await worker('models')).find(m => m.id === modelId);
     if (!model) throw new Error('That policy no longer exists');
     // What it presses is what it learned (a Policy node can choose some of the recorded buttons); a
@@ -72,20 +72,16 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     status();
   }
 
-  // The planner drives: what it learned (its moves and the keys of each hop) is loaded once, and the guard presses only
-  // the buttons it learned moves with
-  async function startDriving({ windowId, drive, name, driverId }) {
-    const loaded = await worker('drive.load', drive);
-    const recorded = loaded.actionSchema.buttons.map(({ id, vk }) => ({ id, vk }));
+  // A behaviour tree runs: checked and loaded once, the guard pressing only the keys its nodes press
+  async function startTree({ windowId, behavior, name, treeId }) {
+    const loaded = await worker('behavior.load', behavior);
     const buttons = loaded.buttons.map(({ id, vk }) => ({ id, vk }));
-    if (!buttons.length) throw new Error('None of the moves it learned presses a key');
-    // The guard checks each frame's action schema against the buttons it's configured with: these, not every one recorded
     const current = await runtime('session.schemas', { buttons });
     await guard('focus', { windowId: String(windowId) }).catch(() => {});
     await guard('configure', { windowId: String(windowId), buttons, observationSchema: current.observationSchema.identity });
-    play = { drive: true, modelId: null, windowId: String(windowId), observationSchema: current.observationSchema.identity, actionSchema: current.actionSchema.identity,
-      buttons, recorded, busy: false, engaged: false, actions: 0, released: 0, started: now(), corrections: false, correcting: null, corrected: 0,
-      trace: loaded.trace ?? null, taps: {}, tapping: new Map(), policyName: name ?? 'the planner', driverId, stepMs: 5, correctionHz: 15 };
+    play = { behavior: true, modelId: null, windowId: String(windowId), observationSchema: current.observationSchema.identity, actionSchema: current.actionSchema.identity,
+      buttons, recorded: buttons, busy: false, engaged: false, actions: 0, released: 0, started: now(), corrections: false, correcting: null, corrected: 0,
+      trace: loaded.trace ?? null, taps: {}, tapping: new Map(), policyName: name ?? 'the tree', treeId, stepMs: 5, correctionHz: 15, tree: null, treeSent: 0 };
     status();
   }
 
@@ -97,7 +93,7 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     if (current.correcting) endCorrection(current);
     stopGuard();
     if (current.trace) worker('trace.close').catch(() => {});
-    status(reason, current.drive ? { drive: true, name: current.policyName, driverId: current.driverId ?? null, driving: current.driving ?? null } : {});
+    status(reason, current.behavior ? { behavior: true, name: current.policyName, treeId: current.treeId ?? null, tree: current.tree ?? null } : {});
   }
 
   // The guard stopped by itself and let go of everything: the player taking over, focus lost, or its watchdog
@@ -175,22 +171,20 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       status();
     }
     const observations = [...(result.observations ?? []), ...(result.tracked ?? [])];
-    let buttons, predicted = true;
+    let buttons, predicted = true, sequence = null, ended = null;
     const asked = now();
     current.predicting = asked;
-    if (current.drive) {
-      // When its keys will be pressed, after the frame's capture: its age now and how long a step takes, since where
-      // the player is then is reckoned from how fast they're going
+    if (current.behavior) {
       try {
-        const stepped = await worker('drive.step', { observations, timestamp: result.timestamp, ageMs: clock() - result.timestamp + current.stepMs + 2 });
+        const stepped = await worker('behavior.step', { observations, timestamp: result.timestamp, ageMs: clock() - result.timestamp + current.stepMs + 2 });
         current.stepMs = 0.8 * current.stepMs + 0.2 * (now() - asked);
         buttons = stepped.buttons;
-        predicted = stepped.status?.phase !== 'missing';
-        if (!predicted) current.missed = stepped.status?.text ?? null;
-        const was = current.driving;
-        current.driving = stepped.status ?? null;
-        if (!was || was.phase !== current.driving?.phase || was.done !== current.driving?.done || was.missed !== current.driving?.missed
-          || JSON.stringify(was.hop?.to) !== JSON.stringify(current.driving?.hop?.to)) status();
+        sequence = Array.isArray(stepped.sequence) ? stepped.sequence : null;
+        const was = JSON.stringify(current.tree);
+        current.tree = stepped.status ?? null;
+        ended = stepped.status?.done ?? null;
+        // the nodes lit in the editor: sent when they change, at most ten times a second
+        if (JSON.stringify(current.tree) !== was && now() - current.treeSent >= 100) { current.treeSent = now(); status(); }
       } catch (e) {
         buttons = current.buttons.map(() => false);
         predicted = false;
@@ -224,11 +218,12 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       heldBy: Array.isArray(took.heldBy) ? took.heldBy : null,
       slowestProbe: slowest ? { name: slowest[0], ms: slowest[1] } : null,
       arrivedAgeMs: arrived - result.timestamp, predictMs: now() - asked, askedAgeMs: clock() - result.timestamp, ageMs: null };
-    if (!current.drive) buttons = tapped(current, buttons, now());
+    if (!current.behavior) buttons = tapped(current, buttons, now());
     let applied;
     current.applying = now();
     try {
-      applied = await guard('apply', { buttons, timestamp: result.timestamp, actionSchema: current.actionSchema, observationSchema: current.observationSchema });
+      applied = await guard('apply', { buttons, timestamp: result.timestamp, actionSchema: current.actionSchema, observationSchema: current.observationSchema,
+        ...(sequence ? { sequence } : {}) });
       current.unconfiguredSince = null;
     } catch (e) {
       current.applying = null;
@@ -248,6 +243,8 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     if (typeof applied?.keyboardFocus === 'boolean' && applied.keyboardFocus !== current.keyboardFocus) { current.keyboardFocus = applied.keyboardFocus; status(); }
     current.latency = latency;
     if (predicted) current.actions++; else current.released++;
+    // The tree came to its end (its root not looping): it's done, and says how
+    if (ended && play === current) { stop(ended === 'success' ? 'The tree succeeded' : 'The tree failed'); return; }
     // What it's holding now, and how often it has pressed each button: a policy that decides to press
     // nothing looks the same as one whose presses the game ignores, unless it says which
     const held = current.buttons.filter((_, i) => buttons[i]).map(b => b.id);
