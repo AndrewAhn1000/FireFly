@@ -1,4 +1,5 @@
 import type { Edge, Node } from '@xyflow/react';
+import { compileMap, type CompiledMap, type MapDoc } from './mapModel';
 
 // The Policy Graph as data, and what it means for training: which recordings, formulas and values make a
 // Policy node's dataset. A node's output handle is `out` (a state or formula: its value) or `data` (a
@@ -49,31 +50,32 @@ export interface SpatialData {
 // `in:@position` (and, optionally, which way it faces, `in:@facing`) to a target, as columns <name>.forward (or
 // .dx), .dy and .dist. In training the target is where the player got to `lookAhead` seconds later (hindsight:
 // `targets` of them, evenly over the range, each a row, those under `minMove` px away left out), so the policy
-// learns how to get to a place from every move recorded; in play it's what's wired into `in:@target`: a position, or a
-// Planner. `route` is from before the Planner held it, and becomes one when the graph is read (migrateGraph)
+// learns how to get to a place from every move recorded; in play it's where `heads` says: what's wired into
+// `in:@target`, the way over a map (a Map graph, src/mapModel.ts), or along a recording's route
 export interface GoalData {
   kind: 'goal'; name: string; lookAhead: [number, number]; targets: number; minMove: number;
-  route?: { recording: string; aheadS: number } | null;
-  hint?: boolean; // the Planner's next move as values too: per button, whether it's next and how far until it is
+  heads?: GoalHeads;   // absent: what's wired into its Target
+  route?: { recording: string; aheadS: number } | null;  // from before Planners: migrateGraph makes it `heads`
+  hint?: boolean; // the plan's next move as values too: per button, whether it's next and how far until it is
   [key: string]: unknown;
 }
-// Where play heads, wired into a Goal's Target: in `route` mode, the point aheadS seconds on along where the player
-// went in a recording, from where the player is on it (so play's targets are like training's: where to get to next,
-// not somewhere far off). In `plan` mode (worker/planner.py), it learns places (cells of `cell` px) and the moves made
-// between them from recordings (a Recordings node wired into `in:@data`, else the policy's), and heads for its
-// destination along the quickest of them: a point clicked on its map, a position wired into `in:@destination`, or
-// where a recording ended. A Level observation wired into `in:@level` keeps each level's places apart. A Spatial
-// node wired into `in:@map` draws the level's shapes under its map
-export type PlannerMode = 'route' | 'plan';
-// A clicked point keeps the level it was clicked on (the Level's value then, when one is wired), so on another level
-// it isn't taken for a place there
-export type PlanDestination = { kind: 'point'; x?: number; y?: number; level?: string | null } | { kind: 'input' } | { kind: 'end'; recording: string };
-export interface PlannerData {
-  kind: 'planner'; name: string; mode: PlannerMode; route: { recording: string; aheadS: number };
-  plan?: { cell: number; aheadS: number; destination: PlanDestination;
-    avoid?: string[];  // its Map's inputs to keep away from, such as monsters
-    learn?: boolean }; // a move that doesn't happen in play costs more from then on (true unless false)
-  [key: string]: unknown;
+// Where play heads. `map`: over a Map graph's places and links (and what it learns on a grid), toward a place of it,
+// a position wired into `in:@destination`, or where a recording ended, aiming aheadS seconds along the quickest way
+// (worker/planner.py); `avoid`, inputs of a Spatial node wired into `in:@avoid` whose shapes the way keeps away from;
+// `learn`, a link that doesn't happen costs more for the rest of the run. `route`: the point aheadS seconds on along
+// where the player went in a recording, from where the player is on it. Either way play's targets are like training's:
+// where to get to next, not somewhere far off
+export type MapDestination = { kind: 'place'; place: string } | { kind: 'input' } | { kind: 'end'; recording: string };
+export type GoalHeads = { kind: 'target' }
+  | { kind: 'map'; map: string; destination: MapDestination; aheadS: number; avoid?: string[]; learn?: boolean }
+  | { kind: 'route'; recording: string; aheadS: number };
+// A map as a Goal reads it: its saved document and name in the graph library, null when it's gone
+export type MapLookup = (id: string) => { doc: MapDoc; name: string } | null;
+// The Planner node from before maps (graphs are migrated: migrateGraph)
+interface LegacyPlanner {
+  kind: 'planner'; name: string; mode: 'route' | 'plan'; route: { recording: string; aheadS: number };
+  plan?: { cell: number; aheadS: number; destination: { kind: 'point'; x?: number; y?: number; level?: string | null } | { kind: 'input' } | { kind: 'end'; recording: string };
+    avoid?: string[]; learn?: boolean };
 }
 
 export interface PolicyData {
@@ -84,7 +86,7 @@ export interface PolicyData {
   correctionShare?: number; // how much of training its corrections make up (DEFAULT_CORRECTION_SHARE unless chosen)
   [key: string]: unknown;
 }
-export type GraphData = StateData | FormulaData | RecordingsData | PolicyData | GridData | SpatialData | GoalData | PlannerData;
+export type GraphData = StateData | FormulaData | RecordingsData | PolicyData | GridData | SpatialData | GoalData;
 export type GraphNode = Node<GraphData>;
 export interface GraphDoc { version: 1; nodes: GraphNode[]; edges: Edge[]; }
 
@@ -100,9 +102,9 @@ export interface SpatialSpec {
   radii: number[]; maxDistance: number; fields?: SpatialField[];
 }
 export interface PlanSpec {
-  cell: number; aheadS: number; level?: string; recordings?: string[];
+  map: CompiledMap & { id: string; name: string }; aheadS: number;
   avoid?: { alias: string; shapes: string[]; read?: SpatialRead }[]; learn?: false;
-  destination: { kind: 'point'; x: number; y: number; level?: string } | { kind: 'input'; name: string } | { kind: 'end'; recording: string };
+  destination: { kind: 'place'; place: string } | { kind: 'input'; name: string } | { kind: 'end'; recording: string };
 }
 export interface GoalSpec {
   name: string; position: string; facing?: string; target?: string; route?: { recording: string; aheadS: number }; plan?: PlanSpec;
@@ -121,11 +123,9 @@ export const GRID_CELL = 40; // px, a centred grid's cell unless it says otherwi
 export const SPATIAL_RADII = [100, 250, 500], SPATIAL_REACH = 1000; // px, a Spatial node's unless it says otherwise
 export const SPATIAL_POINT = 'in:@point', SPATIAL_FACING = 'in:@facing', SPATIAL_BOUNDS = 'in:@bounds'; // an alias has no @, so these are never one
 export const GOAL_POSITION = 'in:@position', GOAL_FACING = 'in:@facing', GOAL_TARGET = 'in:@target';
+export const GOAL_DESTINATION = 'in:@destination', GOAL_AVOID = 'in:@avoid';  // heading over a map
 export const GOAL_DEFAULTS = { lookAhead: [1, 4] as [number, number], targets: 3, minMove: 20 };
-export const PLANNER_MAP = 'in:@map', PLANNER_LEVEL = 'in:@level', PLANNER_DESTINATION = 'in:@destination', PLANNER_DATA = 'in:@data';
-export const PLAN_CELL = 40; // px, a place's side unless the node says otherwise
-export const planDefaults = (): NonNullable<PlannerData['plan']> => ({ cell: PLAN_CELL, aheadS: 2.5, destination: { kind: 'point' } });
-export const ROUTE_AHEAD_S = 2.5; // the middle of the default look-ahead
+export const ROUTE_AHEAD_S = 2.5; // the middle of the default look-ahead: how far along a map or route play aims
 // Whether a Spatial node's input takes several wires: its shapes inputs do, its point, facing and bounds don't
 export const takesMany = (node: GraphNode | undefined, handle: string | null | undefined) =>
   node?.data.kind === 'spatial' && !!handle && handle.startsWith('in:') && !handle.startsWith('in:@') && handle !== 'in:+';
@@ -152,7 +152,7 @@ export function columnsOf(name: string, type: string | undefined): string[] | nu
 export function nameOf(node: GraphNode | undefined): string | null {
   if (!node) return null;
   if (node.data.kind === 'state') return node.data.name;
-  if (node.data.kind === 'formula' || node.data.kind === 'grid' || node.data.kind === 'spatial' || node.data.kind === 'goal' || node.data.kind === 'planner')
+  if (node.data.kind === 'formula' || node.data.kind === 'grid' || node.data.kind === 'spatial' || node.data.kind === 'goal')
     return node.data.name.trim() || null;
   return null;
 }
@@ -232,64 +232,67 @@ export function spatialColumns(name: string, aliases: string[], fields: SpatialF
   return aliases.flatMap(alias => fields.filter(f => fieldApplies(f, alias)).map(f => `${name.trim()}.${alias}.${f.name}`));
 }
 
-// The Planner wired into a Goal's Target, if one is
-export function plannerOf(doc: GraphDoc, goal: GraphNode): (GraphNode & { data: PlannerData }) | null {
-  const source = byId(doc).get(into(doc, goal.id, GOAL_TARGET)[0]?.source ?? '');
-  return source?.data.kind === 'planner' ? source as GraphNode & { data: PlannerData } : null;
-}
+// Where a Goal heads in play (its Target unless it says)
+export const headsOf = (d: GoalData): GoalHeads => d.heads ?? { kind: 'target' };
 
-// A Planner's plan as the worker takes it, or null while something it needs isn't there (see planProblem)
-export function planSpec(doc: GraphDoc, planner: GraphNode & { data: PlannerData }): PlanSpec | null {
-  if (planner.data.mode !== 'plan') return null;
-  const nodes = byId(doc), p = planner.data.plan ?? planDefaults();
-  const from = (handle: string) => nameOf(nodes.get(into(doc, planner.id, handle)[0]?.source ?? ''));
-  const data = nodes.get(into(doc, planner.id, PLANNER_DATA)[0]?.source ?? '');
-  const level = from(PLANNER_LEVEL), d = p.destination;
-  const destination = d.kind === 'point' ? (d.x != null && d.y != null ? { kind: 'point' as const, x: d.x, y: d.y, ...(d.level != null ? { level: d.level } : {}) } : null)
-    : d.kind === 'input' ? (from(PLANNER_DESTINATION) ? { kind: 'input' as const, name: from(PLANNER_DESTINATION)! } : null)
-    : d.recording ? { kind: 'end' as const, recording: d.recording } : null;
+// A Goal's plan over its map as the worker takes it, or null while something it needs isn't there (see goalProblem)
+export function goalPlan(doc: GraphDoc, node: GraphNode, maps?: MapLookup): PlanSpec | null {
+  const h = node.data.kind === 'goal' ? headsOf(node.data) : null;
+  if (h?.kind !== 'map') return null;
+  const found = h.map ? maps?.(h.map) : null;
+  if (!found) return null;
+  const d = h.destination, wired = nameOf(byId(doc).get(into(doc, node.id, GOAL_DESTINATION)[0]?.source ?? ''));
+  const destination = d.kind === 'place' ? (found.doc.places.some(p => p.id === d.place) ? d : null)
+    : d.kind === 'input' ? (wired ? { kind: 'input' as const, name: wired } : null) : d.recording ? d : null;
   if (!destination) return null;
-  const avoid = planShapes(doc, planner, p.avoid ?? []);
-  return { cell: p.cell, aheadS: p.aheadS, destination, ...(level ? { level } : {}),
-    ...(avoid?.length ? { avoid } : {}), ...(p.learn === false ? { learn: false as const } : {}),
-    ...(data?.data.kind === 'recordings' && data.data.ids.length ? { recordings: data.data.ids } : {}) };
+  const avoid = goalAvoid(doc, node, h.avoid ?? []);
+  return { map: { ...compileMap(found.doc), id: h.map, name: found.name }, aheadS: h.aheadS, destination,
+    ...(avoid?.length ? { avoid } : {}), ...(h.learn === false ? { learn: false as const } : {}) };
 }
 
-// Those of the Spatial inputs of a Planner's Map named, such as the ones to keep away from
-export function planShapes(doc: GraphDoc, planner: GraphNode & { data: PlannerData }, aliases: string[]): PlanSpec['avoid'] | null {
-  const map = byId(doc).get(into(doc, planner.id, PLANNER_MAP)[0]?.source ?? '');
-  const spec = map ? spatialSpec(doc, map) : null;
+// Those inputs of the Spatial node wired into a Goal's Keep away from that are named
+export function goalAvoid(doc: GraphDoc, node: GraphNode, aliases: string[]): PlanSpec['avoid'] | null {
+  const spatial = byId(doc).get(into(doc, node.id, GOAL_AVOID)[0]?.source ?? '');
+  const spec = spatial ? spatialSpec(doc, spatial) : null;
   if (!spec) return null;
   const on = new Set(aliases);
   return spec.sets.filter(s => on.has(s.alias)).map(s => ({ alias: s.alias, shapes: s.shapes, ...(s.read ? { read: s.read } : {}) }));
 }
 
-// What stops a Planner in plan mode, if anything
-export function planProblem(doc: GraphDoc, planner: GraphNode & { data: PlannerData }): string | null {
-  const p = planner.data.plan ?? planDefaults(), name = nameOf(planner) ?? 'Its planner';
-  const data = byId(doc).get(into(doc, planner.id, PLANNER_DATA)[0]?.source ?? '');
-  if (p.destination.kind === 'point' && (p.destination.x == null || p.destination.y == null)) return `${name}: click its map where play heads`;
-  if (p.destination.kind === 'input' && !into(doc, planner.id, PLANNER_DESTINATION).length) return `${name}: wire a position into its Destination`;
-  if (p.destination.kind === 'end' && !p.destination.recording) return `${name}: choose the recording whose end play heads for`;
-  if (data?.data.kind === 'recordings' && !data.data.ids.length) return `${name}: choose the recordings it learns from`;
+// What stops a Goal heading where it says in play, if anything
+export function goalProblem(doc: GraphDoc, node: GraphNode, maps?: MapLookup): string | null {
+  if (node.data.kind !== 'goal') return null;
+  const h = headsOf(node.data), name = node.data.name.trim() || 'Its goal';
+  if (h.kind === 'route') return h.recording ? null : `${name}: choose the recording whose route play follows`;
+  if (h.kind !== 'map') return null;
+  const found = h.map ? maps?.(h.map) : null;
+  if (!h.map) return `${name}: choose the map play goes over`;
+  if (!found) return `${name}: the map it goes over was deleted: choose another`;
+  if (!found.doc.position.trim()) return `${name}: ${found.name} doesn’t say where the player is yet: open it and set its Position`;
+  if (!found.doc.places.length && !found.doc.grid) return `${name}: ${found.name} has no places: add some, or have it learn a grid from your recordings`;
+  const d = h.destination;
+  if (d.kind === 'place' && !found.doc.places.some(p => p.id === d.place)) return `${name}: choose the place of ${found.name} play heads for`;
+  if (d.kind === 'input' && !into(doc, node.id, GOAL_DESTINATION).length) return `${name}: wire a position into its Destination`;
+  if (d.kind === 'end' && !d.recording) return `${name}: choose the recording whose end play heads for`;
   return null;
 }
 
-// A Goal node as the worker takes it, once a position is wired into it: its target a position, or a Planner's route
-export function goalSpec(doc: GraphDoc, node: GraphNode): GoalSpec | null {
+// A Goal node as the worker takes it, once a position is wired into it: its target a position, a map's way or a
+// recording's route
+export function goalSpec(doc: GraphDoc, node: GraphNode, maps?: MapLookup): GoalSpec | null {
   if (node.data.kind !== 'goal') return null;
   const nodes = byId(doc), from = (handle: string) => nameOf(nodes.get(into(doc, node.id, handle)[0]?.source ?? ''));
-  const position = from(GOAL_POSITION), facing = from(GOAL_FACING), planner = plannerOf(doc, node), d = node.data;
-  const target = planner ? null : from(GOAL_TARGET);
-  const route = planner?.data.mode === 'route' && planner.data.route.recording ? planner.data.route : null;
-  const plan = planner ? planSpec(doc, planner) : null;
+  const position = from(GOAL_POSITION), facing = from(GOAL_FACING), d = node.data, h = headsOf(d);
+  const target = h.kind === 'target' ? from(GOAL_TARGET) : null;
+  const route = h.kind === 'route' && h.recording ? { recording: h.recording, aheadS: h.aheadS } : null;
+  const plan = goalPlan(doc, node, maps);
   return position ? { name: d.name.trim(), position, ...(facing ? { facing } : {}),
     ...(route ? { route } : plan ? { plan } : target ? { target } : {}), ...(d.hint && plan ? { hint: true as const } : {}),
     lookAhead: d.lookAhead, targets: d.targets, minMove: d.minMove } : null;
 }
 
-export function goalSpecs(doc: GraphDoc): GoalSpec[] {
-  return doc.nodes.map(n => goalSpec(doc, n)).filter((s): s is GoalSpec => !!s && !!s.name);
+export function goalSpecs(doc: GraphDoc, maps?: MapLookup): GoalSpec[] {
+  return doc.nodes.map(n => goalSpec(doc, n, maps)).filter((s): s is GoalSpec => !!s && !!s.name);
 }
 
 // Its columns, as worker/observations.py names them (goal_names): forward with facing, else dx; dy; how far
@@ -314,10 +317,9 @@ export function upstream(doc: GraphDoc, ids: string[]): Set<string> {
       for (const e of into(doc, id, 'in:center')) stack.push(e.source);
     if (node?.data.kind === 'spatial')  // its point and facing, such as formulas
       for (const e of [...into(doc, id, SPATIAL_POINT), ...into(doc, id, SPATIAL_FACING)]) stack.push(e.source);
-    if (node?.data.kind === 'goal')  // its position, facing and target, such as formulas
-      for (const e of [...into(doc, id, GOAL_POSITION), ...into(doc, id, GOAL_FACING), ...into(doc, id, GOAL_TARGET)]) stack.push(e.source);
-    if (node?.data.kind === 'planner')  // the Spatial node it plans over, its destination and level, such as formulas
-      for (const e of [...into(doc, id, PLANNER_MAP), ...into(doc, id, PLANNER_DESTINATION), ...into(doc, id, PLANNER_LEVEL)]) stack.push(e.source);
+    if (node?.data.kind === 'goal')  // its position, facing, target and destination, such as formulas
+      for (const e of [...into(doc, id, GOAL_POSITION), ...into(doc, id, GOAL_FACING), ...into(doc, id, GOAL_TARGET), ...into(doc, id, GOAL_DESTINATION)])
+        stack.push(e.source);
   }
   return seen;
 }
@@ -336,7 +338,8 @@ export function makesCycle(doc: GraphDoc, source: string, target: string): boole
 // it can train only on what all of them hold. `label` names an observation as the user knows it: the State reading
 // it (“hp %” for bar level), for the problems
 export function compilePolicy(doc: GraphDoc, policyId: string, fields: Map<string, string>,
-    checks: Map<string, FormulaCheck>, holds: Map<string, Set<string>> = new Map(), label: (name: string) => string = n => n): Compiled {
+    checks: Map<string, FormulaCheck>, holds: Map<string, Set<string>> = new Map(), label: (name: string) => string = n => n,
+    maps?: MapLookup): Compiled {
   const L = (name: string | undefined) => name ? label(name) : '';
   const nodes = byId(doc), policy = nodes.get(policyId);
   const problems: string[] = [], values: PolicyValue[] = [];
@@ -387,16 +390,12 @@ export function compilePolicy(doc: GraphDoc, policyId: string, fields: Map<strin
       continue;
     }
     if (node.data.kind === 'goal') {
-      const spec = goalSpec(doc, node), typeOf = (n: string) => fields.get(n) ?? checks.get(n)?.type;
+      const spec = goalSpec(doc, node, maps), typeOf = (n: string) => fields.get(n) ?? checks.get(n)?.type;
       if (goal) problems.push(`A policy has one goal: ${goal.name} and ${name} are both wired into it`);
       else if (!spec) problems.push(`Wire a position, such as the player’s, into ${name}'s Position`);
-      else if (plannerOf(doc, node)?.data.mode === 'route' && !plannerOf(doc, node)!.data.route.recording)
-        problems.push(`${nameOf(plannerOf(doc, node)!) ?? 'Its planner'}: choose the recording whose route play follows`);
-      else if (plannerOf(doc, node)?.data.mode === 'plan' && planProblem(doc, plannerOf(doc, node)!))
-        problems.push(planProblem(doc, plannerOf(doc, node)!)!);
+      else if (goalProblem(doc, node, maps)) problems.push(goalProblem(doc, node, maps)!);
       else if (spec.plan?.destination.kind === 'input' && typeOf(spec.plan.destination.name) !== 'vector')
-        problems.push(`${nameOf(plannerOf(doc, node)!) ?? 'Its planner'}: its destination, ${L(spec.plan.destination.name)}, isn’t a position (a vector)`);
-      else if (spec.plan?.level && recorded && fields.has(spec.plan.level) && !recorded.has(spec.plan.level)) problems.push(notRecorded(L(spec.plan.level)));
+        problems.push(`${name}: its destination, ${L(spec.plan.destination.name)}, isn’t a position (a vector)`);
       else if (spec.route && holds.size && !holds.has(spec.route.recording)) problems.push(`${name}: the recording whose route play follows was deleted: choose another`);
       else if (typeOf(spec.position) !== 'vector') problems.push(`${name}: its position, ${L(spec.position)}, isn’t a position (a vector)`);
       else if (spec.facing && typeOf(spec.facing) !== 'boolean') problems.push(`${name}: its facing, ${L(spec.facing)}, isn’t true or false`);
@@ -462,57 +461,89 @@ export function compilePolicy(doc: GraphDoc, policyId: string, fields: Map<strin
 }
 
 // Where play heads for a Policy node's versions, from the graph as it is now: the target, route or plan of the Goal
-// wired into it (play sends it with the version it plays, which uses it in place of what it trained with), or null
-// A Goal whose Planner can't plan gives the reason ({error}): played without it, a version went where it trained to
-// (the route of another level), as if the destination had been ignored
-export function playGoal(doc: GraphDoc, policyId: string): Pick<GoalSpec, 'target' | 'route' | 'plan'> | { error: string } | null {
+// wired into it (play sends it with the version it plays, which uses it in place of what it trained with), or null.
+// A Goal that can't head where it says gives the reason ({error}): played without it, a version went where it
+// trained to (the route of another level), as if the destination had been ignored
+export function playGoal(doc: GraphDoc, policyId: string, maps?: MapLookup): Pick<GoalSpec, 'target' | 'route' | 'plan'> | { error: string } | null {
   const nodes = byId(doc);
   for (const e of into(doc, policyId, 'values')) {
     const node = nodes.get(e.source);
     if (node?.data.kind !== 'goal') continue;
-    const spec = goalSpec(doc, node), planner = plannerOf(doc, node);
-    if (planner && !spec?.route && !spec?.plan) {
-      const name = nameOf(planner) ?? 'Its planner';
-      return { error: planner.data.mode === 'plan' ? planProblem(doc, planner) ?? `${name} can’t plan yet`
-        : `${name}: choose the recording whose route play follows` };
-    }
+    const problem = goalProblem(doc, node, maps);
+    if (problem) return { error: problem };
+    const spec = goalSpec(doc, node, maps);
     if (!spec) return null;
-    const { target, route } = spec;
-    // learning from the recordings its preview does (its own, else this Policy's Recordings node's, not the version's
-    // corrections too), so what the preview learned is what Play uses
-    const data = nodes.get(into(doc, policyId, 'data')[0]?.source ?? '');
-    const plan = spec.plan && !spec.plan.recordings && data?.data.kind === 'recordings' && data.data.ids.length
-      ? { ...spec.plan, recordings: data.data.ids } : spec.plan;
+    const { target, route, plan } = spec;
     return target || route || plan ? { ...(target ? { target } : {}), ...(route ? { route } : {}), ...(plan ? { plan } : {}) } : null;
   }
   return null;
 }
 
-// A graph from before the Planner: a Goal that followed a recording's route (`route`) now has a Planner node in
-// route mode doing it, wired into its Target in place of anything there (the route took its place then too), placed
-// to its left. Graphs without one come back as they are
-export function migrateGraph(doc: GraphDoc, newId: () => string = () => crypto.randomUUID()): GraphDoc {
-  const routed = doc.nodes.filter(n => n.data.kind === 'goal' && (n.data as GoalData).route);
-  if (!routed.length) return doc;
-  const nodes: GraphNode[] = [], edges = [...doc.edges];
-  for (const node of doc.nodes) {
-    if (!routed.includes(node)) { nodes.push(node); continue; }
-    const { route, ...rest } = node.data as GoalData;
-    const planner: GraphNode = { id: newId(), type: 'planner', position: { x: node.position.x - 300, y: node.position.y + 140 },
-      data: { kind: 'planner', name: 'planner', mode: 'route', route: { recording: route!.recording ?? '', aheadS: route!.aheadS ?? ROUTE_AHEAD_S } } };
-    nodes.push({ ...node, data: rest as GoalData }, planner);
-    for (let i = edges.length - 1; i >= 0; i--)
-      if (edges[i].target === node.id && edges[i].targetHandle === GOAL_TARGET) edges.splice(i, 1);
-    edges.push({ id: newId(), source: planner.id, sourceHandle: 'out', target: node.id, targetHandle: GOAL_TARGET });
+// What migrateGraph hands a Planner from before maps that planned on a grid, for the graph library to make a Map graph
+// of (the places a Goal's plan goes over): the formulas for where the player is and on which level, the grid it
+// learned (its place size and recordings), and the point it headed for, if one was clicked
+export interface PlannerMap { name: string; position: string; level: string; cell: number; recordings: string[] | null; point: { x: number; y: number; level: string | null } | null; }
+// What a node's value is as a map's formula (over observations, not the policy graph): a State's name, or a formula's
+// own source with its inputs' names in place of their aliases
+function formulaText(doc: GraphDoc, id: string | undefined): string {
+  const node = id ? byId(doc).get(id) : undefined;
+  if (!node) return '';
+  if (node.data.kind === 'state') return quoted(node.data.name);
+  if (node.data.kind !== 'formula') return '';
+  let text = node.data.source;
+  for (const alias of node.data.inputs) {
+    const wired = formulaText(doc, into(doc, node.id, `in:${alias}`)[0]?.source);
+    if (wired) text = text.replace(new RegExp(`(?<![\\w.\`])${alias}(?![\\w\`])`, 'g'), `(${wired})`);  // an alias is a plain name
   }
+  return text;
+}
+const quoted = (name: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ? name : '`' + name.replace(/`/g, '') + '`';
+
+// A graph from before maps. A Goal that followed a recording's route (`route`, from before Planners) heads along it.
+// A Planner wired into a Goal's Target becomes how the Goal heads: following a recording, or, planning on a grid, over
+// a Map graph `makeMap` makes of it ({map id, place id of a clicked point}), its destination and the Spatial node it
+// kept away from rewired into the Goal; without `makeMap` (a pasted graph) the Goal is left to choose a map. The
+// Planner goes. Graphs without these come back as they are
+export function migrateGraph(doc: GraphDoc, newId: () => string = () => crypto.randomUUID(),
+    makeMap?: (planner: PlannerMap) => { map: string; place: string | null }): GraphDoc {
+  const planners = doc.nodes.filter(n => (n.data as { kind: string }).kind === 'planner');
+  const routed = doc.nodes.filter(n => n.data.kind === 'goal' && (n.data as GoalData).route);
+  if (!planners.length && !routed.length) return doc;
+  let edges = [...doc.edges];
+  const nodes = doc.nodes.filter(n => !planners.includes(n)).map(node => {
+    if (node.data.kind !== 'goal') return node;
+    const { route, ...rest } = node.data as GoalData;
+    let data: GoalData = route ? { ...rest, heads: { kind: 'route' as const, recording: route.recording ?? '', aheadS: route.aheadS ?? ROUTE_AHEAD_S } } : node.data;
+    const planner = planners.find(p => into(doc, node.id, GOAL_TARGET).some(e => e.source === p.id));
+    if (!planner) return { ...node, data };
+    const p = planner.data as unknown as LegacyPlanner;
+    edges = edges.filter(e => !(e.target === node.id && e.targetHandle === GOAL_TARGET));
+    if (p.mode === 'route') return { ...node, data: { ...data, heads: { kind: 'route' as const, recording: p.route.recording, aheadS: p.route.aheadS } } };
+    const plan = p.plan ?? { cell: 40, aheadS: ROUTE_AHEAD_S, destination: { kind: 'point' } };
+    // its Data (else the policy's Recordings node), its level, and its destination and map, rewired into the Goal
+    const policy = doc.edges.find(e => e.source === node.id && e.targetHandle === 'values')?.target;
+    const data_ = byId(doc).get(into(doc, planner.id, 'in:@data')[0]?.source ?? '') ?? byId(doc).get(into(doc, policy ?? '', 'data')[0]?.source ?? '');
+    const d = plan.destination;
+    const made = makeMap?.({ name: `${p.name || node.data.name || 'Planner'} map`,
+      position: formulaText(doc, into(doc, node.id, GOAL_POSITION)[0]?.source), level: formulaText(doc, into(doc, planner.id, 'in:@level')[0]?.source),
+      cell: plan.cell, recordings: data_?.data.kind === 'recordings' && data_.data.ids.length ? data_.data.ids : null,
+      point: d.kind === 'point' && d.x != null && d.y != null ? { x: d.x, y: d.y, level: d.level ?? null } : null });
+    const destination: MapDestination = d.kind === 'end' ? { kind: 'end', recording: d.recording } : d.kind === 'input' ? { kind: 'input' } : { kind: 'place', place: made?.place ?? '' };
+    for (const [from, to] of [['in:@destination', GOAL_DESTINATION], ['in:@map', GOAL_AVOID]])
+      for (const e of into(doc, planner.id, from)) edges.push({ ...e, id: newId(), target: node.id, targetHandle: to });
+    data = { ...data, heads: { kind: 'map', map: made?.map ?? '', destination, aheadS: plan.aheadS,
+      ...(plan.avoid?.length ? { avoid: plan.avoid } : {}), ...(plan.learn === false ? { learn: false } : {}) } };
+    return { ...node, data };
+  });
+  edges = edges.filter(e => !planners.some(p => e.source === p.id || e.target === p.id));
   return { ...doc, nodes, edges };
 }
 
 // Reading a saved graph: anything malformed falls back to an empty one
-export function readGraph(text: string | null): GraphDoc {
+export function readGraph(text: string | null, makeMap?: (planner: PlannerMap) => { map: string; place: string | null }): GraphDoc {
   try {
     const doc = JSON.parse(text ?? 'null') as GraphDoc | null;
-    if (doc?.version === 1 && Array.isArray(doc.nodes) && Array.isArray(doc.edges)) return migrateGraph(doc);
+    if (doc?.version === 1 && Array.isArray(doc.nodes) && Array.isArray(doc.edges)) return migrateGraph(doc, undefined, makeMap);
   } catch { /* fall through */ }
   return emptyGraph();
 }

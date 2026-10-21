@@ -17,6 +17,7 @@ sample that many steps earlier, is Missing: the sample is skipped, unless the fo
 `a ?? b` (b where a is missing) or asks with found(a).
 """
 import math
+import re
 
 from shapes import count_within, finite, lines_of, nearest, surface
 
@@ -304,6 +305,15 @@ def _fits(have, want):
 
 def _numeric(t):
     return t in ('number', 'boolean')
+
+
+def bare_name(source):
+    """The name a formula is when it's only one, such as `Map Id` (in backticks) or hp, else None: a State read as it
+    is, of any type (a formula's result has to be a number, true/false or a vector)."""
+    text = (source or '').strip()
+    if len(text) > 2 and text[0] == '`' and text[-1] == '`' and '`' not in text[1:-1]:
+        return text[1:-1]
+    return text if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', text) and text not in ('true', 'false', 'and', 'or', 'not') else None
 
 
 class FormulaSet:

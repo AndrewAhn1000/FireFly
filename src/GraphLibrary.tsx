@@ -5,8 +5,9 @@ import BehaviorTree from './BehaviorTree';
 import MapGraph from './MapGraph';
 import { emptyTree } from './behaviorModel';
 import { emptyMap } from './mapModel';
-import { emptyGraph } from './graphModel';
+import { emptyGraph, readGraph } from './graphModel';
 import { emptyCollection, type CaptureRegion, type CollectionStatus } from './collectionModel';
+import type { PlayStatus } from './policyPlay';
 
 type Kind = 'folder' | 'policy' | 'collection' | 'behavior' | 'map';
 const KIND_NAMES: Record<Exclude<Kind, 'folder'>, string> = { policy: 'Policy', collection: 'Data Collection', behavior: 'Behavior tree', map: 'Map' };
@@ -21,12 +22,37 @@ function newPolicy(name?: string) {
   return { ...doc, nodes: doc.nodes.map(n => ({ ...n, id: ids.get(n.id)!, data: n.data.kind === 'policy' && name ? { ...n.data, name } : n.data })),
     edges: doc.edges.map(e => ({ ...e, source: ids.get(e.source)!, target: ids.get(e.target)! })) };
 }
+// Policy graphs from before maps: a Planner that planned on a grid becomes a Map graph beside its policy graph (the
+// grid it learned, where the player is and on which level, and the point it headed for as a place), and the Goal it
+// fed heads over that map (graphModel's migrateGraph)
+function migratePlanners(scope: string, library: Library): Library {
+  let entries = library.entries;
+  for (const entry of library.entries.filter(e => e.kind === 'policy')) {
+    const key = documentKey(scope, entry.id), text = localStorage.getItem(key);
+    if (!text || !text.includes('"planner"')) continue;
+    const made: Entry[] = [];
+    const doc = readGraph(text, planner => {
+      const id = crypto.randomUUID();
+      const point = planner.point ? { id: crypto.randomUUID(), name: 'Destination', level: planner.point.level, x: Math.round(planner.point.x), y: Math.round(planner.point.y) } : null;
+      localStorage.setItem(documentKey(scope, id), JSON.stringify({ ...emptyMap(), position: planner.position, level: planner.level,
+        grid: { cell: planner.cell, recordings: planner.recordings }, places: point ? [point] : [] }));
+      made.push({ id, parent: entry.parent, name: planner.name, kind: 'map' });
+      return { map: id, place: point?.id ?? null };
+    });
+    localStorage.setItem(key, JSON.stringify(doc));
+    entries = [...entries, ...made];
+  }
+  return entries === library.entries ? library : { ...library, entries };
+}
+
 function readLibrary(scope: string): Library {
   const saved = localStorage.getItem(scope + '-library');
   if (saved) {
     const doc = JSON.parse(saved);
     if (doc.version !== 1 || !Array.isArray(doc.entries)) throw Error('Unsupported graph library');
-    return doc;
+    const migrated = migratePlanners(scope, doc);
+    if (migrated !== doc) localStorage.setItem(scope + '-library', JSON.stringify(migrated));
+    return migrated;
   }
   const id = crypto.randomUUID();
   const legacy = localStorage.getItem(scope);
@@ -38,7 +64,7 @@ function readLibrary(scope: string): Library {
 
 export default function GraphLibrary(props: Props) {
   const [statuses, setStatuses] = useState<CollectionStatus[]>([]);
-  const [play, setPlay] = useState<{ playing: boolean; graphId?: string; treeId?: string | null; behavior?: boolean; name?: string }>({ playing: false });
+  const [play, setPlay] = useState<PlayStatus & { graphId?: string }>({ playing: false });
   useEffect(() => {
     void window.bridge.collection.status().then(setStatuses).catch(() => {});
     const a = window.bridge.on('collection:status', s => setStatuses(s as CollectionStatus[]));
@@ -51,11 +77,11 @@ export default function GraphLibrary(props: Props) {
       {play.playing && <span>● {play.behavior ? `${play.name ?? 'A behavior tree'} running` : 'Policy playing'} <button onClick={() => void window.bridge.policy.stop()}>{play.behavior ? 'Stop tree' : 'Stop policy'}</button></span>}
       {running.map(s => <span key={s.graphId}>● {s.name} · {s.test ? `${s.fired} test events` : `${s.saved} images`} <button onClick={() => void window.bridge.collection.stop(s.graphId)}>Stop</button></span>)}
     </div>}
-    <LibraryEditor key={props.storageKey} {...props} statuses={statuses} playingId={play.playing ? play.graphId ?? play.treeId ?? undefined : undefined} />
+    <LibraryEditor key={props.storageKey} {...props} statuses={statuses} playStatus={play} playingId={play.playing ? play.graphId ?? play.treeId ?? undefined : undefined} />
   </>;
 }
 
-function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?: string }) {
+function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?: string; playStatus: PlayStatus }) {
   const [library, setLibrary] = useState<Library>(() => readLibrary(props.storageKey));
   const [opened, setOpened] = useState<string[]>([]);
   useEffect(() => {
@@ -156,13 +182,13 @@ function LibraryEditor(props: Props & { statuses: CollectionStatus[]; playingId?
       <div className="graph-breadcrumb"><span>{['Graphs', ...ancestors].join(' / ')}</span>{selected && <><b>{selected.kind === 'folder' ? 'Folder' : KIND_NAMES[selected.kind]}</b><button title="Graph options" aria-label="Graph options" onClick={e => setMenu({ id: selected.id, x: e.clientX - 150, y: e.clientY + 10 })}>⋯</button></>}</div>
       {error && <div className="collection-error">{error}</div>}
       {/* Open policy editors stay mounted so training state survives navigation. */}
-      {library.entries.filter(e => e.kind === 'policy' && (opened.includes(e.id) || props.active && library.selected === e.id)).map(entry => <div key={entry.id} className={`graph-page ${library.selected === entry.id ? '' : 'pg-off'}`}><PolicyGraph {...props} active storageKey={documentKey(props.storageKey, entry.id)} graphId={entry.id} /></div>)}
+      {library.entries.filter(e => e.kind === 'policy' && (opened.includes(e.id) || props.active && library.selected === e.id)).map(entry => <div key={entry.id} className={`graph-page ${library.selected === entry.id ? '' : 'pg-off'}`}><PolicyGraph {...props} active storageKey={documentKey(props.storageKey, entry.id)} graphId={entry.id} scope={props.storageKey} maps={graphs.filter(g => g.kind === 'map')} /></div>)}
       {selected?.kind === 'collection' && (props.active || opened.includes(selected.id)) && <CollectionGraph key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name} scope={props.storageKey} windowId={props.windowId} capturing={props.capturing} observed={props.observed} stateLabels={props.stateLabels} regions={props.regions} status={props.statuses.find(s => s.graphId === selected.id)} />}
       {selected?.kind === 'behavior' && (props.active || opened.includes(selected.id)) && <BehaviorTree key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name}
         windowId={props.windowId} capturing={props.capturing} recording={props.recording} online={props.online} observed={props.observed} stateLabels={props.stateLabels}
         scope={props.storageKey} graphs={graphs} />}
       {selected?.kind === 'map' && (props.active || opened.includes(selected.id)) && <MapGraph key={selectedKey} storageKey={selectedKey} graphId={selected.id} name={selected.name}
-        scope={props.storageKey} graphs={graphs} capturing={props.capturing} online={props.online} observed={props.observed} stateLabels={props.stateLabels} />}
+        scope={props.storageKey} graphs={graphs} capturing={props.capturing} online={props.online} windowId={props.windowId} recording={props.recording} status={props.playStatus} observed={props.observed} stateLabels={props.stateLabels} />}
       {!selected && <div className="graph-empty">Create a Policy, Data Collection, Behavior tree or Map graph to get started.</div>}
     </section>
     {menu && <div className="graph-menu-shade" onClick={() => setMenu(null)}><div className="graph-menu" style={{ left: Math.min(menu.x, window.innerWidth - 190), top: Math.min(menu.y, window.innerHeight - 270) }} onClick={e => e.stopPropagation()}>{(() => {

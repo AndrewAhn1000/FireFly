@@ -355,7 +355,7 @@ function Editor(props: BehaviorTreeProps) {
           </ReactFlow>
         </div>
       </div>
-      {replaying && <TreeReplay treeId={props.graphId} labels={props.stateLabels} nodes={nodes} onFrame={setReplayed} />}
+      {replaying && <TreeReplay treeId={props.graphId} labels={props.stateLabels} nodes={nodes} maps={bundled.maps} onFrame={setReplayed} />}
     </div>
   </Context.Provider>;
 }

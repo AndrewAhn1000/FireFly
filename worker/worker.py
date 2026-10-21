@@ -19,11 +19,21 @@ import numpy as np
 import torch
 from torch import nn
 
-from formulas import MAX_HISTORY, FormulaSet, Missing, columns_of, functions_help
+from formulas import MAX_HISTORY, FormulaSet, Missing, bare_name, columns_of, functions_help
 from shapes import finite, lines_of
 import behavior as behavior_
+import calibration as calibration_
 import keys as keys_
 import planner as planner_
+import movement as movement_
+import platformer as platformer_
+import tap_response as tap_response_
+
+# What learned movements are made by: a hash of the code that analyses recordings into them, part of their cache's
+# identity, so a change to it is never answered from plans made by the code before (a version bumped by hand was
+# forgotten once, and runs used stale plans)
+ANALYSIS = hashlib.sha256(b''.join((Path(__file__).parent / name).read_bytes() for name in ('movement.py', 'platformer.py', 'keys.py'))).hexdigest()[:16]
+import replay_report as replay_report_
 from observations import _frame as featurize_frame
 from observations import goal_names, level_key
 from observations import HINDSIGHT, MAX_INPUTS, MAX_STEP_MS, MIN_STEP_MS, Featurizer, goal_numbers, held, on_grid, phases, suggested_step
@@ -279,14 +289,43 @@ class Worker:
         return out
 
     def _map_stats(self, ids):
-        """What each map's links did before ({map id: {link id: {runs, fails, ms}}}), kept in <root>/maps/<id>.json."""
+        """What each map's links did before ({map id: {link id: {runs, fails, ms}}}), kept in <root>/maps/<id>.json,
+        and what taps did (`_taps`), from the taps its runs made lining up when it has kept none yet (_traced_taps)."""
         out = {}
         for mid in ids:
             try:
                 out[mid] = json.loads((self.root / 'maps' / f'{_safe(mid)}.json').read_text(encoding='utf8'))
             except (OSError, ValueError):
                 out[mid] = {}
+            if '_taps' not in out[mid]:
+                taps = self._traced_taps(mid)
+                if taps:
+                    out[mid]['_taps'] = taps
         return out
+
+    def _traced_taps(self, mid, most=tap_response_.TAPS_KEPT, files=60):
+        """The taps a map's runs made lining up ({axis: [[ms, px moved]]}, newest kept), from the `line-up` events of
+        the newest `files` behaviour traces: what taps did is then known before its first run with the tap model."""
+        out = {}
+        folder = self.root / 'traces' / 'behavior'
+        try:
+            paths = sorted(folder.glob('*.jsonl'), reverse=True)[:files]
+        except OSError:
+            return out
+        for path in reversed(paths):
+            try:
+                with open(path, encoding='utf8') as f:
+                    for line in f:
+                        if '"line-up"' not in line:
+                            continue
+                        for e in json.loads(line).get('events') or []:
+                            if e.get('kind') == 'line-up' and e.get('map') == mid:
+                                for t in e.get('taps') or []:
+                                    if finite(t.get('ms')) and finite(t.get('movedPx')) and t.get('axis') in ('x', 'y'):
+                                        out.setdefault(t['axis'], []).append([t['ms'], abs(t['movedPx'])])
+            except (OSError, ValueError):
+                continue
+        return {a: v[-most:] for a, v in out.items()}
 
     def _map_keep(self, stats):
         try:
@@ -300,9 +339,240 @@ class Worker:
         except OSError:
             pass
 
-    def _behavior(self, request, tree_id=None):
-        return behavior_.Behavior(request.get('tree'), request.get('fields') or [], self._tree_clips(request), request.get('trees') or {},
-                                  request.get('maps') or {}, self._map_stats((request.get('maps') or {}).keys()), tree_id or request.get('treeId'))
+    def _behavior(self, request, tree_id=None, learned=False):
+        """A request's tree; `learned` expands recorded sequences (or legacy grid
+        keys links) before loading clip events. Checking needn't read recordings."""
+        maps = request.get('maps') or {}
+        if learned:
+            maps = {mid: self._with_grid(m, mid) for mid, m in maps.items()}
+        return behavior_.Behavior(request.get('tree'), request.get('fields') or [], self._tree_clips({**request, 'maps': maps}), request.get('trees') or {},
+                                  maps, self._map_stats(maps.keys()), tree_id or request.get('treeId'))
+
+    def _with_grid(self, m, mid=None):
+        """Add recorded checkpoints and intact clips, or legacy grid key links."""
+        if not isinstance(m, dict) or not m.get('grid'):
+            return m
+        sequences = m['grid'].get('execution', 'sequences') == 'sequences'
+        grid = self._map_sequences(m, mid) if sequences else self._map_grid(m)[0]
+        if sequences and not grid['links'] and not m.get('links'):
+            raise ValueError('No recorded movement sequences. ' + ' '.join(grid['notes'][:3]))
+        places = [{'id': f'g{i}', 'name': '', 'level': p[0], 'x': p[1], 'y': p[2],
+                   **({'reach': behavior_.replay_settings(m)['startPx'], 'recorded': True} if sequences else {})} for i, p in enumerate(grid['places'])]
+        links = grid['links'] if sequences else [
+            {'id': f'g{a}>{b}', 'from': f'g{a}', 'to': f'g{b}', 'kind': 'keys', 'keys': list(keys), 'ms': ms}
+            for a, b, ms, n, keys in grid['moves']]
+        # A migrated Planner destination is a named point, with no hand-built
+        # links. Resolve these the same way as a Planner's point destination:
+        # its learned cell, else the nearest recorded point on this level using
+        # Planner.place_at. A marker can be above the recorded player position.
+        # Places with explicit links retain their own routing and semantics.
+        connected = {p for link in m.get('links') or [] for p in (link.get('from'), link.get('to'))}
+        aliases = {}
+        learned = planner_.Planner(grid)
+        for point in m.get('places') or []:
+            if point['id'] in connected:
+                continue
+            target = learned.place_at(point.get('level'), point['x'], point['y'])
+            if target is not None:
+                aliases[point['id']] = f'g{target}'
+        return {**m, 'places': [*(m.get('places') or []), *places], 'links': [*(m.get('links') or []), *links], 'aliases': aliases,
+                **({'platformer': grid['platformer']} if sequences and grid.get('platformer') else {})}
+
+    def _map_sequences(self, m, mid=None):
+        """A map's recorded movements as the movement analysis learns them; with its id (`mid`) and a platformer
+        model, analysed again with its runs' calibration (calibration.summary) once it has conditions measured enough,
+        each in a cache of its own."""
+        graph = self._map_sequences_with(m, None)
+        model = (graph.get('platformer') or {}).get('model')
+        if mid and model:
+            cal = self._calibration(m, mid, model)
+            if cal:
+                return self._map_sequences_with(m, cal)
+        return graph
+
+    def _calibration(self, m, mid, model):
+        """The calibration summary of a map's runs (newest 60), kept in <root>/plans/calibration-<map>.json until its
+        runs change."""
+        folder = self.root / 'traces' / 'behavior'
+        files = sorted(folder.glob('*.jsonl'), reverse=True)[:400] if folder.exists() else []
+        signature = hashlib.sha256(json.dumps([[p.name, p.stat().st_size] for p in files] + [model.get('walk'), model.get('delays')]).encode()).hexdigest()[:16]
+        path = self.root / 'plans' / f'calibration-{_safe(mid)}.json'
+        try:
+            kept = json.loads(path.read_text(encoding='utf8'))
+            if kept.get('signature') == signature:
+                return kept['summary']
+        except (OSError, ValueError):
+            pass
+        sync = bare_name(behavior_.replay_settings(m)['sync'] or '')
+        found, runs = [], 0
+        for p in files:
+            if runs >= 60:
+                break
+            frames = []
+            try:
+                with open(p, encoding='utf8') as f:
+                    f.readline()
+                    for line in f:
+                        row = json.loads(line)
+                        if not row.get('closing'):
+                            frames.append(row)
+            except (OSError, ValueError):
+                continue
+            if not any(mid in (fr.get('maps') or {}) for fr in frames[:50]):
+                continue
+            runs += 1
+            found += calibration_.outcomes(frames, model, sync, p.name)[0]
+        out = calibration_.summary(found)
+        try:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps({'signature': signature, 'summary': out}), encoding='utf8')
+        except OSError:
+            pass
+        return out
+
+    def _map_sequences_with(self, m, calibration):
+        ids = self._grid_ids(m)
+        if not ids:
+            raise ValueError('The recordings this map learns from are gone')
+        replay = behavior_.replay_settings(m)
+        # what changes the movements learned: the recordings, how the player is measured, what presses wait for, and
+        # the ground jumps are measured on
+        identity = [sorted(ids), m.get('position'), m.get('level'), m.get('grounded'), replay['sync'], replay['syncWindowMs'] if replay['sync'] else None,
+                    'movement', ANALYSIS, *([replay['ground'], 'platformer'] if replay['ground'] else []),
+                    *(['calibration', calibration] if calibration else [])]
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
+        path = self.root / 'plans' / f'sequences-{key}.json'
+        try:
+            return json.loads(path.read_text(encoding='utf8'))
+        except (OSError, ValueError):
+            pass
+        tracks = self._track({**m, 'fields': [], 'formulas': [], 'optionalGrounded': True, **({'sync': replay['sync']} if replay['sync'] else {})},
+                             sorted(ids))
+        graph = movement_.learn(tracks, key, replay['syncWindowMs'] if replay['sync'] else 0)
+        if replay['ground']:
+            graph['platformer'] = self._takeoffs(m, ids, graph, replay, calibration)
+        try:
+            path.parent.mkdir(exist_ok=True)
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(graph), encoding='utf8')
+            temporary.replace(path)
+        except OSError:
+            pass
+        return graph
+
+    def _takeoffs(self, m, ids, graph, replay, calibration=None):
+        """A map's recorded jumps measured by the platformer model, its replay naming the State whose lines are the
+        ground: its recordings' positions at their read times, whether the player was on the ground, levels and keys,
+        and the ground lines, gathered for platformer.annotate (the model fitted, and each recorded movement
+        annotated). {model, grounds: [[level, lines]], counts, unsafe} or {error}."""
+        grounded = (m.get('grounded') or '').strip() or replay['sync']
+        if not grounded:
+            return {'error': 'Measuring jumps needs to know when the player is on the ground: set Wait for (such as On Ground)'}
+        try:
+            tracks = self._track({'position': m.get('position'), 'level': m.get('level'), 'grounded': grounded, 'fields': [], 'formulas': [],
+                                  'shapes': replay['ground']}, ids)
+        except ValueError as e:
+            return {'error': str(e)}
+        recordings, grounds = {}, {}
+        for rid, track, on_ground, levels, keys, detail in tracks:
+            if not getattr(keys, 'recorded', False):
+                continue
+            lv = [level_key(list(v) if isinstance(v, tuple) else v) if v is not None else None for v in levels] if levels is not None else [None] * len(track)
+            samples = [(detail['reads'][n] if detail['reads'][n] is not None else t, x, y, on_ground[n] if on_ground else None, lv[n])
+                       for n, (t, x, y) in enumerate(track)]
+            recordings[rid] = {'samples': samples, 'keys': keys, 'times': [s[0] for s in samples]}
+            for level, value in detail['shapes'].items():
+                grounds.setdefault(level, value)
+        if not grounds:
+            return {'error': f'{replay["ground"]} has no lines in the recordings'}
+        return platformer_.annotate(graph, recordings, grounds, calibration)
+
+    # A map's grid: places and moves learned from recordings (planner.learn), measured by the map's own Position and
+    # Level, kept on disk (<root>/plans/<hash>.json) by what they were learned from, since reading every sample of
+    # many recordings takes seconds
+    def _grid_ids(self, m):
+        ids = (m.get('grid') or {}).get('recordings')
+        with self.db() as db:
+            rows = db.execute("SELECT id, metadata FROM recordings WHERE status='complete'").fetchall()
+        complete = {rid: json.loads(meta) for rid, meta in rows}
+        if ids:
+            return [rid for rid in ids if rid in complete]
+        return sorted(rid for rid, meta in complete.items() if not meta.get('correction'))
+
+    def _map_grid(self, m):
+        """What a map learned on its grid: (graph {cell, places, moves}, ends {recording: (x, y, level)})."""
+        ids = self._grid_ids(m)
+        if not ids:
+            raise ValueError(f'{m.get("name") or "Its map"}: the recordings it learns from are gone')
+        cell = float(m['grid']['cell'])
+        key = hashlib.sha256(json.dumps([sorted(ids), m.get('position'), m.get('level') or '', cell, 'map', 1], sort_keys=True).encode()).hexdigest()[:32]
+        path = self.root / 'plans' / f'{key}.json'
+        try:
+            kept = json.loads(path.read_text(encoding='utf8'))
+            return kept['graph'], {rid: tuple(e) for rid, e in kept['ends'].items()}
+        except (OSError, ValueError, KeyError):
+            pass
+        series, ends = [], {}
+        for rid, track, _, levels, keys in self._track({'position': m.get('position'), 'level': m.get('level'), 'fields': [], 'formulas': []}, ids):
+            lv = [level_key(list(v) if isinstance(v, tuple) else v) if v is not None else None for v in levels] if levels is not None else [None] * len(track)
+            series.append([(t, x, y, lv[n], tuple(sorted(keys.held(t)))) for n, (t, x, y) in enumerate(track)])
+            if track:
+                ends[rid] = (track[-1][1], track[-1][2], lv[-1])
+        graph = planner_.learn(series, cell)
+        try:
+            path.parent.mkdir(exist_ok=True)
+            temporary = path.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'graph': graph, 'ends': ends}), encoding='utf8')
+            temporary.replace(path)
+        except OSError:
+            pass
+        return graph, ends
+
+    def _map_graph(self, m):
+        """A map as a planner plans over it (planner.merge): its own places and links, with what they did (its
+        stats), and what it learned on a grid; and where the recordings it learned from ended."""
+        grid, ends = self._map_grid(m) if m.get('grid') else (None, {})
+        stats = self._map_stats([m.get('id')]).get(m.get('id')) or {} if m.get('id') else {}
+        return planner_.merge(grid, m, stats, self._tree_clips({'maps': {m.get('id'): m}})), ends
+
+    def _map_outcomes(self, outcomes):
+        """How a map's links went while a policy played over it (Featurizer.map_outcomes), kept with its stats."""
+        by_map = {}
+        for mid, lid, worked, ms in outcomes:
+            by_map.setdefault(mid, []).append((lid, worked, ms))
+        for mid, done in by_map.items():
+            if not mid:
+                continue
+            stats = self._map_stats([mid])[mid]
+            for lid, worked, ms in done:
+                planner_.learn_stat(stats.setdefault(lid, {'runs': 0, 'fails': 0}), worked, ms)
+            self._map_keep({mid: stats})
+
+    def map_grid(self, request):
+        """Execution preview: recorded stops and sequences, or legacy grid moves.
+        Policy planning continues to use _map_grid regardless of execution mode."""
+        m = request.get('map') or {}
+        if not m.get('grid'):
+            return {'places': [], 'moves': [], 'recordings': 0}
+        if not (m.get('position') or '').strip():
+            raise ValueError('Say where the player is first: its Position')
+        sequences = m['grid'].get('execution', 'sequences') == 'sequences'
+        graph = self._map_sequences(m, request.get('id')) if sequences else self._map_grid(m)[0]
+        return {'places': graph['places'][:planner_.MAX_DRAWN], 'moves': graph['moves'][:planner_.MAX_DRAWN],
+                'count': {'places': len(graph['places']), 'moves': len(graph['moves'])}, 'recordings': len(self._grid_ids(m)),
+                'execution': 'sequences' if sequences else 'keys', 'notes': graph.get('notes', []),
+                'linkIds': [l['id'] for l in graph.get('links', [])][:planner_.MAX_DRAWN],
+                # how many recorded movements wait for the map's Wait for State somewhere, and how often in all
+                **({'synced': sum(1 for l in graph['links'] if l.get('syncs')), 'waits': sum(len(l.get('syncs') or []) for l in graph['links'])}
+                   if sequences else {}),
+                # the platformer model its jumps are measured by, how many of each kind, and which movements are unsafe
+                **({'takeoff': {k: v for k, v in graph['platformer'].items() if k != 'grounds'},
+                    'unsafe': [bool(l.get('unsafe')) for l in graph['links'][:planner_.MAX_DRAWN]]} if sequences and graph.get('platformer') else {}),
+                **({'paths': [movement_.drawn_path(l) for l in graph['links'][:planner_.MAX_DRAWN]]} if sequences else {}),
+                # where a failed movement could be resumed (platformer.checkpoints; internal, drawn faintly): [level, x, y,
+                # kind, resumable, why], at most MAX_DRAWN
+                **({'checkpoints': [[c['level'], c['position'][0], c['position'][1], c['kind'], c['resumable'], c.get('why')]
+                                    for l in graph['links'] for c in l.get('checkpoints') or []][:planner_.MAX_DRAWN]} if sequences else {})}
 
     def behavior_check(self, request):
         """What's wrong with a tree, by node id ({errors}), and the keys it presses ({buttons})."""
@@ -316,7 +586,7 @@ class Worker:
         """A tree to run on every frame (behavior_step), with the trees it runs (`trees`) and maps it goes over (`maps`),
         and the buttons it presses ([{id, vk}], those of request['buttons'] it uses). Every frame is kept in
         <root>/traces/behavior/<when>.jsonl: what its nodes did, the keys, and what it read."""
-        tree = self._behavior(request)
+        tree = self._behavior(request, learned=True)
         if tree.inputs:
             raise ValueError(f'This tree takes inputs ({", ".join(tree.inputs)}): run it from another tree’s Run tree node, which gives them')
         known = {b['id']: b for b in request.get('buttons') or [] if isinstance(b, dict) and isinstance(b.get('id'), str)}
@@ -331,8 +601,11 @@ class Worker:
         folder = self.root / 'traces' / 'behavior'
         folder.mkdir(parents=True, exist_ok=True)
         self.trace = open(folder / f"{time.strftime('%Y-%m-%d %H-%M-%S')}.jsonl", 'w', encoding='utf8')
+        # the request as it came (the maps as the editor saved them, not as learned), so the run can be replayed
+        # through the executor again later (trace_replay.py)
         self.trace.write(json.dumps({'version': 2, 'behavior': True, 'treeId': request.get('treeId'), 'name': request.get('name'),
-                                     'buttons': self.behaving['buttons'], 'reads': tree.reads}) + '\n')
+                                     'buttons': self.behaving['buttons'], 'reads': tree.reads,
+                                     'request': {k: request.get(k) for k in ('tree', 'trees', 'maps', 'fields', 'treeId')}}) + '\n')
         return {'buttons': buttons, 'trace': self.trace.name}
 
     def behavior_step(self, request):
@@ -345,7 +618,7 @@ class Worker:
         values = {o['name']: o for o in request.get('observations') or []}
         t = float(request['timestamp'])
         now = t + max(0.0, float(request.get('ageMs') or 0))
-        out = b['tree'].tick(now, values)
+        out = b['tree'].tick(now, values, execution=request.get('execution'), observation_time=t)
         learned = b['tree'].stats()
         if learned:
             self._map_keep(learned)
@@ -353,13 +626,23 @@ class Worker:
         sequence = out['sequence']
         if sequence is not None:
             sequence = [[ms, index[key], bool(down)] for ms, key, down in sequence if key in index]
+        action = out['action']
+        if action is not None and action.get('keep'):  # keys the guard leaves held after it, by their index
+            action = {**action, 'keep': [index[k] for k in action['keep'] if k in index]}
+            out = {**out, 'action': action}
         if self.trace is not None:
             self.trace.write(json.dumps({'t': round(t, 1), 'now': round(now, 1), 'keys': sorted(out['keys']), 'nodes': out['nodes'], 'trees': out['trees'],
                                          'maps': out['maps'], 'text': out['text'], 'values': b['tree'].seen(),
+                                         **({'reads': reads} if (reads := b['tree'].read_times()) else {}),
+                                         **({'events': out['events']} if out.get('events') else {}),
+                                         # the guard's record of each press of an action that has ended (play.cjs)
+                                         **({'dispatch': request['dispatch']} if request.get('dispatch') else {}),
+                                         'execution': request.get('execution'), 'action': out['action'],
                                          **({'sequence': sequence} if sequence is not None else {}), **({'done': out['done']} if out['done'] else {})},
                                         default=str) + '\n')
             self.trace.flush()
         return {'buttons': [k in out['keys'] for k in b['buttons']], **({'sequence': sequence} if sequence is not None else {}),
+                **({'action': out['action']} if out['action'] is not None else {}),
                 'status': {'text': out['text'], 'nodes': out['nodes'], 'trees': out['trees'], 'maps': out['maps'], 'done': out['done']}}
 
     def behavior_traces(self, request):
@@ -391,12 +674,70 @@ class Worker:
             head = json.loads(f.readline() or '{}')
             for line in f:
                 try:
-                    frames.append(json.loads(line))
+                    row = json.loads(line)
                 except ValueError:
                     continue
+                if row.get('closing'):  # the guard's records of its last actions, kept as play stopped: the last frame's
+                    if frames:
+                        frames[-1]['dispatch'] = [*(frames[-1].get('dispatch') or []), *(row.get('dispatch') or [])]
+                    continue
+                frames.append(row)
                 if len(frames) >= 20000:
                     break
         return {'head': head, 'frames': frames}
+
+    def map_calibration(self, request):
+        """How the map's platformer model's landings compare with where its jumps pressed by position came down in its
+        runs (calibration.py: measurement only), with a correction from the state each was pressed in scored by leaving
+        each run out: {report, leftOut, runs}. `files` (newest first) at most `runs` of them, default 60."""
+        m = request.get('map') or {}
+        graph = self._map_sequences(m)
+        pf = graph.get('platformer') or {}
+        if not pf.get('model'):
+            raise ValueError('The map has no platformer model: set its Ground lines and Wait for')
+        sync = bare_name(behavior_.replay_settings(m)['sync'] or '')
+        folder = self.root / 'traces' / 'behavior'
+        found, left, runs = [], {}, 0
+        for path in sorted(folder.glob('*.jsonl'), reverse=True) if folder.exists() else []:
+            if runs >= int(request.get('runs') or 60):
+                break
+            frames = []
+            try:
+                with open(path, encoding='utf8') as f:
+                    f.readline()
+                    for line in f:
+                        row = json.loads(line)
+                        if not row.get('closing'):
+                            frames.append(row)
+            except (OSError, ValueError):
+                continue
+            if not any(m.get('id') in (fr.get('maps') or {}) for fr in frames[:50]):
+                continue
+            runs += 1
+            o, l = calibration_.outcomes(frames, pf['model'], sync, path.name)
+            found += o
+            for k, v in l.items():
+                left[k] = left.get(k, 0) + v
+        return {'report': calibration_.evaluate(found, pf['model']['walk']), 'leftOut': left, 'runs': runs}
+
+    def behavior_replay(self, request):
+        """Each recorded movement replayed in a run, against its recording (replay_report): per key event its due and
+        sent times, recorded and live positions, raw and time-aligned error. `maps` (the run's map bundle) finds the
+        recorded links of traces from before links were kept in them; `thresholdPx` is when an attempt has diverged."""
+        run = self.behavior_trace(request)
+        maps, found = request.get('maps') or {}, {}
+
+        def links(mid, lid):
+            if mid not in found:
+                try:
+                    found[mid] = {l['id']: l for l in self._with_grid(maps[mid]).get('links') or []} if mid in maps else {}
+                except (ValueError, KeyError, OSError):
+                    found[mid] = {}
+            link = found[mid].get(lid)
+            return {k: link.get(k) for k in ('clip', 'start', 'end', 'ms', 'trajectory')} if link and link.get('recorded') else None
+
+        threshold = float(request.get('thresholdPx') or replay_report_.THRESHOLD_PX)
+        return replay_report_.report(run['head'], run['frames'], threshold, links)
 
     def map_frame(self, request):
         """What a map is drawn over, from one sample (`observations`, what FireFly observes now, else the last sample of
@@ -415,9 +756,15 @@ class Worker:
             values = {o['name']: o for o in (json.loads(last[0])['observations'] if last else [])}
         known = {f['name'] for f in fields}
         fields = [*fields, *(f for f in request.get('fields') or [] if f['name'] not in known)]
-        entries = [{'name': f'firefly {k}', 'source': request[k]} for k in ('position', 'level') if (request.get(k) or '').strip()]
+        level_name = bare_name(request.get('level') or '')
+        level_name = level_name if level_name in {f['name'] for f in fields} else None  # a State's value as it is
+        entries = [{'name': f'firefly {k}', 'source': request[k]} for k in ('position', 'level')
+                   if (request.get(k) or '').strip() and not (k == 'level' and level_name)]
         formulas = FormulaSet(entries, fields)
         out = {'position': None, 'level': None, 'shapes': {}, 'errors': {}}
+        if level_name:
+            o = values.get(level_name)
+            out['level'] = level_key(o.get('value')) if o and o.get('valid') else None
         for k in ('position', 'level'):
             e = formulas.entries.get(f'firefly {k}')
             if e is None:
@@ -504,21 +851,34 @@ class Worker:
                 known = {f['name'] for f in schema['fields']}
                 schema = {**schema, 'fields': [*schema['fields'], *(f for f in request.get('fields') or [] if f['name'] not in known)]}
                 # the position, level and on the ground: formulas over the observations (a State's name is one)
-                own = [{'name': f'firefly {k}', 'source': request[k]} for k in ('position', 'grounded', 'level') if (request.get(k) or '').strip()]
+                level_name = bare_name(request.get('level') or '')
+                level_name = level_name if level_name in known else None  # a State's value as it is (any value)
+                shapes = request.get('shapes')  # a shapes State whose first value on each level is kept (`detail`)
+                if shapes and shapes not in known:
+                    continue  # a recording without it has nothing to measure
+                own = [{'name': f'firefly {k}', 'source': request[k]} for k in ('position', 'grounded', 'level', 'sync')
+                       if (request.get(k) or '').strip() and not (k == 'level' and level_name)]
                 formulas = FormulaSet([*(request.get('formulas') or []), *own], schema['fields'])
                 if not (request.get('position') or '').strip():
                     raise ValueError('Choose the position clips are measured by: a State or formula giving the player’s position')
-                for k in ('position', 'grounded', 'level'):
+                for k in ('position', 'grounded', 'level', 'sync'):
                     e = formulas.entries.get(f'firefly {k}')
-                    if e is not None and e['error']:
-                        raise ValueError(f'{k.capitalize()}: {e["error"]}')
+                    # a recording without the Wait for State keeps its movements timed by the clock (movement.learn says so)
+                    if e is not None and e['error'] and not (k == 'grounded' and request.get('optionalGrounded')) and k != 'sync':
+                        raise ValueError(f'{"Wait for" if k == "sync" else k.capitalize()}: {e["error"]}')
                 usable = [{'name': e['name'], 'source': e['source'], **({'inputs': e['inputs']} if e['inputs'] else {})} for e in formulas.ok()]
                 featurize = Featurizer(schema, formulas=usable)
                 names = {e['name'] for e in usable}
                 (_, samples), = self._recordings(db, [rid])[0]
-                keys = keys_.Keys(self._key_events(db, rid))
+                events = self._key_events(db, rid)
+                keys = keys_.Keys(events or self._sample_events(samples))
+                keys.recorded = bool(events)
                 frames = [s['observations'] for s in samples]
-                track, grounded, level = [], [], []
+                track, grounded, level, sync = [], [], [], []
+                detail = {'reads': [], 'shapes': {}}
+                # when the position was read: the newest read time of the States its formula reads
+                e = formulas.entries.get('firefly position')
+                position_reads = sorted(e['observations']) if e and not e['error'] else []
                 for n, s in enumerate(samples):
                     seen = [frames[n], *(frames[n - k] if n >= k else None for k in range(1, featurize.depth + 1))]
                     try:
@@ -526,10 +886,35 @@ class Worker:
                     except Missing:
                         continue
                     track.append((s['timestamp'], float(x), float(y)))
+                    if shapes:  # when the position was read (its States' readAt), and the ground on its level
+                        times = [o['readAt'] for name in position_reads if (o := frames[n].get(name)) and finite(o.get('readAt'))]
+                        detail['reads'].append(max(times) if times else None)
                     g = self._read(featurize, 'firefly grounded', names, frames[n], seen)
                     grounded.append(None if g is None else bool(g))
-                    level.append(self._read(featurize, 'firefly level', names, frames[n], seen))
-                out.append((rid, track, grounded if 'firefly grounded' in names else None, level if 'firefly level' in names else None, keys))
+                    level.append(self._read(featurize, level_name, known, frames[n], seen) if level_name else self._read(featurize, 'firefly level', names, frames[n], seen))
+                    v = self._read(featurize, 'firefly sync', names, frames[n], seen)
+                    sync.append(None if v is None else bool(v))
+                    if shapes:
+                        lv = level[-1]
+                        lv = level_key(list(lv) if isinstance(lv, tuple) else lv) if lv is not None else None
+                        g = frames[n].get(shapes)
+                        if lv not in detail['shapes'] and g and g.get('valid') and g.get('value'):
+                            detail['shapes'][lv] = g['value']
+                # with a Wait for State asked for, each recording's values of it beside the rest
+                out.append((rid, track, grounded if 'firefly grounded' in names else None,
+                            level if level_name or 'firefly level' in names else None, keys)
+                           + ((sync,) if 'firefly sync' in names else ()) + ((detail,) if shapes else ()))
+        return out
+
+    @staticmethod
+    def _sample_events(samples):
+        """Key events from what each sample held, for a recording without its raw key events."""
+        out, held = [], set()
+        for s in samples:
+            actions = s.get('actions') or {}
+            now = {b for b, on in (actions.get('buttons') or {}).items() if on} if actions.get('valid') else set()
+            out += [(s['timestamp'], b, True) for b in sorted(now - held)] + [(s['timestamp'], b, False) for b in sorted(held - now)]
+            held = now
         return out
 
     @staticmethod
@@ -568,6 +953,28 @@ class Worker:
         """A plan's places and moves, learned from its recordings (else the policy's); trained again after they were
         deleted, it keeps what it learned."""
         plan = featurize.goal['plan']
+        if 'map' in plan:
+            stored = (goal.get('plan') or {}).get('graph') if isinstance(goal, dict) else None
+            try:
+                plan['graph'], ends = self._map_graph(plan['map'])
+            except ValueError:
+                if not stored:
+                    raise
+                plan['graph'], ends = stored, {}  # trained again after its recordings were deleted: what it learned then
+            if not plan['graph']['moves']:
+                raise ValueError(f'{featurize.goal["name"]}: its map has no links, and learned no moves: add links, or have it learn a grid')
+            dest = plan['destination']
+            if dest['kind'] == 'end' and dest['recording'] not in ends and 'x' not in dest:
+                tracks = self._track({'position': plan['map']['position'], 'level': plan['map'].get('level'), 'fields': [], 'formulas': []}, [dest['recording']])
+                for rid, track, _, levels, _ in tracks:
+                    if track:
+                        ends[rid] = (track[-1][1], track[-1][2], level_key(levels[-1]) if levels and levels[-1] is not None else None)
+            if dest['kind'] == 'end' and 'x' not in dest:
+                if dest['recording'] not in ends:
+                    raise ValueError(f'{featurize.goal["name"]}: the recording whose end play heads for is gone: choose another')
+                x, y, level = ends[dest['recording']]
+                plan['destination'] = {**dest, 'x': x, 'y': y, **({'level': level} if level is not None else {})}
+            return
         ids = plan.get('recordings') or list(policy_ids)
         with self.db() as db:
             gone = [rid for rid in ids if not db.execute("SELECT 1 FROM recordings WHERE id=? AND status='complete'", (rid,)).fetchone()]
@@ -631,78 +1038,6 @@ class Worker:
                 raise ValueError(f'{featurize.goal["name"]}: the recording whose end play heads for is gone: choose another')
             x, y, level = ends[dest['recording']]
             plan['destination'] = {**dest, 'x': x, 'y': y, **({'level': level} if level is not None else {})}
-
-    def planner_preview(self, request):
-        """A Planner node's picture: the places and moves it learned (from request['recordings'], else the
-        policy's), on the level of a sample (the one given, such as what FireFly observes now, else where the first
-        recording ended), and the way from there to its destination, with the target and the next move."""
-        goal = request['goal']
-        ids = (goal.get('plan') or {}).get('recordings') or request.get('recordingIds') or []
-        if not ids:
-            raise ValueError('Choose the recordings it learns from')
-        with self.db() as db:  # what the first recording observed, from its metadata (not its samples: whole levels of shapes each)
-            row = db.execute('SELECT metadata FROM recordings WHERE id=?', (ids[0],)).fetchone()
-        if not row:
-            raise ValueError('A recording it learns from no longer exists (it was deleted)')
-        schema = json.loads(row[0])['observationSchema']
-        known = {f['name'] for f in schema['fields']}
-        schema = {**schema, 'fields': [*schema['fields'], *(f for f in request.get('fields') or [] if f['name'] not in known)]}
-        formulas = FormulaSet(request.get('formulas'), schema['fields'])
-        usable = [{'name': e['name'], 'source': e['source'], **({'inputs': e['inputs']} if e['inputs'] else {})} for e in formulas.ok()]
-        # Before a destination is chosen it's drawn without a way there (the map is where one is clicked)
-        chosen = isinstance(goal.get('plan'), dict) and goal['plan'].get('destination') is not None
-        if not chosen:
-            goal = {**goal, 'plan': {**goal['plan'], 'destination': {'kind': 'point', 'x': 0, 'y': 0}}}
-        featurize = Featurizer(schema, formulas=usable, goal=self._goal_request(goal))
-        spec = featurize.goal['plan']
-        key = json.dumps([ids, featurize.goal['position'], spec.get('level'), spec['cell'], usable], sort_keys=True)
-        cache = self.__dict__.setdefault('_plan_cache', {})
-        if key not in cache:
-            series, ends = self._plan_samples(featurize, ids)
-            cache.clear()
-            cache[key] = (planner_.Planner(planner_.learn(series, spec['cell'])), ends, series)
-        plan, ends, series = cache[key]
-        if not self._plan_kept(featurize, ids):  # for Play, which learns from the same recordings
-            self._plan_keep(featurize, ids, {'cell': plan.cell, 'places': plan.places, 'moves': plan.moves}, ends)
-        spec['graph'] = {'cell': plan.cell, 'places': plan.places, 'moves': plan.moves}
-        featurize._planner = plan
-        dest_spec = featurize.goal['plan']['destination']
-        if dest_spec['kind'] == 'end' and dest_spec.get('recording') in ends:
-            x, y, level = ends[dest_spec['recording']]
-            featurize.goal['plan']['destination'] = {**dest_spec, 'x': x, 'y': y}
-        sample = request.get('observations')
-        position = level = destination = None
-        error = None
-        if sample is not None:
-            values = {o['name']: o for o in sample}
-            try:  # the position alone: the Goal's facing may look a step back, which one sample hasn't
-                position = tuple(float(v) for v in featurize._value(featurize.goal['position'], values, [values], 'vector')[:2])
-            except Missing as e:
-                error = str(e)
-            level = featurize.plan_level(values)
-        else:
-            last = next((rows[-1] for rows in reversed(series) if rows), None)
-            values = None
-            if last:
-                position, level = (last[1], last[2]), last[3]
-        try:
-            destination = featurize.plan_destination(values or {}, [values or {}]) if chosen else None
-        except Missing as e:
-            error = error or str(e)
-        picture = plan.picture(level, position, destination, 1000 * featurize.goal['plan']['aheadS'])
-        if position is not None and destination is not None and not picture.get('path'):
-            # where it got stuck: the place it took the player to be at, and how far the moves from there get
-            s = plan.stuck(level, position, destination)
-            error = error or ('No move you’ve made leads from here to the destination' + (
-                f" (you're at ({position[0]:.0f}, {position[1]:.0f}), its place ({s['at'][0]}, {s['at'][1]}); from there its moves reach "
-                f"{s['reach']} place{'s' if s['reach'] != 1 else ''}, the nearest to the destination ({s['nearest'][0]}, {s['nearest'][1]}), "
-                f"{s['short']} px short)" if s else ''))
-            out_stuck = s
-        else:
-            out_stuck = None
-        out = {**picture, 'position': list(position) if position else None, 'destination': list(destination) if destination else None,
-               'level': level, 'recordings': len(series), 'error': error, 'stuck': out_stuck}
-        return out
 
     def _route_path(self, featurize, goal):
         """A Goal's route, the way play follows: where its position was in the route's recording, [ms from its start,
@@ -1400,10 +1735,14 @@ class Worker:
             return {**metadata, 'trace': str(path)}
         return metadata
 
-    def close_trace(self):
-        """Stops keeping what the policy sees, and says where it was kept."""
-        if self.trace is None:
+    def close_trace(self, request=None):
+        """Stops keeping what the policy sees, and says where it was kept. `file`: only that trace (a run started since
+        has its own); `dispatch`: the guard's records of the run's last actions, kept as its last row."""
+        request = request or {}
+        if self.trace is None or (request.get('file') and Path(request['file']).resolve() != Path(self.trace.name).resolve()):
             return {'trace': None}
+        if request.get('dispatch'):
+            self.trace.write(json.dumps({'closing': True, 'dispatch': request['dispatch']}) + '\n')
         path = self.trace.name
         self.trace.close()
         self.trace = None
@@ -1522,6 +1861,9 @@ class Worker:
             x = featurize(frame, [e[1] if e else None for e in earlier[1:featurize.depth + 1]])
         except Missing as e:
             x = e
+        outcomes = featurize.__dict__.pop('map_outcomes', None)
+        if outcomes:
+            self._map_outcomes(outcomes)
         keep = t - (max(featurize.depth, history) + 2) * step
         self.recent = [r for r in self.recent if r[0] >= keep] + [(t, frame, x)]
         if isinstance(x, Missing):
@@ -1582,20 +1924,24 @@ def main():
                 result = worker.load(request)
             elif op == 'predict':
                 result = worker.predict(request)
-            elif op == 'planner.preview':
-                result = worker.planner_preview(request)
+            elif op == 'map.grid':
+                result = worker.map_grid(request)
             elif op == 'clips.list':
                 result = worker.clips_list(request)
             elif op == 'behavior.traces':
                 result = worker.behavior_traces(request)
             elif op == 'behavior.trace':
                 result = worker.behavior_trace(request)
+            elif op == 'behavior.replay':
+                result = worker.behavior_replay(request)
             elif op == 'map.frame':
                 result = worker.map_frame(request)
             elif op == 'map.suggest':
                 result = worker.map_suggest(request)
             elif op == 'map.stats':
                 result = worker.map_stats(request)
+            elif op == 'map.calibration':
+                result = worker.map_calibration(request)
             elif op == 'behavior.check':
                 result = worker.behavior_check(request)
             elif op == 'behavior.load':
@@ -1603,7 +1949,7 @@ def main():
             elif op == 'behavior.step':
                 result = worker.behavior_step(request)
             elif op == 'trace.close':
-                result = worker.close_trace()
+                result = worker.close_trace(request)
             elif op == 'trace.report':
                 result = worker.trace_report(request)
             elif op == 'export':

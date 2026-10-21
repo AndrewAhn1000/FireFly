@@ -22,15 +22,16 @@
 const CORRECTION_BEFORE_MS = 300;
 
 function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, clock = () => Number(process.hrtime.bigint()) / 1e6,
-  focusWaitMs = 10000, correctionIdleMs = 1500, pollMs = 200, unconfiguredWaitMs = 1000 }) {
+  focusWaitMs = 10000, correctionIdleMs = 1500, pollMs = 200, unconfiguredWaitMs = 1000, heartbeatMs = 50 }) {
   let play = null; // { modelId, windowId, observationSchema, actionSchema, buttons, busy, engaged, actions, released, started, corrections, correcting, corrected, policyName }
   let correctionTimer = null;
+  let actionTimer = null;
 
   function status(reason, stopped = {}) {
     send('play:status', play
       ? { playing: true, waiting: !play.engaged, correcting: !!play.correcting, corrected: play.corrected,
           modelId: play.modelId, actions: play.actions, released: play.released, missed: play.missed ?? null, holding: play.holding ?? [], pressed: play.counts ?? {}, keyboardFocus: play.keyboardFocus ?? null, started: play.started, latency: play.latency ?? null, top: play.top ?? null, heading: play.heading ?? null,
-          trace: play.trace ?? null, taps: Object.keys(play.taps ?? {}),
+          trace: play.trace ?? null, taps: Object.keys(play.taps ?? {}), execution: play.execution ?? null,
           ...(play.behavior ? { behavior: true, name: play.policyName, treeId: play.treeId ?? null, tree: play.tree ?? null } : {}) }
       : { playing: false, reason: reason ?? null, ...stopped });
   }
@@ -78,11 +79,65 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     const buttons = loaded.buttons.map(({ id, vk }) => ({ id, vk }));
     const current = await runtime('session.schemas', { buttons });
     await guard('focus', { windowId: String(windowId) }).catch(() => {});
-    await guard('configure', { windowId: String(windowId), buttons, observationSchema: current.observationSchema.identity });
+    const configured = await guard('configure', { windowId: String(windowId), buttons, observationSchema: current.observationSchema.identity, sequenceProtocol: 1 });
     play = { behavior: true, modelId: null, windowId: String(windowId), observationSchema: current.observationSchema.identity, actionSchema: current.actionSchema.identity,
       buttons, recorded: buttons, busy: false, engaged: false, actions: 0, released: 0, started: now(), corrections: false, correcting: null, corrected: 0,
-      trace: loaded.trace ?? null, taps: {}, tapping: new Map(), policyName: name ?? 'the tree', treeId, stepMs: 5, correctionHz: 15, tree: null, treeSent: 0 };
+      trace: loaded.trace ?? null, taps: {}, tapping: new Map(), policyName: name ?? 'the tree', treeId, stepMs: 5, correctionHz: 15, tree: null, treeSent: 0,
+      sequenceProtocol: configured?.sequenceProtocol === 1, execution: { id: 0, state: 'idle' }, dispatches: [], dispatchAsked: 0 };
+    const running = play;
+    if (running.sequenceProtocol) {
+      actionTimer = setInterval(() => renewAction(running), heartbeatMs);
+      actionTimer.unref?.();
+    }
     status();
+  }
+
+  function executionStatus(current, execution) {
+    if (!execution || play !== current) return;
+    const previous = current.execution;
+    // An in-flight heartbeat can return after an apply for a newer action.
+    if (previous && (execution.id < previous.id ||
+        (execution.id === previous.id && previous.state !== 'running' && previous.state !== 'idle' && execution.state === 'running'))) return;
+    current.execution = execution;
+    const before = (current.holding ?? []).join();
+    if (Array.isArray(execution.held)) current.holding = current.buttons.filter(b => execution.held.includes(b.vk)).map(b => b.id);
+    else if (execution.state !== 'running' && execution.id) current.holding = [];
+    if (previous?.id !== execution.id || previous?.state !== execution.state || before !== (current.holding ?? []).join()) status();
+    if (execution.id > current.dispatchAsked && ['completed', 'cancelled', 'failed'].includes(execution.state)) fetchDispatch(current, execution.id);
+  }
+
+  // How each press of an ended action went (the guard's `dispatch`: due, sent and returned times, and whether an OS
+  // event went), asked for once per action and handed to the tree's next step, which keeps it in its trace
+  function fetchDispatch(current, actionId) {
+    current.dispatchAsked = actionId;
+    const fetched = guard('dispatch', { actionId }).then(reply => { if (reply?.dispatch) current.dispatches.push(reply.dispatch); }, () => {});
+    (current.dispatchFetches ??= []).push(fetched);
+  }
+
+  // A tree's trace closed with the record of its last action too: the one it stopped on (a movement that failed ends
+  // the tree before another step could keep it), and any fetched since the last step. It names its file, so a run
+  // started at once after isn't the one closed
+  async function closeTrace(current) {
+    const last = current.execution?.id ?? 0;
+    if (current.sequenceProtocol && last > (current.dispatchAsked ?? 0)) fetchDispatch(current, last);
+    await Promise.allSettled(current.dispatchFetches ?? []);
+    const dispatch = current.dispatches?.splice(0) ?? [];
+    await worker('trace.close', { file: current.trace, ...(dispatch.length ? { dispatch } : {}) });
+  }
+
+  async function renewAction(current) {
+    if (play !== current || current.correcting || current.renewing || current.execution?.state !== 'running') return;
+    if (current.supervised?.id === current.execution.id && clock() - current.supervised.checked > 500) {
+      stop('Recorded movement stopped: no fresh position check for 500 ms');
+      return;
+    }
+    current.renewing = true;
+    try {
+      const reply = await guard('heartbeat', { actionId: current.execution.id,
+        actionSchema: current.actionSchema, observationSchema: current.observationSchema });
+      executionStatus(current, reply?.execution);
+    } catch (e) { if (play === current) stop(e.message); }
+    finally { current.renewing = false; }
   }
 
   function stop(reason) {
@@ -90,9 +145,11 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     const current = play;
     play = null;
     clearInterval(correctionTimer);
+    clearInterval(actionTimer);
+    current.pending = null;
     if (current.correcting) endCorrection(current);
     stopGuard();
-    if (current.trace) worker('trace.close').catch(() => {});
+    if (current.trace) closeTrace(current).catch(() => {});
     status(reason, current.behavior ? { behavior: true, name: current.policyName, treeId: current.treeId ?? null, tree: current.tree ?? null } : {});
   }
 
@@ -161,6 +218,9 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
 
   async function actOn(current, result, arrived) {
     if (current.correcting) return; // the player is in control
+    // A slow result cannot cancel a valid bounded clip merely by reaching the
+    // guard late. It also cannot advance the tree or authorize another action.
+    if (current.sequenceProtocol && current.execution?.id && clock() - result.timestamp > 250) return;
     if (!current.engaged) {
       const { focused } = await guard('focused');
       if (!focused) {
@@ -171,15 +231,27 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       status();
     }
     const observations = [...(result.observations ?? []), ...(result.tracked ?? [])];
-    let buttons, predicted = true, sequence = null, ended = null;
+    const executionAtStep = current.execution;
+    let buttons, predicted = true, sequence = null, action = null, ended = null;
     const asked = now();
     current.predicting = asked;
     if (current.behavior) {
       try {
-        const stepped = await worker('behavior.step', { observations, timestamp: result.timestamp, ageMs: clock() - result.timestamp + current.stepMs + 2 });
+        const dispatch = current.dispatches?.splice(0) ?? [];
+        const stepped = await worker('behavior.step', { observations, timestamp: result.timestamp, ageMs: clock() - result.timestamp + current.stepMs + 2,
+          ...(current.sequenceProtocol ? { execution: executionAtStep } : {}), ...(dispatch.length ? { dispatch } : {}) });
         current.stepMs = 0.8 * current.stepMs + 0.2 * (now() - asked);
         buttons = stepped.buttons;
         sequence = Array.isArray(stepped.sequence) ? stepped.sequence : null;
+        action = stepped.action ?? null;
+        if (action) current.supervised = action.supervised ? { id: action.id, checked: result.timestamp } : null;
+        for (const map of Object.values(stepped.status?.maps ?? {})) {
+          const checked = map?.monitor;
+          if (current.supervised && checked?.actionId === current.supervised.id &&
+              Number.isFinite(checked.observedAt) && checked.observedAt <= result.timestamp) {
+            current.supervised.checked = Math.max(current.supervised.checked, checked.observedAt);
+          }
+        }
         const was = JSON.stringify(current.tree);
         current.tree = stepped.status ?? null;
         ended = stepped.status?.done ?? null;
@@ -187,6 +259,7 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
         if (JSON.stringify(current.tree) !== was && now() - current.treeSent >= 100) { current.treeSent = now(); status(); }
       } catch (e) {
         buttons = current.buttons.map(() => false);
+        sequence = []; // Failed conditions/evaluation must cancel a running clip.
         predicted = false;
         current.missed = String(e?.message ?? e).replace(/^Error: /, '');
       } finally { current.predicting = null; }
@@ -209,6 +282,12 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       current.missed = String(e?.message ?? e).replace(/^Error: /, '');
     } finally { current.predicting = null; }
     if (play !== current || current.correcting) return;
+    // A continuation already authorized by the guard needs no stale apply.
+    // Cancellation and new actions still pass through the guard's checks.
+    if (current.sequenceProtocol && executionAtStep?.state === 'running' && sequence === null && predicted) {
+      await renewAction(current);
+      return;
+    }
     // Where the time went, from the frame's capture to its buttons (the runtime's part, then the policy's)
     const took = result.latency ?? {};
     // The slowest Lua or memory State read for it, by name
@@ -223,7 +302,8 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     current.applying = now();
     try {
       applied = await guard('apply', { buttons, timestamp: result.timestamp, actionSchema: current.actionSchema, observationSchema: current.observationSchema,
-        ...(sequence ? { sequence } : {}) });
+        ...(sequence ? { sequence } : {}), ...(current.sequenceProtocol && action ? { actionId: action.id, durationMs: action.durationMs, ...(Array.isArray(action.keep) && action.keep.length ? { keep: action.keep } : {}) } : {}) });
+      executionStatus(current, applied?.execution);
       current.unconfiguredSince = null;
     } catch (e) {
       current.applying = null;
@@ -244,10 +324,16 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
     current.latency = latency;
     if (predicted) current.actions++; else current.released++;
     // The tree came to its end (its root not looping): it's done, and says how
-    if (ended && play === current) { stop(ended === 'success' ? 'The tree succeeded' : 'The tree failed'); return; }
+    if (ended && play === current) {
+      const detail = typeof current.tree?.text === 'string' ? current.tree.text.trim() : '';
+      stop(ended === 'success' ? 'The tree succeeded' : `The tree failed${detail ? ': ' + detail : ''}`);
+      return;
+    }
     // What it's holding now, and how often it has pressed each button: a policy that decides to press
     // nothing looks the same as one whose presses the game ignores, unless it says which
-    const held = current.buttons.filter((_, i) => buttons[i]).map(b => b.id);
+    const held = current.sequenceProtocol && Array.isArray(applied?.execution?.held)
+      ? current.buttons.filter(b => applied.execution.held.includes(b.vk)).map(b => b.id)
+      : current.buttons.filter((_, i) => buttons[i]).map(b => b.id);
     current.counts = current.counts ?? {};
     for (const id of held) if (!(current.holding ?? []).includes(id)) current.counts[id] = (current.counts[id] ?? 0) + 1;
     if (held.join() !== (current.holding ?? []).join()) { current.holding = held; status(); }
@@ -301,14 +387,24 @@ function createPlay({ runtime, guard, stopGuard, worker, send, now = Date.now, c
       if (!play.frameGap || gap >= play.frameGap.ms || arrived - play.frameGap.at > 10000) play.frameGap = { ms: gap, at: arrived };
     }
     play.lastArrived = arrived;
-    if (play.busy) return;
-    const current = play;
+    if (play.lastTimestamp != null && result.timestamp <= play.lastTimestamp) return;
+    play.lastTimestamp = result.timestamp;
+    if (play.busy) { play.pending = { result, arrived }; return; }
+    processObservation(play, result, arrived);
+  }
+
+  function processObservation(current, result, arrived) {
     current.busy = true;
     actOn(current, result, arrived)
       // The guard refused and let go of every button (focus lost, a stale observation, a held
       // modifier), or the player never switched to the game
       .catch(e => { if (play === current) stop(e.message); })
-      .finally(() => { current.busy = false; });
+      .finally(() => {
+        current.busy = false;
+        const pending = current.pending;
+        current.pending = null;
+        if (play === current && pending) processObservation(current, pending.result, pending.arrived);
+      });
   }
 
   // What FireFly observes changing mid-play would feed the policy inputs it wasn't trained on. The app

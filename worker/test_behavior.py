@@ -291,6 +291,21 @@ class MapTests(unittest.TestCase):
         self.assertEqual(out['done'], 'failure')
         self.assertIn('no way from Takeoff to Ledge (1 link given up on)', out['text'])
 
+    def test_each_link_attempt_is_said_when_it_begins_and_ends(self):
+        # for the trace: which attempt, from where, and how it ended (a failure's cause), each said once
+        b, events = self.go(maps={**MAP, 'approach': {'tree': 'walk'}}), []
+        tick = b.tick
+        b.tick = lambda *a, **k: (out := tick(*a, **k), events.extend(out['events']))[0]
+        run(b, Game(20, jump=0.3))
+        begun = [e for e in events if e['kind'] == 'link']
+        ended = [e for e in events if e['kind'] == 'link-end']
+        self.assertEqual([e['attempt'] for e in begun], list(range(1, len(begun) + 1)))
+        self.assertEqual([e['attempt'] for e in ended], [e['attempt'] for e in begun])
+        self.assertEqual((begun[0]['link'], begun[0]['map'], ended[0]['worked']), ('ab', 'm', True))
+        failed = [e for e in ended if not e['worked']]
+        self.assertTrue(failed and all(e['link'] == 'bc' and e['cause'] and e['why'] for e in failed), failed)
+        self.assertTrue(all('recorded' not in e for e in begun), 'a tree link said it replays a recording')
+
     def test_the_quickest_way_and_how_often_a_link_worked(self):
         doc = {**MAP, 'links': [*MAP['links'], {'id': 'ac', 'from': 'a', 'to': 'c', 'kind': 'tree', 'tree': 'up'}]}
         from behavior import MapRun
@@ -358,7 +373,13 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(out['sequence'][0], [0.0, 0, True])                      # right, by its index, at once
         self.assertTrue(any(s[1] == 1 and s[2] for s in out['sequence']))         # space, later, as pressed
         self.assertEqual(out['status']['nodes'], {'c': 'running', 'root': 'running'})
-        w.close_trace()
+        # closed only by its own file, with the guard's record of the action it stopped on read back on its last frame
+        self.assertEqual(w.close_trace({'file': str(self.root / 'another.jsonl')}), {'trace': None})
+        record = {'id': 1, 'state': 'cancelled', 'cause': 'request', 'startedAt': 0, 'events': [[0, 0, 0.3, 0.4, 'emitted']]}
+        w.close_trace({'file': loaded['trace'], 'dispatch': [record]})
+        run = w.behavior_trace({'file': Path(loaded['trace']).name})
+        self.assertEqual(len(run['frames']), 1)
+        self.assertEqual(run['frames'][-1]['dispatch'], [record])
 
     def test_a_tree_that_isnt_right_says_where(self):
         from worker import Worker

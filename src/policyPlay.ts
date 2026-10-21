@@ -2,7 +2,7 @@
 // says, deleting versions (with the corrections recorded while they played), and training a version again
 // with those corrections. The worker (worker/worker.py) trains, lists and plays them.
 import { buttonLabel } from './Keyboard';
-import type { MapLive } from './mapModel';
+import { mapLookup, type MapLive } from './mapModel';
 import { playGoal, readGraph } from './graphModel';
 
 export const POLICY_VERSION = 3; // what the worker plays (worker.py VERSION)
@@ -36,7 +36,7 @@ export const graphDocumentKey = (scope: string, graphId: string) => `${scope}-do
 export function savedPlayGoal(scope: string, policyId: string) {
   const node = policyNodes(scope).find(p => p.policyId === policyId);
   if (!node) return null;
-  try { return playGoal(readGraph(localStorage.getItem(graphDocumentKey(scope, node.graphId))), policyId); } catch { return null; }
+  try { return playGoal(readGraph(localStorage.getItem(graphDocumentKey(scope, node.graphId))), policyId, mapLookup(scope)); } catch { return null; }
 }
 export function policyNodes(scope: string): PolicyNodeInfo[] {
   try {
@@ -58,7 +58,7 @@ export interface Latency { ageMs: number | null; sentAgeMs: number | null; arriv
 export interface PlayStatus { playing: boolean; waiting?: boolean; correcting?: boolean; corrected?: number; modelId?: string; actions?: number; released?: number; missed?: string | null; holding?: string[]; pressed?: Record<string, number>; keyboardFocus?: boolean | null; reason?: string | null; latency?: Latency | null;
   top?: { id: string; p: number } | null; // the button it was surest of in the latest frame, and how sure
   // where a Goal's play aimed in the latest frame: the point, how far, and from what (its plan, route or Target)
-  heading?: { kind: 'plan' | 'route' | 'target'; x: number; y: number; distance: number } | null;
+  heading?: { kind: 'plan' | 'route' | 'target'; x: number; y: number; distance: number; map?: string; way?: [number, number][]; at?: [number, number] } | null;
   trace?: string | null; // where what it sees is being kept, if it is
   taps?: string[];  // the buttons it taps rather than holds, as the player did
   name?: string;

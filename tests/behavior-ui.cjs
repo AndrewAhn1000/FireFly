@@ -1,6 +1,6 @@
 // A behaviour tree in the Graphs view: what's wrong with a node said on it (the worker's behavior.check), its keys and
 // formulas edited, a clip found in a recording, Run sending the tree with its children in order, its nodes lit while it
-// runs and why it stopped. Needs `npm run build`
+// runs and why it stopped, and a run's recorded movement compared with its recording. Needs `npm run build`
 const { app, BrowserWindow, ipcMain, nativeImage } = require('electron');
 const path = require('node:path'), assert = require('node:assert/strict');
 const root = path.join(__dirname, '..'), wait = ms => new Promise(r => setTimeout(r, ms));
@@ -35,6 +35,19 @@ app.whenReady().then(async () => {
         }
         return { errors, buttons: [] };
       }
+      if (op === 'behavior.traces') return { runs: [{ file: 'run.jsonl', when: '2026-10-19 15-37-26', frames: 3 }] };
+      if (op === 'behavior.trace') return { head: { treeId: 'tree', buttons: ['right', 'space'] }, frames: [0, 500, 1000].map(t => ({
+        t: 1000 + t, now: 1070 + t, keys: ['right'], nodes: { root: 'running' }, text: 'its clip', values: {} })) };
+      // as the worker's replay report: one attempt that diverged at 0.5 s
+      if (op === 'behavior.replay') return { notes: [], attempts: [{ attempt: 1, link: 'recorded:x', map: 'm', recordedMs: 1000, startOffsetPx: 1.5, actionId: 1, durationMs: 1000, startedAt: 999,
+        executor: { state: 'cancelled', cause: 'request', error: null, ranMs: 700, maxLateMs: 0.4, sent: 2, emitted: 2 },
+        ended: { worked: false, cause: 'deviation', why: 'movement deviated' },
+        readings: { fresh: 20, reused: 20, inferred: false, medianGapMs: 42, readLagMs: { median: 3, max: 9 } },
+        thresholdPx: params.thresholdPx, reliableMs: 25, firstOverMs: 500, lastOnsetMs: 500, maxErrorPx: 40, firstOverEvent: 1, continuedMs: 200,
+        series: [[0, 0, 0], [250, 2, 10], [500, 30, 5], [700, 40, 5]],
+        events: [0, 1].map(i => ({ index: i, at: i * 500, button: i ? 'space' : 'right', down: true, sentMs: i * 500 + 0.4, lateMs: 0.4, returnedMs: i * 500 + 0.5, outcome: 'emitted',
+          recorded: { x: 10 * i, y: 100, level: null, nearestMs: 0, interpolated: false }, live: { x: 10 * i + 30 * i, y: 100, level: null, nearestMs: 5, interpolated: true },
+          errorPx: 30 * i, lagMs: i ? null : 0, alignedErrorPx: i ? 30 : 0 })) }] };
       if (op === 'clips.list') return { start: 0, stands: 3, note: null, clips: [
         { from: 1000, to: 3000, ms: 2000, start: [150, 195], end: [480, 145], dx: 330, dy: -50, keys: [[0, 'right', true], [1200, 'space', true]] }] };
       return {};
@@ -107,6 +120,22 @@ app.whenReady().then(async () => {
     require('node:fs').writeFileSync(path.join(root, 'build', 'behavior-ui.png'), (await win.webContents.capturePage()).toPNG());
     win.webContents.send('play:status', { playing: false, behavior: true, treeId: 'tree', name: 'Climb', graphId: 'tree', reason: 'The tree succeeded' });
     await until(`document.querySelector('.bt-status').textContent.includes('Stopped: The tree succeeded')`, 'why it stopped');
+    // Replay: the run's recorded movement against its recording, and a key event clicked going to its moment
+    await js(`document.querySelector('[aria-label="Replay runs"]').click();0`);
+    await until(`document.querySelector('.bt-replay-at')?.textContent.includes('frame 1/3')`, 'the run loaded');
+    await click('Movement');
+    await js(`(()=>{const i=document.querySelector('[aria-label="Divergence threshold"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(i,'12');i.dispatchEvent(new Event('input',{bubbles:true}));})();0`);
+    await click('Compare with recording');
+    await until(`document.querySelectorAll('.rr-events tbody tr').length===2`, 'the key events');
+    const compared = asked.find(([op]) => op === 'behavior.replay')[1];
+    assert.equal(compared.file, 'run.jsonl'); assert.equal(compared.thresholdPx, 12); assert.ok(compared.maps && typeof compared.maps === 'object', 'the map bundle, for older traces');
+    const facts = await js(`document.querySelector('.rr-facts').textContent`);
+    assert.match(facts, /cancelled by request/); assert.match(facts, /first over 12\.0 px at 0\.50 s \(key event #1\)/); assert.match(facts, /went on 0\.20 s after it/);
+    assert.match(facts, /read 3 ms after capture/);
+    assert.ok(await js(`document.querySelectorAll('.rr-events tbody tr')[1].classList.contains('rr-first')`), 'the first event over the threshold marked');
+    assert.match(await js(`document.querySelectorAll('.rr-events tbody tr')[1].textContent`), /\(10, 100\).*\(40, 100\) ~5 ms.*30\.0 px.*can’t tell/);
+    await js(`document.querySelectorAll('.rr-events tbody tr')[1].click();0`);
+    await until(`document.querySelector('.bt-replay-at').textContent.includes('frame 2/3')`, 'the replay at that key event');
     const logged = errors.filter(e => !/DevTools|Autofill|ResizeObserver loop/.test(e));
     assert.equal(logged.length, 0, 'Console errors: ' + logged.join(' | '));
     console.log('Behavior UI: ok');

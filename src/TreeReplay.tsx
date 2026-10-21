@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { buttonLabel } from './Keyboard';
 import { cleanError } from './policyPlay';
 import { BT, type BtNode } from './behaviorModel';
+import ReplayReport from './ReplayReport';
 
 // Stepping through a run of a behaviour tree, frame by frame (the worker's behavior.traces and behavior.trace, from
 // <root>/traces/behavior): which nodes it reached and how each answered (lit on the tree as it was), what it held and
@@ -22,9 +23,11 @@ const show = (v: unknown): string => v == null ? '—' : Array.isArray(v) ? (v.l
   : typeof v === 'number' ? String(Math.round(v * 100) / 100) : typeof v === 'object' ? JSON.stringify(v).slice(0, 60) : String(v);
 const same = (a?: Frame, b?: Frame) => !!a && !!b && JSON.stringify([a.nodes, a.trees, a.keys]) === JSON.stringify([b.nodes, b.trees, b.keys]);
 
-export default function TreeReplay({ treeId, labels, nodes, onFrame }: { treeId: string; labels: Record<string, string>; nodes: BtNode[]; onFrame(f: ReplayFrame | null): void }) {
+// maps: the tree's map bundle, for comparing replays in runs from before traces kept what each link replays
+export default function TreeReplay({ treeId, labels, nodes, maps, onFrame }: { treeId: string; labels: Record<string, string>; nodes: BtNode[]; maps: Record<string, unknown>; onFrame(f: ReplayFrame | null): void }) {
   const [runs, setRuns] = useState<Run[] | null>(null), [file, setFile] = useState(''), [trace, setTrace] = useState<Trace | null>(null);
   const [at, setAt] = useState(0), [playing, setPlaying] = useState(false), [error, setError] = useState('');
+  const [comparing, setComparing] = useState(false);
   const list = async () => {
     try {
       const r = (await window.bridge.policy.invoke('behavior.traces', { treeId })) as { runs: Run[] };
@@ -52,6 +55,8 @@ export default function TreeReplay({ treeId, labels, nodes, onFrame }: { treeId:
     return () => clearTimeout(timer);
   }, [playing, at, frames]);
   const step = (k: number) => { setPlaying(false); setAt(Math.max(0, Math.min(frames.length - 1, k))); };
+  // the frame of a moment (a capture time): the first at or after it
+  const seek = (t: number) => { const k = frames.findIndex(f => f.t >= t); step(k < 0 ? frames.length - 1 : k); };
   const change = (dir: 1 | -1) => { let k = at + dir; while (k > 0 && k < frames.length - 1 && same(frames[k], frames[at])) k += dir; step(k); };
   const named = useMemo(() => new Map(nodes.map(n => [n.id, n.data.label || BT[n.data.kind]?.title || n.data.kind])), [nodes]);
   const start = frames[0]?.now ?? 0;
@@ -72,9 +77,12 @@ export default function TreeReplay({ treeId, labels, nodes, onFrame }: { treeId:
       <button className="modal-btn" aria-label="Next change" title="On to where what it does next changes" disabled={!frames.length} onClick={() => change(1)}>»</button>
       <input type="range" aria-label="Frame" min={0} max={Math.max(0, frames.length - 1)} value={Math.min(at, Math.max(0, frames.length - 1))} disabled={!frames.length}
         onChange={e => step(Number(e.target.value))} />
+      <button className={`modal-btn ${comparing ? 'primary' : ''}`} aria-pressed={comparing} disabled={!file}
+        title="Each recorded movement this run replayed, against its recording" onClick={() => setComparing(c => !c)}>Movement</button>
       <span className="bt-replay-at">{frame ? `frame ${at + 1}/${frames.length} · ${((frame.now - start) / 1000).toFixed(2)} s` : ''}</span>
     </div>
     {error && <div className="pg-warn">{error}</div>}
+    {comparing && file && <ReplayReport key={file} file={file} maps={maps} onSeek={seek} />}
     {frame && <div className="bt-replay-body">
       <div>
         <div className="pg-section-hd">Doing</div>

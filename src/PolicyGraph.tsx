@@ -10,11 +10,12 @@ import { buttonLabel } from './Keyboard';
 import { cleanError, correctionShareHint, correctionsOf, DEFAULT_CORRECTION_SHARE, deleteVersions, MAX_CORRECTION_SHARE, meanF1, newestFirst, percent, playingText, policyNodes, POLICY_VERSION, stopHow, type PlayStatus, type PolicyVersion, type Schema } from './policyPlay';
 import { NEW_INPUT, aliasFrom, renameIn } from './formulaInputs';
 import { PreservedTextarea, PreservedInput } from './PreservedInputs';
+import { mapLookup } from './mapModel';
 import {
-  FORMULA_INPUT_TYPES, GOAL_DEFAULTS, GOAL_FACING, GOAL_POSITION, GOAL_TARGET, GRID_CELL, PLANNER_DATA, PLANNER_DESTINATION, PLANNER_LEVEL, PLANNER_MAP,
-  PLAN_CELL, ROUTE_AHEAD_S, SPATIAL_BOUNDS, planDefaults, planShapes, SPATIAL_FACING, SPATIAL_POINT, SPATIAL_RADII, SPATIAL_REACH, VALUE_TYPES, compilePolicy, formulaSpecs, gridSpecs,
+  FORMULA_INPUT_TYPES, GOAL_DEFAULTS, GOAL_FACING, GOAL_POSITION, GOAL_TARGET, GOAL_DESTINATION, GOAL_AVOID, GRID_CELL,
+  ROUTE_AHEAD_S, SPATIAL_BOUNDS, goalProblem, headsOf, SPATIAL_FACING, SPATIAL_POINT, SPATIAL_RADII, SPATIAL_REACH, VALUE_TYPES, compilePolicy, formulaSpecs, gridSpecs,
   fieldApplies, goalColumns, goalSpecs, makesCycle, migrateGraph, nameOf, playGoal, readGraph, spatialColumns, spatialFields, spatialSpec, spatialSpecs, takesMany,
-  type Compiled, type FormulaCheck, type FormulaData, type GoalData, type GraphDoc, type PlannerData, type GraphNode, type GridData, type PolicyData, type RecordingsData,
+  type Compiled, type FormulaCheck, type FormulaData, type GoalData, type GoalHeads, type GraphDoc, type MapLookup, type GraphNode, type GridData, type PolicyData, type RecordingsData,
   type SpatialData, type SpatialField, type SpatialPick, type SpatialRead, type SpatialValue, type StateData,
 } from './graphModel';
 
@@ -78,8 +79,8 @@ interface Ctx {
   wiredInto(nodeId: string, handle: string): string | null; // the name of what's wired into a node's input
   wiredAll(nodeId: string, handle: string): string[];       // every one, for an input that takes several
   nodeInto(nodeId: string, handle: string): GraphNode | undefined; // the node wired into a node's input
-  planPictures: Record<string, PlanPicture | { error: string }>;     // each planning Planner's map, by node id
-  measurePlan(nodeId: string, sample: LiveSample): Promise<PlanPicture | { error: string }>; // one on what FireFly observes now
+  maps: { id: string; name: string }[]; lookup: MapLookup;  // the library's maps, a Goal heads over
+  goalProblem(nodeId: string): string | null;               // what stops a Goal heading where it says
   nodesOutOf(nodeId: string): GraphNode[];                  // the nodes a node's output is wired into
   measureSpatial(nodeId: string, sample: LiveSample): Promise<SpatialCheck | null>; // a Spatial node on one sample (its preview, live)
   latestLive(): LiveSample | null; // what FireFly observed last, while a session runs
@@ -721,7 +722,15 @@ function GoalNode({ id, data, selected }: NodeProps<GraphNode>) {
   const position = g.wiredInto(id, GOAL_POSITION), facing = g.wiredInto(id, GOAL_FACING), target = g.wiredInto(id, GOAL_TARGET);
   const columns = check?.columns.length ? check.columns : goalColumns(d.name, !!facing);
   const [low, high] = d.lookAhead;
-  const planner = g.nodeInto(id, GOAL_TARGET)?.data.kind === 'planner' ? g.nodeInto(id, GOAL_TARGET)!.data as PlannerData : null;
+  const h = headsOf(d), setHeads = (heads: GoalHeads) => g.update(id, { heads });
+  const routes = g.recordings.filter(r => r.status === 'complete' && !r.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started);
+  const found = h.kind === 'map' && h.map ? g.lookup(h.map) : null, problem = g.goalProblem(id);
+  const destination = g.wiredInto(id, GOAL_DESTINATION), avoidNode = g.nodeInto(id, GOAL_AVOID);
+  const avoidInputs = avoidNode?.data.kind === 'spatial' ? (avoidNode.data as SpatialData).inputs : [];
+  const levels = [...new Set((found?.doc.places ?? []).map(p => p.level))];
+  const aim = h.kind === 'target' ? null : h.aheadS;
+  const heading = (kind: string): GoalHeads => kind === 'map' ? { kind: 'map', map: g.maps[0]?.id ?? '', destination: { kind: 'place', place: '' }, aheadS: ROUTE_AHEAD_S }
+    : kind === 'route' ? { kind: 'route', recording: routes[0]?.id ?? '', aheadS: ROUTE_AHEAD_S } : { kind: 'target' };
   const seconds = (i: 0 | 1) => (e: ChangeEvent<HTMLInputElement>) => {
     const v = Math.min(30, Math.max(0.1, Number(e.target.value) || 0.1)), next: [number, number] = [d.lookAhead[0], d.lookAhead[1]];
     next[i] = v;
@@ -737,9 +746,69 @@ function GoalNode({ id, data, selected }: NodeProps<GraphNode>) {
       {position ? <>Position: <b>{g.labels[position] ?? position}</b></> : <span className="pg-unwired">Position: wire the player’s in</span>}</div>
     <div className="pg-port" title="True when facing left: the way to the target is then forward or back, rather than right or left"><PgHandle type="target" position={Position.Left} id={GOAL_FACING} />
       {facing ? <>Facing left: <b>{g.labels[facing] ?? facing}</b></> : 'Facing left (optional): else right and left'}</div>
-    <div className="pg-port" title="Where play goes: a Planner (along a recording's route), or a position, such as a formula vec(1200, 300) or a State the recordings hold. Training doesn't use it"><PgHandle type="target" position={Position.Left} id={GOAL_TARGET} />
-      {planner ? <>Target: <b>{planner.name || 'planner'}</b>{planner.mode === 'route' ? <small className="pg-dim"> (follows a recording)</small> : null}</>
-        : target ? <>Target: <b>{g.labels[target] ?? target}</b></> : <span className="pg-unwired">Target: where play goes, such as a Planner</span>}</div>
+    <div className="pg-settings">
+      <label className="nodrag" title="Where play goes. Training doesn't use it: it aims at where you went">Heads for
+        <select aria-label="Goal heads for" value={h.kind} onChange={e => setHeads(heading(e.target.value))}>
+          <option value="target">What’s wired into Target</option>
+          <option value="map">A place on a map</option>
+          <option value="route">Along a recording</option>
+        </select></label>
+    </div>
+    {h.kind === 'target' && <div className="pg-port" title="A position, such as a formula vec(1200, 300) or a State the recordings hold"><PgHandle type="target" position={Position.Left} id={GOAL_TARGET} />
+      {target ? <>Target: <b>{g.labels[target] ?? target}</b></> : <span className="pg-unwired">Target: where play goes</span>}</div>}
+    {h.kind === 'map' && <>
+      <div className="pg-settings">
+        <label className="nodrag" title="A Map graph: its places and links, and what it learned on a grid from your recordings">Map
+          <select aria-label="Goal map" value={h.map} onChange={e => setHeads({ ...h, map: e.target.value, destination: { kind: 'place', place: '' } })}>
+            {!h.map && <option value="">Choose a map…</option>}
+            {g.maps.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            {h.map && !g.maps.some(m => m.id === h.map) && <option value={h.map}>(deleted map)</option>}
+          </select></label>
+        <label className="nodrag" title="Where on the map play heads">To
+          <select aria-label="Goal destination" value={h.destination.kind === 'place' ? `place:${h.destination.place}` : h.destination.kind}
+            onChange={e => setHeads({ ...h, destination: e.target.value === 'input' ? { kind: 'input' } : e.target.value === 'end' ? { kind: 'end', recording: routes[0]?.id ?? '' }
+              : { kind: 'place', place: e.target.value.slice(6) } })}>
+            {h.destination.kind === 'place' && !h.destination.place && <option value="place:">Choose a place…</option>}
+            {levels.map(level => <optgroup key={String(level)} label={level == null ? 'Places' : `Level ${level}`}>
+              {found!.doc.places.filter(p => p.level === level).map(p => <option key={p.id} value={`place:${p.id}`}>{p.name || '(a place)'}</option>)}</optgroup>)}
+            <option value="input">What’s wired into Destination</option>
+            <option value="end">Where a recording ended</option>
+          </select></label>
+        {h.destination.kind === 'end' && <label className="nodrag">Recording
+          <select aria-label="Destination recording" value={h.destination.recording} onChange={e => setHeads({ ...h, destination: { kind: 'end', recording: e.target.value } })}>
+            {!h.destination.recording && <option value="">Choose a recording…</option>}
+            {routes.map(r => <option key={r.id} value={r.id}>{r.name} · {Math.round(r.durationMs / 1000)} s</option>)}
+          </select></label>}
+        <label className="nodrag" title="How far along the way it aims from where you are. Within the look-ahead, so its targets are like training's">Aim ahead (s)
+          <input aria-label="Plan aim ahead" type="number" min={0.1} max={30} step={0.5} value={h.aheadS}
+            onChange={e => setHeads({ ...h, aheadS: Math.min(30, Math.max(0.1, Number(e.target.value) || 0.1)) })} /></label>
+      </div>
+      {h.destination.kind === 'input' && <div className="pg-port" title="A position play heads for, such as a portal's or a monster's"><PgHandle type="target" position={Position.Left} id={GOAL_DESTINATION} />
+        {destination ? <>Destination: <b>{g.labels[destination] ?? destination}</b></> : <span className="pg-unwired">Destination: wire a position in</span>}</div>}
+      <div className="pg-port" title="A Spatial node: tick the inputs whose shapes (monsters) the way keeps away from"><PgHandle type="target" position={Position.Left} id={GOAL_AVOID} />
+        {avoidNode ? <>Keep away from: <b>{nameOf(avoidNode) ?? 'spatial'}</b></> : <span className="pg-dim">Keep away from (optional): a Spatial node</span>}</div>
+      {avoidInputs.length > 0 && <div className="pg-plan-on" aria-label="Shapes to keep away from">
+        {avoidInputs.map(alias => <label key={alias} className="nodrag" title="Links ending near these shapes, as they are each moment, take 1.5 s longer, so a way round them is planned when there is one">
+          <input type="checkbox" checked={(h.avoid ?? []).includes(alias)}
+            onChange={e => setHeads({ ...h, avoid: e.target.checked ? [...(h.avoid ?? []), alias] : (h.avoid ?? []).filter(a => a !== alias) })} />{alias}</label>)}
+      </div>}
+      <label className="nodrag pg-check" title="Playing, a link that hasn't happened after twice its usual time (and half a second) costs four times as much for the rest of the run, so it plans another way if there is one. How each of the map's own links goes is kept with the map either way">
+        <input type="checkbox" aria-label="Learn from failure" checked={h.learn !== false} onChange={e => setHeads({ ...h, learn: e.target.checked })} />Try another way when a link fails</label>
+      {found && <div className="pg-hint">{found.doc.places.length} places and {found.doc.links.length} links of your own{found.doc.grid ? `, and a grid it learns from ${found.doc.grid.recordings ? `${found.doc.grid.recordings.length} recording${found.doc.grid.recordings.length === 1 ? '' : 's'}` : 'every recording'}` : ''}. Open {found.name} in Graphs to change them.</div>}
+    </>}
+    {h.kind === 'route' && <div className="pg-settings">
+      <label className="nodrag" title="The recording of you doing it, such as a run of the jump quest from start to finish">Route
+        <select aria-label="Route recording" value={h.recording} onChange={e => setHeads({ ...h, recording: e.target.value })}>
+          {!h.recording && <option value="">Choose a recording…</option>}
+          {h.recording && !routes.some(r => r.id === h.recording) && <option value={h.recording}>(deleted)</option>}
+          {routes.map(r => <option key={r.id} value={r.id}>{r.name} · {Math.round(r.durationMs / 1000)} s</option>)}
+        </select></label>
+      <label className="nodrag" title="How far along the route it aims from where you are on it. Within the look-ahead, so its targets are like training's">Aim ahead (s)
+        <input aria-label="Aim ahead" type="number" min={0.1} max={30} step={0.5} value={h.aheadS}
+          onChange={e => setHeads({ ...h, aheadS: Math.min(30, Math.max(0.1, Number(e.target.value) || 0.1)) })} /></label>
+    </div>}
+    {problem && <div className="pg-warn">{problem}</div>}
+    {aim != null && (aim < low || aim > high) && <div className="pg-warn">Aim ahead within the look-ahead ({low}–{high} s), so its targets are like the ones it trained on.</div>}
     <div className="pg-settings">
       <label className="nodrag" title="Training aims each moment at where the player was this long after it">Look ahead (s)
         <span className="pg-pair"><input aria-label="Look ahead from" type="number" min={0.1} max={30} step={0.5} value={low} onChange={seconds(0)} />–<input aria-label="Look ahead to" type="number" min={0.1} max={30} step={0.5} value={high} onChange={seconds(1)} /></span></label>
@@ -748,307 +817,19 @@ function GoalNode({ id, data, selected }: NodeProps<GraphNode>) {
       <label className="nodrag" title="A target nearer than this teaches nothing about getting anywhere, and is left out: standing still, fighting">At least (px) away
         <input type="number" min={0} max={10000} value={d.minMove} onChange={e => g.update(id, { minMove: Math.min(10000, Math.max(0, Math.round(Number(e.target.value) || 0))) })} /></label>
     </div>
-    <div className="pg-hint">Training aims each moment at where you got to {low === high ? `${low} s` : `${low}–${high} s`} later, so it learns to get anywhere you went; playing, it {planner ? `goes where ${planner.name || 'the planner'} says` : 'goes to the Target'}.
+    <div className="pg-hint">Training aims each moment at where you got to {low === high ? `${low} s` : `${low}–${high} s`} later, so it learns to get anywhere you went; playing, it {h.kind === 'map' ? 'heads along the map' : h.kind === 'route' ? 'follows the recording' : 'goes to the Target'}.
       {d.targets > 1 ? ` Each moment is ${d.targets} rows.` : ''}</div>
-    {!target && <div className="pg-warn">Without a Target it trains, but has nowhere to go when it plays.</div>}
+    {h.kind === 'target' && !target && <div className="pg-warn">Without a Target it trains, but has nowhere to go when it plays.</div>}
     <label className="nodrag pg-check" title="Per button the policy presses, whether the plan's next move uses it (next.<button>) and how far along the way until a move does (soon.<button>, up to 400 px): in training, toward where you got to; playing, toward the destination. So it needn't work out which keys get there from the way alone">
-      <input type="checkbox" aria-label="Plan next move as values" checked={!!d.hint} disabled={planner?.mode !== 'plan'}
+      <input type="checkbox" aria-label="Plan next move as values" checked={!!d.hint} disabled={h.kind !== 'map'}
         onChange={e => g.update(id, { hint: e.target.checked })} />Tell it the plan’s next move</label>
-    {d.hint && planner?.mode !== 'plan' && <div className="pg-warn">The plan’s next move needs a Planner planning from what you’ve done in its Target.</div>}
-    {d.hint && planner?.mode === 'plan' && <div className="pg-hint">Adds next.&lt;button&gt; and soon.&lt;button&gt; for each button the policy presses.</div>}
+    {d.hint && h.kind !== 'map' && <div className="pg-warn">The plan’s next move is the next link of a map: head for a place on a map.</div>}
+    {d.hint && h.kind === 'map' && <div className="pg-hint">Adds next.&lt;button&gt; and soon.&lt;button&gt; for each button the policy presses.</div>}
     {check?.error ? <div className="pg-error">{check.error}</div> : check?.moved != null
       ? <div className="pg-hint">In the latest sample you went {fmt(check.moved)} px in {high} s{check.moved < d.minMove ? ', under the least, so that moment has no row' : ''}.</div> : null}
     <div className="nowheel pg-spatial-values">
       {columns.map((c, i) => <div key={c}><span>{c.slice(d.name.trim().length + 1)}</span><b>{check?.values ? fmt(check.values[i]) : ''}</b></div>)}
     </div>
-    <PgHandle type="source" position={Position.Right} id="out" />
-  </div>;
-}
-
-// A Planner's map, from the worker (worker/planner.py, Planner.picture): the places it learned, the moves between
-// them, and with a destination the way there from the player, the target, the next move and how long it takes
-interface PlanPicture {
-  places: [number, number][]; moves: [number, number][]; count: { places: number; moves: number }; recordings: number;
-  path?: [number, number][] | null; target?: [number, number] | null; position?: [number, number] | null;
-  destination?: [number, number] | null; next?: { keys: string[]; ms: number; seen: number } | null; seconds?: number | null;
-  level?: string | null; error?: string | null;
-}
-const planBounds = (p: PlanPicture): [number, number, number, number] => {
-  const pts = [...p.places, ...(p.position ? [p.position] : []), ...(p.destination ? [p.destination] : [])];
-  if (!pts.length) return [0, 0, 1, 1];
-  const xs = pts.map(q => q[0]), ys = pts.map(q => q[1]), pad = 30;
-  return [Math.min(...xs) - pad, Math.min(...ys) - pad, Math.max(...xs) + pad, Math.max(...ys) + pad];
-};
-// Draws a Planner's map: the level's shapes (from its Spatial node) faint, the moves fainter, the places, the way to
-// the destination bold, the player, the target and the destination's flag
-function drawPlan(c: HTMLCanvasElement, p: PlanPicture, view: SpatialView, shapes: { points: [number, number][]; color: string }[], ratio = 1) {
-  const g = c.getContext('2d')!, width = c.width / ratio, height = c.height / ratio;
-  g.setTransform(ratio, 0, 0, ratio, 0, 0);
-  const at = (x: number, y: number): [number, number] => [width / 2 + (x - view.cx) * view.scale, height / 2 + (y - view.cy) * view.scale];
-  g.fillStyle = '#0b0b0b'; g.fillRect(0, 0, width, height);
-  g.lineWidth = 1.5;
-  for (const s of shapes) {
-    g.strokeStyle = s.color; g.globalAlpha = 0.35; g.beginPath();
-    s.points.forEach(([x, y], i) => { const [u, v] = at(x, y); if (i) g.lineTo(u, v); else g.moveTo(u, v); });
-    g.stroke();
-  }
-  g.globalAlpha = 1; g.strokeStyle = 'rgba(255,255,255,0.13)'; g.lineWidth = 1; g.beginPath();
-  for (const [a, b] of p.moves) { const [x0, y0] = at(...p.places[a]), [x1, y1] = at(...p.places[b]); g.moveTo(x0, y0); g.lineTo(x1, y1); }
-  g.stroke();
-  g.fillStyle = 'rgba(255,255,255,0.45)';
-  for (const q of p.places) { const [x, y] = at(...q); g.fillRect(x - 1, y - 1, 2, 2); }
-  if (p.path?.length) {
-    g.strokeStyle = '#5aa9e6'; g.lineWidth = 2.5; g.beginPath();
-    p.path.forEach((q, i) => { const [x, y] = at(...q); if (i) g.lineTo(x, y); else g.moveTo(x, y); });
-    g.stroke();
-  }
-  if (p.position) { const [x, y] = at(...p.position); g.fillStyle = '#ffffff'; g.beginPath(); g.arc(x, y, 4.5, 0, Math.PI * 2); g.fill(); }
-  if (p.target) { const [x, y] = at(...p.target); g.strokeStyle = '#f0a020'; g.lineWidth = 2; g.beginPath(); g.arc(x, y, 6, 0, Math.PI * 2); g.stroke(); }
-  if (p.destination) {
-    const [x, y] = at(...p.destination); g.strokeStyle = '#ffffff'; g.lineWidth = 1.5;
-    g.beginPath(); g.moveTo(x, y); g.lineTo(x, y - 16); g.lineTo(x + 11, y - 12); g.lineTo(x, y - 8); g.stroke();
-  }
-}
-const nextMove = (p: PlanPicture) => p.next ? `next: ${p.next.keys.length ? p.next.keys.map(buttonLabel).join(' + ') : 'nothing held'} · ${(p.next.ms / 1000).toFixed(1)} s · seen ${p.next.seen}×` : '';
-
-function PlanMap({ picture, shapes, onPick }: { picture: PlanPicture; shapes: { points: [number, number][]; color: string }[]; onPick(x: number, y: number, level: string | null): void }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const bounds = planBounds(picture), w = Math.max(bounds[2] - bounds[0], 1), h = Math.max(bounds[3] - bounds[1], 1);
-  const width = 236, height = Math.round(Math.min(220, Math.max(70, width * h / w)));
-  const view = fitView(bounds, width, height);
-  useEffect(() => { if (ref.current) drawPlan(ref.current, picture, view, shapes); });
-  return <canvas ref={ref} width={width} height={height} className="nodrag pg-grid-picture" aria-label="Planner map" style={{ cursor: 'crosshair' }}
-    title="Click to put the destination there" onClick={e => {
-      const r = e.currentTarget.getBoundingClientRect(), k = width / r.width;  // the canvas is scaled with the graph's zoom
-      onPick(Math.round(view.cx + ((e.clientX - r.left) * k - width / 2) / view.scale), Math.round(view.cy + ((e.clientY - r.top) * k - height / 2) / view.scale), picture.level ?? null);
-    }} />;
-}
-
-// A Planner's map, large: live while a capture session runs (what FireFly observes now, about three times a second),
-// else from where its first recording ended. The wheel zooms where the pointer is, dragging moves it, and a click
-// (without dragging) puts the destination there
-function PlanPreview({ name, recorded, shapes, capturing, measure, onPick, onClose }: {
-  name: string; recorded: PlanPicture | { error: string } | undefined; shapes: { points: [number, number][]; color: string }[];
-  capturing: boolean; measure(sample: LiveSample): Promise<PlanPicture | { error: string }>; onPick(x: number, y: number, level: string | null): void; onClose(): void;
-}) {
-  const [live, setLive] = useState<PlanPicture | { error: string } | null>(null);
-  const repick = useRef(false); // measure again now (a destination was just clicked), new frame or not
-  const measured = useRef(measure);
-  measured.current = measure;
-  useEffect(() => {
-    if (!capturing) { setLive(null); return; }
-    let latest: LiveSample | null = null, fresh = false, busy = false, alive = true;
-    const off = window.bridge.on('runtime:event', (msg: unknown) => {
-      const { event, result } = msg as { event: string; result: { observations?: unknown[]; tracked?: unknown[] } };
-      if (event !== 'observations' || !result) return;
-      latest = { observations: [...(result.observations ?? []), ...(result.tracked ?? [])] };
-      latestSample.current = latest;
-      fresh = true;
-    });
-    const timer = setInterval(() => {
-      if (latestSample.current && !latest) latest = latestSample.current;
-      if ((!fresh && !repick.current) || busy || !latest) return;
-      repick.current = false;
-      fresh = false; busy = true;
-      measured.current(latest).then(r => { if (alive) setLive(r); }).catch(e => { if (alive) setLive({ error: cleanError(e) }); }).finally(() => { busy = false; });
-    }, 300);
-    return () => { alive = false; off(); clearInterval(timer); };
-  }, [capturing]);
-  const latestSample = useRef<LiveSample | null>(null);
-  const [picked, setPicked] = useState<[number, number] | null>(null);
-  const shownSource = live && 'places' in live ? live : recorded && 'places' in recorded ? recorded : null;
-  // What was clicked shows at once, until the worker's next picture (which has it)
-  useEffect(() => { setPicked(null); }, [recorded, live]);
-  const source = shownSource && picked ? { ...shownSource, destination: picked, path: null, target: null, next: null, seconds: null } : shownSource;
-  const ref = useRef<HTMLCanvasElement>(null), box = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ width: 900, height: 600 });
-  const [view, setView] = useState<SpatialView | null>(null);
-  const drag = useRef<{ x: number; y: number; view: SpatialView; moved: boolean } | null>(null);
-  const ratio = window.devicePixelRatio || 1;
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
-    const fit = () => setSize({ width: Math.max(200, Math.floor(el.clientWidth)), height: Math.max(200, Math.floor(el.clientHeight)) });
-    fit();
-    const observer = new ResizeObserver(fit);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  const shown = view ?? fitView(source ? planBounds(source) : [0, 0, 1, 1], size.width, size.height);
-  useEffect(() => { if (ref.current && source) drawPlan(ref.current, source, shown, shapes, ratio); });
-  useEffect(() => {
-    const key = (e: KeyboardEvent) => { e.stopPropagation(); if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', key, true);
-    return () => window.removeEventListener('keydown', key, true);
-  }, [onClose]);
-  const toMap = (e: { clientX: number; clientY: number }): [number, number] => {
-    const r = ref.current!.getBoundingClientRect();
-    return [shown.cx + (e.clientX - r.left - size.width / 2) / shown.scale, shown.cy + (e.clientY - r.top - size.height / 2) / shown.scale];
-  };
-  const problem = (live && 'error' in live && live.error) || (source?.error ?? null) || (!source && recorded && 'error' in recorded ? recorded.error : null);
-  return createPortal(<div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-    <div className="modal-card pg-spatial-preview" role="dialog" aria-label={`Preview of ${name}`} onClick={e => e.stopPropagation()}>
-      <div className="modal-header pg-spatial-preview-hd"><span className="modal-title">{name}: {source === live && live
-          ? <><span className="pg-live-dot" />live, from where you are now</> : source ? 'from where its first recording ended' : 'nothing to draw yet'}</span>
-        <span className="pg-spatial-preview-tools">
-          <button className="modal-btn" onClick={() => setView(null)}>Fit</button>
-          <button className="modal-btn" onClick={onClose}>Close</button>
-        </span></div>
-      <div className="pg-spatial-preview-body">
-        <div className="pg-spatial-preview-canvas" ref={box}>
-          {!source && <div className="pg-spatial-empty">{problem ?? 'Working out its places and moves…'}</div>}
-          <canvas ref={ref} width={size.width * ratio} height={size.height * ratio} style={{ width: size.width, height: size.height, cursor: 'crosshair' }}
-            aria-label="Planner preview"
-            onWheel={e => {
-              const [x, y] = toMap(e), scale = Math.min(200, Math.max(1e-4, shown.scale * Math.exp(-e.deltaY * 0.0015)));
-              setView({ cx: x - (x - shown.cx) * shown.scale / scale, cy: y - (y - shown.cy) * shown.scale / scale, scale });
-            }}
-            onMouseDown={e => { drag.current = { x: e.clientX, y: e.clientY, view: shown, moved: false }; }}
-            onMouseMove={e => {
-              const d = drag.current;
-              if (!d) return;
-              if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 8) d.moved = true;
-              if (d.moved) setView({ ...d.view, cx: d.view.cx - (e.clientX - d.x) / d.view.scale, cy: d.view.cy - (e.clientY - d.y) / d.view.scale });
-            }}
-            onMouseUp={e => {
-              const d = drag.current; drag.current = null;
-              if (d && !d.moved && source) { const [x, y] = toMap(e); setPicked([Math.round(x), Math.round(y)]); repick.current = true; onPick(Math.round(x), Math.round(y), source.level ?? null); }
-            }}
-            onMouseLeave={() => { drag.current = null; }} />
-        </div>
-        <div className="pg-spatial-legend" aria-label="Plan">
-          {source && <>
-            <div><b>{source.count.places.toLocaleString()}</b> places · <b>{source.count.moves.toLocaleString()}</b> moves from {source.recordings} recording{source.recordings === 1 ? '' : 's'}{source.level != null ? ` · level ${source.level}` : ''}</div>
-            {source.path ? <div>The way there: {(source.seconds ?? 0).toFixed(1)} s · {nextMove(source)}</div>
-              : <div className="pg-hint">{source.destination ? '' : 'Click the map where play heads.'}</div>}
-          </>}
-          {problem && <div className="pg-warn">{problem}</div>}
-          <div className="pg-hint">● you · <span style={{ color: '#f0a020' }}>○</span> where it aims · <span style={{ color: '#5aa9e6' }}>━</span> the way there · ⚑ destination · dots and faint lines: the places and moves of your recordings. Click to put the destination there; drag to move, wheel to zoom.</div>
-        </div>
-      </div>
-    </div></div>, document.body);
-}
-
-// Where play heads, wired into a Goal's Target (graphModel.ts, PlannerData): along where you went in a recording, or
-// planned over the places and moves of your recordings, aiming a little ahead each time, so play gets targets like
-// the ones it trained on
-function PlannerNode({ id, data, selected }: NodeProps<GraphNode>) {
-  const g = useGraph(), d = data as PlannerData;
-  const map = g.wiredInto(id, PLANNER_MAP);
-  const plan = d.plan ?? planDefaults();
-  const level = g.wiredInto(id, PLANNER_LEVEL), destination = g.wiredInto(id, PLANNER_DESTINATION);
-  const learnFrom = g.nodeInto(id, PLANNER_DATA);
-  const recordedPicture = g.planPictures[id];
-  const [previewing, setPreviewing] = useState(false);
-  // Refreshed by hand: from where you are now while a session runs, kept until the node changes; else worked out again
-  const [snapshot, setSnapshot] = useState<{ picture: PlanPicture; at: number; key: string } | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-  const planKey = JSON.stringify([d.plan, d.mode, g.wiredInto(id, PLANNER_LEVEL), g.wiredInto(id, PLANNER_DESTINATION), g.nodeInto(id, PLANNER_DATA)?.id]);
-  const live = snapshot?.key === planKey && g.capturing ? snapshot : null;
-  const picture = recordedPicture;
-  const shown = live?.picture ?? recordedPicture;
-  const refresh = async () => {
-    const sample = g.capturing ? g.latestLive() : null;
-    if (!sample) { setSnapshot(null); g.refreshChecks(); return; }
-    setRefreshing(true);
-    try {
-      const measured = await g.measurePlan(id, sample);
-      if ('places' in measured) setSnapshot({ picture: measured, at: Date.now(), key: planKey });
-    } finally { setRefreshing(false); }
-  };
-  const setPlan = (patch: Partial<NonNullable<PlannerData['plan']>>) => g.update(id, { plan: { ...plan, ...patch } });
-  // The level's shapes, under its map: the Spatial node's latest sample
-  const mapNode = g.nodeInto(id, PLANNER_MAP);
-  const mapInputs = mapNode?.data.kind === 'spatial' ? (mapNode.data as SpatialData).inputs : [];
-  const sets = mapNode?.data.kind === 'spatial' ? g.spatialChecks.get((mapNode.data as SpatialData).name.trim())?.picture?.sets ?? [] : [];
-  const shapes = sets.flatMap((s, i) => s.shapes.map(shape => ({ points: shape.points as [number, number][], color: SET_COLORS[i % SET_COLORS.length] })));
-  // Recordings whose route play can follow: the player's own, newest first
-  const routes = g.recordings.filter(r => r.status === 'complete' && !r.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started);
-  // The Goals it's the Target of, whose look-ahead its aim should be within
-  const goals = g.nodesOutOf(id).filter(n => n.data.kind === 'goal').map(n => n.data as GoalData);
-  const aim = d.mode === 'plan' ? plan.aheadS : d.route.aheadS;
-  const outside = goals.find(goal => aim < goal.lookAhead[0] || aim > goal.lookAhead[1]);
-  return <div className={`pg-node pg-planner ${selected ? 'pg-selected' : ''}`}>
-    <div className="pg-title"><span className="pg-glyph">⤳</span>
-      <PreservedInput className="nodrag pg-name" aria-label="Planner name" value={d.name} placeholder="Name" onChange={e => g.update(id, { name: e.target.value })} />
-      <button className="nodrag pg-x pg-node-delete" title={`Delete ${d.name || 'planner'}`} aria-label="Delete planner node" onClick={() => g.removeNode(id)}>✕</button>
-    </div>
-    <div className="pg-port" title="A Spatial node: the position and the level's shapes, for planning over them"><PgHandle type="target" position={Position.Left} id={PLANNER_MAP} />
-      {map ? <>Map: <b>{map}</b></> : <span className="pg-dim">Map (optional): a Spatial node</span>}</div>
-    <div className="pg-settings">
-      <label className="nodrag" title="How it works out where play heads">Mode
-        <select aria-label="Planner mode" value={d.mode} onChange={e => g.update(id, { mode: e.target.value, ...(e.target.value === 'plan' && !d.plan ? { plan: planDefaults() } : {}) })}>
-          <option value="route">Follow a recording</option>
-          <option value="plan">Plan from what I've done</option>
-        </select></label>
-      {d.mode === 'plan' && <>
-        <label className="nodrag" title="The world in cells this size: each a place, at where you were in it; a move is you going from one to the next">Places (px)
-          <input aria-label="Place size" type="number" min={8} max={400} value={plan.cell}
-            onChange={e => setPlan({ cell: Math.min(400, Math.max(8, Math.round(Number(e.target.value) || PLAN_CELL))) })} /></label>
-        <label className="nodrag" title="Where play heads">Heads for
-          <select aria-label="Plan destination" value={plan.destination.kind} onChange={e => setPlan({ destination:
-            e.target.value === 'end' ? { kind: 'end', recording: g.recordings.filter(r => r.status === 'complete' && !r.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started)[0]?.id ?? '' }
-              : e.target.value === 'input' ? { kind: 'input' } : { kind: 'point' } })}>
-            <option value="point">A point I click on its map</option>
-            <option value="input">What's wired into Destination</option>
-            <option value="end">Where a recording ended</option>
-          </select></label>
-        {plan.destination.kind === 'end' && <label className="nodrag">Recording
-          <select aria-label="Destination recording" value={plan.destination.recording} onChange={e => setPlan({ destination: { kind: 'end', recording: e.target.value } })}>
-            {!plan.destination.recording && <option value="">Choose a recording…</option>}
-            {routes.map(r => <option key={r.id} value={r.id}>{r.name} · {Math.round(r.durationMs / 1000)} s</option>)}
-          </select></label>}
-        <label className="nodrag" title="How far along the way it aims from where you are. Within the Goal's look-ahead, so its targets are like training's">Aim ahead (s)
-          <input aria-label="Plan aim ahead" type="number" min={0.1} max={30} step={0.5} value={plan.aheadS}
-            onChange={e => setPlan({ aheadS: Math.min(30, Math.max(0.1, Number(e.target.value) || 0.1)) })} /></label>
-      </>}
-      {d.mode === 'route' && <>
-        <label className="nodrag" title="The recording of you doing it, such as a run of the jump quest from start to finish">Route
-          <select aria-label="Route recording" value={d.route.recording} onChange={e => g.update(id, { route: { ...d.route, recording: e.target.value } })}>
-            {!d.route.recording && <option value="">Choose a recording…</option>}
-            {d.route.recording && !routes.some(r => r.id === d.route.recording) && <option value={d.route.recording}>(deleted)</option>}
-            {routes.map(r => <option key={r.id} value={r.id}>{r.name} · {Math.round(r.durationMs / 1000)} s</option>)}
-          </select></label>
-        <label className="nodrag" title="How far along the route it aims from where you are on it. Within the Goal's look-ahead, so its targets are like training's">Aim ahead (s)
-          <input aria-label="Aim ahead" type="number" min={0.1} max={30} step={0.5} value={d.route.aheadS}
-            onChange={e => g.update(id, { route: { ...d.route, aheadS: Math.min(30, Math.max(0.1, Number(e.target.value) || 0.1)) } })} /></label>
-      </>}
-    </div>
-    {d.mode === 'plan' && <>
-      <div className="pg-port" title="A State telling levels or maps apart, such as a map id: each keeps its own places"><PgHandle type="target" position={Position.Left} id={PLANNER_LEVEL} />
-        {level ? <>Level: <b>{g.labels[level] ?? level}</b></> : <span className="pg-dim">Level (optional): one space</span>}</div>
-      <div className="pg-port" title="A position play heads for, such as a portal's or a monster's: used when it heads for what's wired in"><PgHandle type="target" position={Position.Left} id={PLANNER_DESTINATION} />
-        {destination ? <>Destination: <b>{g.labels[destination] ?? destination}</b></> : <span className="pg-dim">Destination{plan.destination.kind === 'input' ? '' : ' (optional)'}</span>}</div>
-      <div className="pg-port" title="The recordings it learns places and moves from: else the policy's"><PgHandle type="target" position={Position.Left} id={PLANNER_DATA} extra="pg-handle-data" />
-        {learnFrom?.data.kind === 'recordings' ? <>Learns from: <b>{(learnFrom.data as RecordingsData).ids.length} recordings</b></> : <span className="pg-dim">Learns from: the policy's recordings</span>}</div>
-      <div className="pg-spatial-refresh">
-        <span className="pg-hint">{snapshot ? `Live, as of ${new Date(snapshot.at).toLocaleTimeString()}` : picture && 'places' in picture ? 'From where its first recording ended' : ''}</span>
-        <button className="nodrag modal-btn" disabled={refreshing} title={g.capturing ? 'Measure from where you are now' : 'Work its map out again'}
-          onClick={() => void refresh()}>{refreshing ? 'Refreshing…' : 'Refresh'}</button>
-      </div>
-      {shown && 'places' in shown && <PlanMap picture={shown} shapes={shapes} onPick={(x, y, level) => { setSnapshot(null); setPlan({ destination: { kind: 'point', x, y, level } }); }} />}
-      {mapInputs.length > 0 && <div className="pg-plan-on" aria-label="Shapes to keep away from">
-        <span className="pg-hint" title="Moves ending near these shapes, as they are each moment (monsters), take 1.5 s longer, so a way round them is planned when there is one">Keep away from:</span>
-        {mapInputs.map(alias => <label key={alias} className="nodrag"><input type="checkbox" checked={(plan.avoid ?? []).includes(alias)}
-          onChange={e => setPlan({ avoid: e.target.checked ? [...(plan.avoid ?? []), alias] : (plan.avoid ?? []).filter(a => a !== alias) })} />{alias}</label>)}
-      </div>}
-      <label className="nodrag pg-check" title="Playing, a planned move that hasn't happened after twice its usual time (and half a second) costs four times as much from then on, so it plans another way if there is one. Forgotten when play stops">
-        <input type="checkbox" aria-label="Learn from failure" checked={plan.learn !== false} onChange={e => setPlan({ learn: e.target.checked })} />Try another way when a move fails</label>
-      {picture && 'places' in picture && <div className="pg-hint">Click the map to put the destination there. {picture.count.places.toLocaleString()} places · {picture.count.moves.toLocaleString()} moves from {picture.recordings} recording{picture.recordings === 1 ? '' : 's'}
-        {picture.path ? ` · there in ${(picture.seconds ?? 0).toFixed(1)} s` : ''}{picture.next ? ` · ${nextMove(picture)}` : ''}</div>}
-      {picture && (('error' in picture && picture.error) || ('places' in picture && picture.error)) && <div className="pg-warn">{picture.error}</div>}
-      <button className="nodrag modal-btn pg-spatial-open" disabled={!picture || !('places' in picture)} onClick={() => setPreviewing(true)}
-        title="See its places, moves and the way there large, and click where play heads">Preview</button>
-      {previewing && <PlanPreview name={d.name.trim() || 'planner'} recorded={picture} shapes={shapes} capturing={g.capturing}
-        measure={sample => g.measurePlan(id, sample)} onClose={() => setPreviewing(false)}
-        onPick={(x, y, level) => setPlan({ destination: { kind: 'point', x, y, level } })} />}
-    </>}
-    <div className="pg-hint">{d.mode === 'route'
-      ? `Play aims ${d.route.aheadS} s ahead along where you went in the recording, from where you are on it; off it, it rejoins it on your own level.`
-      : `Play aims ${plan.aheadS} s along the quickest moves you've made toward ${plan.destination.kind === 'point' ? (plan.destination.x != null ? `(${plan.destination.x}, ${plan.destination.y})` : 'where you click on its map') : plan.destination.kind === 'end' ? 'where the recording ended' : 'what’s wired into Destination'}. It knows only moves your recordings made.`}</div>
-    {!goals.length && <div className="pg-warn">Wire it into a Goal's Target.</div>}
-    {d.mode === 'route' && !d.route.recording && <div className="pg-warn">Choose the recording whose route play follows.</div>}
-    {outside && <div className="pg-warn">Aim ahead within the Goal's look-ahead ({outside.lookAhead[0]}–{outside.lookAhead[1]} s), so its targets are like the ones it trained on.</div>}
     <PgHandle type="source" position={Position.Right} id="out" />
   </div>;
 }
@@ -1196,7 +977,7 @@ function PolicyNode({ id, data, selected }: NodeProps<GraphNode>) {
   </div>;
 }
 
-const nodeTypes: NodeTypes = { state: StateNode, formula: FormulaNode, recordings: RecordingsNode, policy: PolicyNode, grid: GridNode, spatial: SpatialNode, goal: GoalNode, planner: PlannerNode };
+const nodeTypes: NodeTypes = { state: StateNode, formula: FormulaNode, recordings: RecordingsNode, policy: PolicyNode, grid: GridNode, spatial: SpatialNode, goal: GoalNode };
 
 // ── The editor ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -1205,6 +986,7 @@ const nodeTypes: NodeTypes = { state: StateNode, formula: FormulaNode, recording
 // observed: every State's observation and its type (and whatever else FireFly observes now), which the
 // graph is built from; States are dragged in from the app's States list.
 export interface PolicyGraphProps { active: boolean; online: boolean; capturing: boolean; windowId: string | null; recording: boolean; storageKey: string; stateLabels: Record<string, string>; graphId?: string;
+  scope?: string; maps?: { id: string; name: string }[];  // the graph library, whose Map graphs a Goal heads over
   observed: Record<string, string>;
   frameSize?: { w: number; h: number } | null; } // the captured window's size, for a new grid's screen
 
@@ -1214,7 +996,7 @@ export default function PolicyGraph(props: PolicyGraphProps) {
   </div>;
 }
 
-function Editor({ online, capturing, windowId, recording, storageKey, stateLabels, observed, frameSize, graphId }: PolicyGraphProps) {
+function Editor({ online, capturing, windowId, recording, storageKey, stateLabels, observed, frameSize, graphId, scope, maps = [] }: PolicyGraphProps) {
   const initial = useMemo(() => readGraph(localStorage.getItem(storageKey)), [storageKey]);
   const [nodes, setNodes, onNodesChange] = useNodesState<GraphNode>(initial.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
@@ -1320,7 +1102,13 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
   const specs = useMemo(() => formulaSpecs(doc), [doc]);
   const grids = useMemo(() => gridSpecs(doc), [doc]);
   const spatial = useMemo(() => spatialSpecs(doc), [doc]);
-  const goals = useMemo(() => goalSpecs(doc), [doc]);
+  // The library's maps, as saved now (read again every few seconds, for changes made in their editors)
+  const [mapsRead, setMapsRead] = useState(0);
+  useEffect(() => { const t = setInterval(() => setMapsRead(n => n + 1), 3000); return () => clearInterval(t); }, []);
+  const lookup: MapLookup = useMemo(() => scope ? mapLookup(scope) : () => null, [scope, mapsRead, maps]); // eslint-disable-line react-hooks/exhaustive-deps
+  const mapsKey = JSON.stringify(maps.map(m => lookup(m.id)));
+  const stableLookup = useMemo(() => lookup, [mapsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const goals = useMemo(() => goalSpecs(doc, stableLookup), [doc, stableLookup]);
   const fieldList = useMemo(() => [...fields].map(([name, type]) => ({ name, type })), [fields]);
   const [refreshed, setRefreshed] = useState(0);
   const specKey = JSON.stringify([specs, grids, spatial, goals, schemaRecording?.id, fieldList, refreshed]);
@@ -1353,56 +1141,8 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     return () => { alive = false; clearTimeout(timer); };
   }, [specKey]);
 
-  // A planning Planner's request to the worker's planner.preview: the Goal it's the Target of (its position), its
-  // plan, and the recordings it learns from (its own, else the policy's that Goal feeds)
-  const planRequest = useCallback((plannerId: string): { request: Record<string, unknown> } | { error: string } => {
-    const planner = nodes.find(n => n.id === plannerId);
-    if (planner?.data.kind !== 'planner') return { error: 'Not a planner' };
-    const into = (id: string, handle: string) => edges.filter(e => e.target === id && e.targetHandle === handle).map(e => nodes.find(n => n.id === e.source));
-    const goal = edges.filter(e => e.source === plannerId && e.targetHandle === GOAL_TARGET).map(e => nodes.find(n => n.id === e.target)).find(n => n?.data.kind === 'goal');
-    if (!goal || goal.data.kind !== 'goal') return { error: "Wire it into a Goal's Target to see its map" };
-    const position = nameOf(into(goal.id, GOAL_POSITION)[0]), facing = nameOf(into(goal.id, GOAL_FACING)[0]);
-    if (!position) return { error: "Wire a position, such as the player's, into the Goal's Position" };
-    const own = into(plannerId, PLANNER_DATA)[0];
-    const policies = edges.filter(e => e.source === goal.id && e.targetHandle === 'values').map(e => e.target);
-    const policyData = policies.flatMap(p => into(p, 'data')).find(n => n?.data.kind === 'recordings');
-    const ids = own?.data.kind === 'recordings' ? own.data.ids : policyData?.data.kind === 'recordings' ? policyData.data.ids : [];
-    if (!ids.length) return { error: own ? 'Choose the recordings it learns from' : "Choose the policy's recordings, or wire Recordings into Learns from" };
-    const p = planner.data.plan ?? planDefaults(), dest = p.destination, level = nameOf(into(plannerId, PLANNER_LEVEL)[0]);
-    const wired = nameOf(into(plannerId, PLANNER_DESTINATION)[0]);
-    const destination = dest.kind === 'point' ? (dest.x != null ? { kind: 'point', x: dest.x, y: dest.y, ...(dest.level != null ? { level: dest.level } : {}) } : undefined)
-      : dest.kind === 'input' ? (wired ? { kind: 'input', name: wired } : undefined) : dest.recording ? dest : undefined;
-    const d = goal.data;
-    const avoid = planShapes({ version: 1, nodes, edges }, planner as GraphNode & { data: PlannerData }, p.avoid ?? []);
-    return { request: { goal: { name: d.name.trim() || 'goal', position, ...(facing ? { facing } : {}), lookAhead: d.lookAhead, targets: d.targets, minMove: d.minMove,
-      plan: { cell: p.cell, aheadS: p.aheadS, ...(level ? { level } : {}), recordings: ids, ...(destination ? { destination } : {}),
-        ...(avoid?.length ? { avoid } : {}), ...(p.learn === false ? { learn: false } : {}) } },
-      recordingIds: ids, fields: fieldList, formulas: specs } };
-  }, [nodes, edges, fieldList, specs]);
-  const [planPictures, setPlanPictures] = useState<Record<string, PlanPicture | { error: string }>>({});
-  const planKey = JSON.stringify(nodes.filter(n => n.data.kind === 'planner' && n.data.mode === 'plan').map(n => [n.id, planRequest(n.id)]));
-  useEffect(() => {
-    let alive = true;
-    const timer = setTimeout(async () => {
-      const out: Record<string, PlanPicture | { error: string }> = {};
-      for (const n of nodes.filter(n => n.data.kind === 'planner' && n.data.mode === 'plan')) {
-        const r = planRequest(n.id);
-        if ('error' in r) { out[n.id] = r; continue; }
-        try { out[n.id] = await window.bridge.policy.invoke('planner.preview', r.request) as PlanPicture; }
-        catch (e) { out[n.id] = { error: cleanError(e) }; }
-      }
-      if (alive) setPlanPictures(out);
-    }, 400);
-    return () => { alive = false; clearTimeout(timer); };
-  }, [planKey, refreshed]);
-  const measurePlan = useCallback(async (nodeId: string, sample: LiveSample) => {
-    const r = planRequest(nodeId);
-    if ('error' in r) return r;
-    return await window.bridge.policy.invoke('planner.preview', { ...r.request, observations: sample.observations }) as PlanPicture;
-  }, [planRequest]);
-
   const compiled = useMemo(() => Object.fromEntries(nodes.filter(n => n.data.kind === 'policy')
-    .map(n => [n.id, compilePolicy(doc, n.id, fields, checks, holds, name => stateLabels[name] ?? name)])), [doc, fields, checks, holds, stateLabels]);
+    .map(n => [n.id, compilePolicy(doc, n.id, fields, checks, holds, name => stateLabels[name] ?? name, stableLookup)])), [doc, fields, checks, holds, stateLabels, stableLookup]);
 
   // Each policy's dataset as the worker would make it, worked out again a moment after it changes
   const previewKey = JSON.stringify(Object.entries(compiled).map(([id, c]) => [id, c.request]));
@@ -1481,11 +1221,11 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     if (!windowId) return;
     setError('');
     // Where it heads is this graph's now (its Goal's target, route or plan), not what the version trained with
-    const version = versions.find(v => v.id === modelId), goal = version?.policy ? playGoal(doc, version.policy.id) : null;
+    const version = versions.find(v => v.id === modelId), goal = version?.policy ? playGoal(doc, version.policy.id, stableLookup) : null;
     if (goal && 'error' in goal) { setError(`Can’t play: ${goal.error}`); return; }
     const res = await window.bridge.policy.play({ modelId, windowId, corrections, graphId, ...(goal ? { goal } : {}) });
     if (!res.ok) setError(res.error ?? 'Could not start playing');
-  }, [windowId, corrections, graphId, versions, doc]);
+  }, [windowId, corrections, graphId, versions, doc, stableLookup]);
 
   // Wiring: a value into a formula input or a Policy's Values, a Recordings node into a Policy's Data.
   // An input takes one wire, so a new one replaces it
@@ -1493,23 +1233,15 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
     const source = nodes.find(n => n.id === c.source), target = nodes.find(n => n.id === c.target);
     if (!source || !target || source.id === target.id) return false;
     const handle = c.targetHandle ?? '';
-    if (target.data.kind === 'planner') {
-      if (handle === PLANNER_MAP) return source.data.kind === 'spatial';
-      if (handle === PLANNER_DATA) return source.data.kind === 'recordings';
-      const type = source.data.kind === 'state' ? fields.get(source.data.name) : source.data.kind === 'formula' ? checks.get(nameOf(source) ?? '')?.type : 'none';
-      if (handle === PLANNER_LEVEL) return source.data.kind === 'state' && type !== 'shapes' && type !== 'image';
-      if (handle === PLANNER_DESTINATION) return type !== 'none' && (!type || type === 'vector');
-      return false;
-    }
+    if (target.data.kind === 'goal' && handle === GOAL_AVOID) return source.data.kind === 'spatial';
     if (source.data.kind === 'recordings') return target.data.kind === 'policy' && handle === 'data';
-    if (source.data.kind === 'planner') return target.data.kind === 'goal' && handle === GOAL_TARGET;
     if (source.data.kind === 'grid' || source.data.kind === 'spatial' || source.data.kind === 'goal') return target.data.kind === 'policy' && handle === 'values';
     if (target.data.kind === 'goal') {
       // Its position and target: positions; its facing: true or false. From a state or a formula (whose type may not be known yet)
       const type = source.data.kind === 'state' ? fields.get(source.data.name) : source.data.kind === 'formula' ? checks.get(nameOf(source) ?? '')?.type : 'none';
       if (type === 'none') return false;
       if (handle === GOAL_FACING) return !type || type === 'boolean';
-      return (handle === GOAL_POSITION || handle === GOAL_TARGET) && (!type || type === 'vector');
+      return (handle === GOAL_POSITION || handle === GOAL_TARGET || handle === GOAL_DESTINATION) && (!type || type === 'vector');
     }
     if (target.data.kind === 'spatial') {
       // Its point: a position; its facing: true or false; its other inputs: shapes. From a state, or for the point
@@ -1601,8 +1333,6 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
       : item.kind === 'recordings' ? { kind: 'recordings', ids: [] }
       : item.kind === 'grid' ? { kind: 'grid', name: `grid ${count('grid')}`, cols: 16, rows: 9, mode: 'coverage', width: frameSize?.w ?? 1280, height: frameSize?.h ?? 720 }
       : item.kind === 'goal' ? { kind: 'goal', name: count('goal') > 1 ? `goal ${count('goal')}` : 'goal', ...GOAL_DEFAULTS }
-      : item.kind === 'planner' ? { kind: 'planner', name: count('planner') > 1 ? `planner ${count('planner')}` : 'planner', mode: 'route',
-          route: { recording: recordings.filter(r => r.status === 'complete' && !r.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started)[0]?.id ?? '', aheadS: ROUTE_AHEAD_S } }
       : item.kind === 'spatial' ? { kind: 'spatial', name: count('spatial') > 1 ? `spatial ${count('spatial')}` : 'spatial', inputs: [], radii: SPATIAL_RADII, maxDistance: SPATIAL_REACH }
       : { kind: 'policy', name: `Policy ${count('policy')}`, buttons: null, off: [], stepMs: null, history: 2, delayMs: 0, epochs: 60 };
     setNodes(ns => [...ns, { id, type: data.kind, position, data }]);
@@ -1642,7 +1372,7 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
   const ctx: Ctx = { fields, recordedAnywhere, labels: stateLabels, recordings, checks, gridChecks, spatialChecks, goalChecks, compiled, previews, versions, deleteVersion, deleteAll, status, training, capturing, windowId, recordingNow: recording,
     corrections, setCorrections, update, removeNode, removeInput, train, exportDataset, play, stop: (e?: { detail: number }) => void window.bridge.policy.stop(stopHow(e)), exported,
     wiredInto: (nodeId, handle) => nameOf(nodes.find(n => n.id === edges.find(e => e.target === nodeId && e.targetHandle === handle)?.source)) ?? null,
-    planPictures, measurePlan,
+    maps, lookup: stableLookup, goalProblem: nodeId => { const n = nodes.find(m => m.id === nodeId); return n ? goalProblem(doc, n, stableLookup) : null; },
     nodeInto: (nodeId, handle) => nodes.find(n => n.id === edges.find(e => e.target === nodeId && e.targetHandle === handle)?.source),
     nodesOutOf: nodeId => edges.filter(e => e.source === nodeId).map(e => nodes.find(n => n.id === e.target)).filter((n): n is GraphNode => !!n),
     wiredAll: (nodeId, handle) => edges.filter(e => e.target === nodeId && e.targetHandle === handle)
@@ -1662,7 +1392,6 @@ function Editor({ online, capturing, windowId, recording, storageKey, stateLabel
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'grid' })} title="Shapes, such as platforms, as a grid over the whole screen"><span className="pg-glyph">▦</span>Grid</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'spatial' })} title="How shapes, such as platforms and monsters, lie around a point, such as the player: distances and counts as values"><span className="pg-glyph">⌖</span>Spatial</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'goal' })} title="Where the player is to get to: trained on where you went, played toward a target"><span className="pg-glyph">⚑</span>Goal</div>
-      <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'planner' })} title="Where play heads, for a Goal's Target: along a recording's route"><span className="pg-glyph">⤳</span>Planner</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'recordings' })}><span className="pg-glyph">▤</span>Recordings</div>
       <div className="pg-palette-item pg-kind" draggable onDragStart={drag({ kind: 'policy' })}><span className="pg-glyph">◎</span>Policy</div>
       <div className="pg-hint pg-drag-states">Drag States in from the States list on the right.</div>

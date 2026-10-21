@@ -27,24 +27,30 @@ function harness(options = {}) {
       if (op === 'load' && params.trace) return {trace: 'C:/traces/p/1.jsonl'};
       if (op === 'predict') return state.predict();
       if (op === 'behavior.load') return {buttons: [{id: 'space', vk: 32}], trace: 'C:/traces/behavior/1.jsonl'};
-      if (op === 'behavior.step') return state.tick();
+      if (op === 'behavior.step') return state.tick(params);
       return {};
     },
     guard: async (op, params) => {
       log('guard', op, params);
       // As the real guard: a request it refuses unconfigures it, and it's in front only once configured
-      if (op === 'configure') state.configured = true;
+      if (op === 'configure') { state.configured = true; return {sequenceProtocol: options.managed ? 1 : 0}; }
+      if (op === 'heartbeat') return {execution: {...state.execution}};
       if (op === 'focus' && state.oldGuard) { state.configured = false; throw new Error('Unsupported guard operation'); }
       if (op === 'focused') return {focused: state.focused && !!state.configured};
+      if (op === 'dispatch') return {dispatch: state.dispatch?.(params.actionId) ?? null};
       if (op === 'idle') return {idleMs: state.idleMs, held: state.held};
       if (op === 'apply' && state.stale) throw new Error('Stale observation (312 ms old; the limit is 250); refusing action');
       if (op === 'apply' && state.strict && !state.configured) throw new Error('Input guardian is not configured');
-      if (op === 'apply') return {held: 0, ageMs: 80};
+      if (op === 'apply') {
+        if (params.actionId) state.execution = {id: params.actionId, state: 'running', startedAt: state.monotonic ?? 0};
+        if (options.managed && Array.isArray(params.sequence) && params.sequence.length === 0) state.execution = {...state.execution, state: 'cancelled'};
+        return {held: 0, ageMs: 80, ...(options.managed ? {execution: {...state.execution}} : {})};
+      }
       return {};
     },
     stopGuard: () => log('guard', 'stop'),
     send: (channel, value) => statuses.push(value),
-    now: () => state.clock, clock: () => state.monotonic ?? 0, pollMs: 5,
+    now: () => state.clock, clock: () => state.monotonic ?? 0, pollMs: 5, heartbeatMs: 5,
   });
   const frame = t => play.onObservations({timestamp: t, observations: [], tracked: []});
   const ops = (who, op) => calls.filter(c => c.who === who && c.op === op);
@@ -422,4 +428,216 @@ test('a behaviour tree presses what each frame of it says, lights its nodes, and
   assert.equal(h.statuses.at(-1).playing, false);
   assert.equal(h.statuses.at(-1).reason, 'The tree succeeded');
   assert.equal(h.statuses.at(-1).treeId, 'g1');
+});
+
+test('retains only the newest pending observation and ignores older deliveries', async () => {
+  const h = harness();
+  let resolve;
+  h.state.predict = () => new Promise(r => { resolve = r; });
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(5);
+  h.frame(2); h.frame(4); h.frame(3);
+  assert.equal(h.ops('worker', 'predict').length, 1);
+  h.state.predict = () => ({buttons: [false, true]});
+  resolve({buttons: [true, false]});
+  await wait(10);
+  assert.deepEqual(h.ops('worker', 'predict').map(c => c.params.timestamp), [1, 4]);
+  h.play.stop('Done');
+});
+
+test('a bounded clip has independent heartbeats and receives executor completion on the next fresh observation', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [1000, 0, false]],
+    action: {id: 1, durationMs: 1000}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(20);
+  assert.equal(h.ops('guard', 'apply')[0].params.actionId, 1);
+  assert.ok(h.ops('guard', 'heartbeat').length > 0, 'No heartbeat without observations');
+  h.state.monotonic = 1600;
+  h.frame(1100); await wait(10);
+  assert.equal(h.ops('worker', 'behavior.step').length, 1, 'Old state advanced the tree');
+  assert.equal(h.ops('guard', 'apply').length, 1, 'Stale frame cancelled a clip');
+  h.state.execution = {id: 1, state: 'completed', startedAt: 1000, finishedAt: 2000};
+  await wait(10);
+  assert.deepEqual(h.statuses.at(-1).holding, []);
+  const beats = h.ops('guard', 'heartbeat').length;
+  await wait(15);
+  assert.equal(h.ops('guard', 'heartbeat').length, beats, 'Completed clip renewed indefinitely');
+  h.state.monotonic = 2001;
+  h.state.tick = p => {
+    assert.equal(p.execution.state, 'completed');
+    return {buttons: [false], status: {done: 'success'}};
+  };
+  h.frame(2001); await wait(10);
+  assert.equal(h.play.playing, false);
+  assert.equal(h.statuses.at(-1).reason, 'The tree succeeded');
+});
+
+test('an ended action’s dispatch record is asked for once and kept by the next tree step', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.dispatch = id => ({id, state: 'completed', startedAt: 1000, events: [[0, 0, 0.4, 0.5, 'emitted'], [100, 100, 100.2, 100.3, 'emitted']]});
+  const steps = [];
+  h.state.tick = p => { steps.push(p); return steps.length === 1
+    ? {buttons: [true], sequence: [[0, 0, true], [100, 0, false]], action: {id: 1, durationMs: 100}, status: {done: null}}
+    : {buttons: [false], status: {done: null}}; };
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(20);
+  h.state.execution = {id: 1, state: 'completed', startedAt: 1000, finishedAt: 1100};
+  await wait(15);
+  h.state.monotonic = 1110;
+  h.frame(1110); await wait(10);
+  h.state.monotonic = 1130;
+  h.frame(1130); await wait(10);
+  assert.equal(h.ops('guard', 'dispatch').length, 1, 'Asked for an action’s presses more than once');
+  assert.equal(h.ops('guard', 'dispatch')[0].params.actionId, 1);
+  assert.deepEqual(steps[1].dispatch?.map(d => d.id), [1], 'The next step did not get the dispatch record');
+  assert.equal(steps[2].dispatch, undefined, 'A dispatch record was handed on twice');
+  h.play.stop();
+});
+
+test('stopping keeps the record of the action it stopped on, in the trace it names', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.dispatch = id => ({id, state: 'cancelled', cause: 'request', startedAt: 1000, events: [[0, 0, 0.4, 0.5, 'emitted']]});
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [900, 0, false]], action: {id: 1, durationMs: 900}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(20);
+  h.play.stop('The tree failed');
+  await wait(20);
+  assert.equal(h.ops('guard', 'dispatch').length, 1, 'the running action’s record was not asked for');
+  const closed = h.ops('worker', 'trace.close');
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].params.file, 'C:/traces/behavior/1.jsonl');
+  assert.deepEqual(closed[0].params.dispatch?.map(d => [d.id, d.cause]), [[1, 'request']]);
+});
+
+test('a part of a movement leaving keys held asks the guard to keep them', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true]], action: {id: 1, durationMs: 0, keep: [0]}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(20);
+  assert.deepEqual(h.ops('guard', 'apply')[0].params.keep, [0]);
+  h.play.stop();
+});
+
+test('recorded movement cancels when fresh position checks stop, even with live heartbeats', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [5000, 0, false]],
+    action: {id: 1, durationMs: 5000, supervised: true}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(15);
+  h.state.monotonic = 1551;
+  await wait(15);
+  assert.equal(h.play.playing, false);
+  assert.match(h.statuses.at(-1).reason, /no fresh position check/);
+  assert.equal(h.ops('guard', 'stop').length, 1);
+});
+
+test('fresh supervision keeps a sequence running but unrelated frames do not renew it', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [5000, 0, false]],
+    action: {id: 1, durationMs: 5000, supervised: true}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(10);
+  h.state.tick = p => ({buttons: [true], status: {done: null, maps: {m: {monitor: {actionId: 1, observedAt: p.timestamp}}}}});
+  for (const t of [1300, 1600, 1900]) {
+    h.state.monotonic = t; h.frame(t); await wait(10);
+    assert.equal(h.play.playing, true);
+  }
+  h.state.tick = () => ({buttons: [true], status: {done: null, maps: {m: {monitor: {actionId: 0, observedAt: 2200}}}}});
+  h.state.monotonic = 2200; h.frame(2200); await wait(10);
+  h.state.monotonic = 2450; await wait(15);
+  assert.equal(h.play.playing, false);
+});
+
+test('fresh incoming frames cannot keep a supervised action alive while its worker is stuck', async () => {
+  const h = harness({managed: true});
+  h.state.monotonic = 1000;
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [5000, 0, false]],
+    action: {id: 1, durationMs: 5000, supervised: true}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1000); await wait(10);
+  let resolve;
+  h.state.tick = () => new Promise(r => { resolve = r; });
+  h.state.monotonic = 1250; h.frame(1250); await wait(10);
+  h.state.monotonic = 1550; h.frame(1550); await wait(15);
+  assert.equal(h.play.playing, false);
+  assert.match(h.statuses.at(-1).reason, /no fresh position check/);
+  resolve({buttons: [true], status: {done: null, maps: {m: {monitor: {actionId: 1, observedAt: 1250}}}}});
+  await wait(10);
+  assert.equal(h.ops('guard', 'apply').length, 1, 'late feedback resumed a stopped sequence');
+});
+
+test('trajectory deviation sends an explicit cancellation and preserves the failure reason', async () => {
+  const h = harness({managed: true});
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [5000, 0, false]],
+    action: {id: 1, durationMs: 5000, supervised: true}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1); await wait(10);
+  h.state.tick = () => ({buttons: [false], sequence: [], status: {done: 'failure', text: 'movement deviated; remaining inputs cancelled'}});
+  h.frame(2); await wait(10);
+  assert.deepEqual(h.ops('guard', 'apply').at(-1).params.sequence, []);
+  assert.equal(h.state.execution.state, 'cancelled');
+  assert.equal(h.play.playing, false);
+  assert.match(h.statuses.at(-1).reason, /movement deviated/);
+});
+
+test('a failed tree preserves the actual route failure in the stop reason', async () => {
+  for (const text of ['no way from Start to Destination', null]) {
+    const h = harness();
+    h.state.tick = () => ({buttons: [false], status: {done: 'failure', text}});
+    await h.play.start({windowId: '42', behavior: {}});
+    h.frame(1); await wait(10);
+    assert.equal(h.play.playing, false);
+    assert.equal(h.statuses.at(-1).reason, text ? `The tree failed: ${text}` : 'The tree failed');
+    assert.deepEqual(h.ops('guard', 'apply').at(-1).params.buttons, [false]);
+    assert.equal(h.ops('guard', 'stop').length, 1);
+  }
+});
+
+test('failure to evaluate a tree cancels its active clip', async () => {
+  const h = harness({managed: true});
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [100, 0, false]],
+    action: {id: 1, durationMs: 100}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1); await wait(10);
+  h.state.tick = () => { throw new Error('Missing player'); };
+  h.frame(2); await wait(10);
+  assert.deepEqual(h.ops('guard', 'apply').at(-1).params.sequence, []);
+  assert.equal(h.state.execution.state, 'cancelled');
+  h.play.stop('Done');
+});
+
+test('stopping with a prediction in flight discards queued observations', async () => {
+  const h = harness();
+  let resolve;
+  h.state.predict = () => new Promise(r => { resolve = r; });
+  await h.play.start({modelId: 'p', windowId: '42'});
+  h.frame(1); await wait(5); h.frame(2);
+  h.play.stop('Stopped');
+  resolve({buttons: [true, false]}); await wait(10);
+  assert.equal(h.ops('worker', 'predict').length, 1);
+  assert.equal(h.ops('guard', 'apply').length, 0);
+});
+
+test('completion during a slow behavior step cannot re-press the finished clips keys', async () => {
+  const h = harness({managed: true});
+  h.state.tick = () => ({buttons: [true], sequence: [[0, 0, true], [100, 0, false]],
+    action: {id: 1, durationMs: 100}, status: {done: null}});
+  await h.play.start({windowId: '42', behavior: {}});
+  h.frame(1); await wait(10);
+  let resolve;
+  h.state.tick = () => new Promise(r => { resolve = r; });
+  h.frame(2); await wait(5);
+  h.state.execution = {id: 1, state: 'completed'};
+  await wait(10);
+  resolve({buttons: [true], status: {done: null}});
+  await wait(10);
+  assert.equal(h.ops('guard', 'apply').length, 1, 'Delayed continuation re-pressed released keys');
+  h.play.stop('Done');
 });

@@ -14,7 +14,7 @@
     "test:graph-library-ui": "electron tests/graph-library-ui.cjs",
     "test:spatial-node-ui": "electron tests/spatial-node-ui.cjs",
     "test:goal-node-ui": "electron tests/goal-node-ui.cjs",
-    "test:planner-node-ui": "electron tests/planner-node-ui.cjs",
+    "test:goal-heads-ui": "electron tests/goal-heads-ui.cjs",
     "test:behavior-ui": "electron tests/behavior-ui.cjs",
     "test:map-ui": "electron tests/map-ui.cjs",
     "test:policy-identity-ui": "electron tests/policy-identity-ui.cjs",

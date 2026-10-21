@@ -12,7 +12,7 @@ import math
 import time
 from bisect import bisect_left
 
-from formulas import FormulaSet, Missing, columns_of
+from formulas import FormulaSet, Missing, bare_name, columns_of
 from shapes import GRID_MODES, count_within, finite, grid_values, lines_of, nearest
 import spatial as spatial_
 import planner as planner_
@@ -123,7 +123,7 @@ def level_key(value):
     return value if isinstance(value, str) else json.dumps(value, sort_keys=True)
 
 
-PLAN_DESTINATIONS = ('point', 'input', 'end')
+PLAN_DESTINATIONS = ('point', 'input', 'end', 'place')
 
 
 def goal_names(g):
@@ -285,11 +285,41 @@ class Featurizer:
                         isinstance(p, list) and len(p) == 3 and all(finite(v) for v in p) for p in path)):
                     raise ValueError(f'{name}: its route is a list of [ms, x, y]')
                 spec['path'] = path
-        # Play planned from what the player has done (planner.py): toward a destination (a point, a position wired in,
-        # or where a recording ended), aiming aheadS seconds along the quickest moves; places and moves (`graph`) are
-        # learned when it trains, from `recordings` (else the policy's), and kept with it
+        # Play planned over a map (planner.py; src/mapModel.ts): toward a destination (a place of the map, a point, a
+        # position wired in, or where a recording ended), aiming aheadS seconds along the quickest of the map's links
+        # and the moves it learned on a grid; the places and moves (`graph`) are worked out when it trains or plays
+        # (Worker._learn_plan), and kept with it. Versions from before maps planned on a grid of their own, learned
+        # from `recordings` (else the policy's), with a Level observation's name in `level`: they still play
         plan = g.get('plan')
-        if plan is not None:
+        if plan is not None and isinstance(plan, dict) and isinstance(plan.get('map'), dict):
+            if 'target' in spec or 'route' in spec:
+                raise ValueError(f'{name}: play plans, follows a route or goes to its Target: one of them')
+            m, dest = plan['map'], plan.get('destination')
+            if not (finite(plan.get('aheadS')) and 0.1 <= plan['aheadS'] <= 30):
+                raise ValueError(f'{name}: aim 0.1..30 s ahead along its map')
+            if not (isinstance(m.get('position'), str) and m['position'].strip()):
+                raise ValueError(f'{name}: its map needs the player’s position: open the map and say where the player is')
+            places = {p['id']: p for p in m.get('places') or [] if isinstance(p, dict) and isinstance(p.get('id'), str)}
+            if not (isinstance(dest, dict) and dest.get('kind') in PLAN_DESTINATIONS):
+                raise ValueError(f'{name}: choose where play heads: a place of its map, a position wired in, or where a recording ended')
+            if dest['kind'] == 'place' and dest.get('place') not in places:
+                raise ValueError(f'{name}: choose the place of its map play heads for' + (' (the one chosen was taken off the map)' if dest.get('place') else ''))
+            if dest['kind'] == 'point' and not (finite(dest.get('x')) and finite(dest.get('y'))):
+                raise ValueError(f'{name}: choose where play heads')
+            if dest['kind'] == 'input' and dest.get('name') not in vectors:
+                raise ValueError(f'{name}: wire a position into its Destination')
+            if dest['kind'] == 'end' and not (isinstance(dest.get('recording'), str) and dest['recording']):
+                raise ValueError(f'{name}: choose the recording whose end play heads for')
+            grid = m.get('grid')
+            if grid is not None and not (isinstance(grid, dict) and finite(grid.get('cell')) and 8 <= grid['cell'] <= 400):
+                raise ValueError(f'{name}: its map learns places 8..400 px a side')
+            if not places and grid is None:
+                raise ValueError(f'{name}: its map has no places: add some, or have it learn a grid from recordings')
+            spec['plan'] = {'map': {k: m.get(k) for k in ('id', 'name', 'position', 'level', 'reach', 'places', 'links', 'grid')},
+                            'aheadS': float(plan['aheadS']),
+                            'destination': {k: v for k, v in dest.items() if k in ('kind', 'x', 'y', 'name', 'recording', 'level', 'place')},
+                            **({'graph': plan['graph']} if isinstance(plan.get('graph'), dict) else {})}
+        elif plan is not None:
             if 'target' in spec or 'route' in spec:
                 raise ValueError(f'{name}: play plans, follows a route or goes to its Target: one of them')
             dest = plan.get('destination') if isinstance(plan, dict) else None
@@ -349,10 +379,28 @@ class Featurizer:
         return g['path'][j][1], g['path'][j][2]
 
     def plan_level(self, values):
-        """The level a sample is on, by the plan's Level observation (None without one)."""
-        name = self.goal['plan'].get('level')
-        if name is None:
-            return None
+        """The level a sample is on: by its map's Level (a State's value as it is, else its formula's), or a plan from
+        before maps' Level observation (None without one)."""
+        plan = self.goal['plan']
+        if 'map' in plan:
+            source = (plan['map'].get('level') or '').strip()
+            if not source:
+                return None
+            name = bare_name(source)
+            if name is None or name not in self.formulas.fields:
+                if getattr(self, '_level_set', None) is None:
+                    self._level_set = FormulaSet([{'name': 'level', 'source': source}], [{'name': n, 'type': t} for n, t in self.formulas.fields.items()])
+                    if self._level_set.entries['level']['error']:
+                        raise ValueError(f'{self.goal["name"]}: its map’s Level: {self._level_set.entries["level"]["error"]}')
+                try:
+                    v = self._level_set.evaluate('level', [values])
+                except Missing:
+                    return None
+                return level_key(list(v) if isinstance(v, tuple) else v)
+        else:
+            name = plan.get('level')
+            if name is None:
+                return None
         item = values.get(name)
         return level_key(item.get('value')) if item and item.get('valid') else None
 
@@ -363,6 +411,9 @@ class Featurizer:
         if dest['kind'] == 'input':
             v = self._value(dest['name'], values, frames, 'vector')
             return float(v[0]), float(v[1])
+        if dest['kind'] == 'place':
+            place = next(p for p in self.goal['plan']['map']['places'] if p['id'] == dest['place'])
+            dest = {'x': place['x'], 'y': place['y'], 'level': place.get('level')}
         if 'x' not in dest:
             raise Missing(f'{self.goal["name"]}: where its recording ended is worked out when it trains')
         here = self.plan_level(values)
@@ -388,8 +439,8 @@ class Featurizer:
                                      1000 * g['plan']['aheadS'], self.plan_away(values, planner))
         if target is None:
             raise Missing(f'{g["name"]}: no move you’ve made leads from here to its destination')
-        if g['plan'].get('learn', True):
-            self.plan_attempt(planner, way)
+        self._plan_way = [[round(planner.places[i][1], 1), round(planner.places[i][2], 1)] for i in way[:60]]
+        self.plan_attempt(planner, way, g['plan'].get('learn', True))
         if 'hint' in g:
             self._plan_hint = planner.hint(way, g['hint']['buttons'])
         return target
@@ -409,23 +460,34 @@ class Featurizer:
             return planner_.AWAY_MS if any(abs(x - px) <= near and abs(y - py) <= near for x, y in points) else 0.0
         return away
 
-    def plan_attempt(self, planner, way):
-        """Learning from failure: the move the plan makes first is timed from when it's first planned; still at its
-        start after twice its usual time (and half a second), it costs more from then on (Planner.penalize), so the
-        way round it is planned if there's one."""
+    def plan_attempt(self, planner, way, learn=True):
+        """Learning from how moves go: the move the plan makes first is timed from when it's first planned; made (the
+        player at its end), what it took is kept for a map's own link; still at its start after twice its usual time
+        (and half a second), it failed, and with `learn` costs more from then on (Planner.penalize), so the way round
+        it is planned if there's one. A map's own links' outcomes go in map_outcomes, for its stats."""
+        now = time.monotonic() * 1000
+        attempt = getattr(self, '_attempt', None)
+        if attempt is not None and attempt[0] is planner and way and way[0] == attempt[2]:
+            self._outcome(planner, attempt[1], attempt[2], True, now - attempt[3])
+            attempt = self._attempt = None
         if not way or len(way) < 2:
             self._attempt = None
             return
-        now = time.monotonic() * 1000
         a, b = way[0], way[1]
-        attempt = getattr(self, '_attempt', None)
         if attempt is None or attempt[0] is not planner or attempt[1:3] != (a, b):
             self._attempt = (planner, a, b, now)
             return
         ms = planner.edges.get((a, b), (0, ()))[0]
         if now - attempt[3] > 2 * ms + 500:
-            planner.penalize(a, b)
+            if learn:
+                planner.penalize(a, b)
+            self._outcome(planner, a, b, False, now - attempt[3])
             self._attempt = None
+
+    def _outcome(self, planner, a, b, worked, ms):
+        lid, plan = planner.link_of.get((a, b)), self.goal['plan']
+        if lid is not None and 'map' in plan:
+            self.__dict__.setdefault('map_outcomes', []).append((plan['map'].get('id'), lid, worked, round(ms, 1)))
 
     def plan_hint(self, values, position, target):
         """The plan's next move toward a target (a hindsight one, in training): its planner, the level's made at once."""
@@ -470,7 +532,9 @@ class Featurizer:
             # where play is heading, for the banner: what it aims at this frame, how far, and from what
             self.heading = {'kind': 'plan' if 'plan' in g else 'route' if 'path' in g else 'target',
                             'x': round(float(target[0]), 1), 'y': round(float(target[1]), 1),
-                            'distance': round(math.hypot(float(target[0]) - position[0], float(target[1]) - position[1]), 1)}
+                            'distance': round(math.hypot(float(target[0]) - position[0], float(target[1]) - position[1]), 1),
+                            **({'map': g['plan']['map'].get('id'), 'way': self._plan_way, 'at': [round(position[0], 1), round(position[1], 1)]}
+                               if 'plan' in g and 'map' in g['plan'] else {})}
             hint = self._plan_hint if 'plan' in g and 'hint' in g else no_hint(g)
             return goal_numbers(g, position, target, facing) + hint
         # a target given (a hindsight one, by Worker._rows): the plan's next move toward it

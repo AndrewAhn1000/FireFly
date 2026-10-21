@@ -1,19 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
-import { buttonLabel } from './Keyboard';
+import { BUTTONS, buttonLabel } from './Keyboard';
 import { PreservedInput } from './PreservedInputs';
-import { cleanError, type PlayStatus } from './policyPlay';
+import { cleanError, playingText, stopHow, type PlayStatus } from './policyPlay';
+import { mapRun } from './mapRun';
+import MapRuns, { type ShownAttempt } from './MapRuns';
 import { inputsOf, quoted, readTree } from './behaviorModel';
 import { graphDocument, type GraphRef } from './BehaviorTree';
-import { MAP_DEFAULTS, mapProblems, placeName, readMap, type LinkStats, type MapDoc, type MapFrame, type MapLink, type MapPlace, type Suggested } from './mapModel';
+import { GRID_CELL, MAP_DEFAULTS, REPLAY_DEFAULTS, compileMap, mapProblems, placeName, readMap, type LearnedGrid, type TakeoffModel, type LinkStats, type LineUpKeys, type MapDoc, type MapFrame, type MapLink, type MapPlace, type ReplayDoc, type Suggested } from './mapModel';
 
 // A map: places the player can be at and links between them, each how to get from one to the other (a clip of a
-// recording, played as you pressed it, or a behaviour tree given `from` and `to`). A tree's Go to node goes over it
-// (worker/behavior.py): the quickest links from where the player is, each costing what it took when it worked, over
-// how often it has. Where the player is and on which level are your formulas; nothing in it is about one game.
+// recording, played as you pressed it, a behaviour tree given `from` and `to`, or keys held until the player is there),
+// and, if it says, places and moves it learns on a grid from your recordings. A tree's Go to node goes over it
+// (worker/behavior.py), and a policy's Goal heads along it (worker/planner.py): the quickest links from where the
+// player is, each costing what it took when it worked, over how often it has. Where the player is and on which level
+// are your formulas; nothing in it is about one game.
 
 export interface MapGraphProps {
   storageKey: string; graphId: string; name: string; scope: string; graphs: GraphRef[];
-  capturing: boolean; online: boolean; observed: Record<string, string>; stateLabels: Record<string, string>;
+  capturing: boolean; online: boolean; windowId: string | null; recording: boolean; status: PlayStatus; observed: Record<string, string>; stateLabels: Record<string, string>;
 }
 interface Recording { id: string; name: string; status: string; durationMs: number; metadata: { started: number; correction?: boolean; observationSchema?: { fields?: { name: string; type: string }[] } }; }
 interface Clip { from: number; to: number; ms: number; start: [number, number]; end: [number, number]; dx: number; dy: number; keys: [number, string, boolean][]; }
@@ -35,9 +39,88 @@ function Formula({ label, value, fields, labels, placeholder, onChange, title }:
     </span></label>;
 }
 
+// Keys held: chips (a click lets one go), and any key to add
+function KeysChoice({ keys, onChange, label = 'Keys held until it\'s there', add = 'Add a key to the link' }: { keys: string[]; onChange(keys: string[]): void; label?: string; add?: string }) {
+  return <div className="map-field">{label}
+    <div className="bt-keys">
+      {keys.map(k => <button key={k} className="bt-chip" title="Leave it out" onClick={() => onChange(keys.filter(x => x !== k))}>{buttonLabel(k)} ✕</button>)}
+      <select aria-label={add} value="" onChange={e => { if (e.target.value) onChange([...keys, e.target.value]); }}>
+        <option value="">+ key</option>
+        {BUTTONS.filter(b => !keys.includes(b.id)).map(b => <option key={b.id} value={b.id}>{buttonLabel(b.id)}</option>)}
+      </select>
+    </div></div>;
+}
+
 function NumberField({ label, value, min, max, unit, onChange, title }: { label: string; value: number; min: number; max: number; unit?: string; title?: string; onChange(v: number): void }) {
   return <label className="map-field map-number" title={title}>{label}
     <span><input type="number" aria-label={label} min={min} max={max} value={value} onChange={e => onChange(Math.min(max, Math.max(min, Math.round(Number(e.target.value) || min))))} />{unit}</span></label>;
+}
+
+// Its recovery checkpoints, in a sentence: the landings a failed movement could be resumed from (not resumed from yet)
+function checkpointText(c?: Record<string, number>) {
+  if (!c) return '';
+  const n = (k: string) => c[k] ?? 0, all = Object.values(c).reduce((a, b) => a + b, 0);
+  if (!all) return '';
+  return ` ${all} landing${all === 1 ? '' : 's'} could be recovery checkpoints (the green diamonds): ${n('stable')} stable, ${n('dynamic')} needing a run-up, and ${n('stable (not resumable)') + n('dynamic (not resumable)')} that can’t be reproduced (too little ground behind, or a jump after it played as recorded).`;
+}
+
+// What measuring its recorded jumps found: the model, how many of its jumps can be pressed where it's safe, and the
+// movements marked unsafe
+function takeoffText(t: TakeoffModel, mode: 'timed' | 'adaptive') {
+  if (t.error) return `Jumps aren’t measured: ${t.error}`;
+  const m = t.model!, c = t.counts ?? {}, n = (k: 'adapt' | 'unsafe' | 'narrow' | 'position' | 'walkoff' | 'timed') => c[k] ?? 0;
+  const all = n('adapt') + n('unsafe') + n('narrow') + n('position') + n('walkoff') + n('timed');
+  return `Measured from ${m.jumps} jumps: walking ${m.walk} px/ms, jumping ${m.jump} px/ms up, gravity ${m.gravity} px/ms², a press taken ${m.delays[0]} to ${m.delays[2]} ms from when it’s sent and leaving the ground within ${m.leaveMs} ms.`
+    + ` Of ${all} recorded jumps, ${n('adapt')} can be pressed where it’s safe, ${n('position')} change keys in the air (only their press is timed by where the player is), ${n('unsafe') + n('narrow')} have nowhere safe enough (${n('narrow')} of them only a few px)${n('walkoff') ? `, ${n('walkoff')} ${n('walkoff') === 1 ? 'is a walk' : 'are walks'} off an edge whose jump key did nothing` : ''}, and ${n('timed')} aren’t ones it knows (played as recorded).`
+    + (t.unsafe ? ` ${t.unsafe} movement${t.unsafe === 1 ? ' is' : 's are'} unsafe${mode === 'adaptive' ? ', dashed red: taken only when there’s no other way' : ''}.` : '')
+    // movements whose end after their last landing is put right by feedback (adaptive, with Line up with taps)
+    + checkpointText(t.checkpoints)
+    + (t.finishes?.correct ? ` ${t.finishes.correct} movement${t.finishes.correct === 1 ? ' ends' : 's end'} on a platform it can be corrected on after its last landing${mode === 'adaptive' ? ' (with Line up with taps along x)' : ' (with adaptive jumps)'}.` : '');
+}
+
+// How recorded movements are replayed: how near their start and end, how long still, and lining up with a start by
+// tapping (the keys each way along x, and y if set; none, and a replay further off than Start within fails saying so)
+function ReplaySettings({ replay, fields, labels, shapes, onChange }: { replay: ReplayDoc; fields: Map<string, string>; labels: Record<string, string>; shapes: string[];
+  onChange(r: ReplayDoc): void }) {
+  const r = { ...REPLAY_DEFAULTS, ...replay }, lu = replay.lineUp ?? null;
+  const axis = (a: 'x' | 'y'): LineUpKeys => lu?.[a] ?? { less: [], more: [] };
+  const setAxis = (a: 'x' | 'y', keys: LineUpKeys) => onChange({ ...replay, lineUp: { ...(lu ?? {}), [a]: keys } });
+  const setLineUp = (patch: Partial<NonNullable<ReplayDoc['lineUp']>>) => onChange({ ...replay, lineUp: { ...(lu ?? {}), ...patch } });
+  return <>
+    <NumberField label="Start within" value={r.startPx} min={1} max={200} unit=" px" title="How near its recorded start a recorded movement must be to replay: what it carries from there, it carries all the way. The map's Runs shows how far off each started and where it parted"
+      onChange={v => onChange({ ...replay, startPx: v })} />
+    <NumberField label="Arrive within" value={r.arrivePx} min={1} max={400} unit=" px" title="How near its recorded end a movement counts as there; further, the link has failed (and the next lines up from where it is)"
+      onChange={v => onChange({ ...replay, arrivePx: v })} />
+    <NumberField label="Still for" value={r.stillMs} min={0} max={2000} unit=" ms" title="How long the player stands still at a start before replaying, and at an end before it counts as there"
+      onChange={v => onChange({ ...replay, stillMs: v })} />
+    <div className="pg-section-hd">Wait for</div>
+    <p className="pg-hint">A press a game only takes in some state (a jump, only on the ground) is lost when the replay gets there a little later than the recording did. With a true/false State or formula here, presses that came just after it turned true in a recording wait for it to turn true again, instead of for the clock; keys held through the wait stay held.</p>
+    <Formula label="Wait for (optional)" value={replay.sync ?? ''} fields={fields} labels={labels} placeholder="such as `On Ground`"
+      title="True/false: presses up to the time below after it turned true in a recording wait for it to turn true again"
+      onChange={v => onChange({ ...replay, sync: v })} />
+    {(replay.sync ?? '').trim() && <NumberField label="Presses waiting for it: up to" value={r.syncWindowMs} min={0} max={1000} unit=" ms after it turns true"
+      title="A press this long or less after it turned true in a recording waits for it; one later is timed by the clock" onChange={v => onChange({ ...replay, syncWindowMs: v })} />}
+    <div className="pg-section-hd">Jumps</div>
+    <p className="pg-hint">With the lines the player stands on, FireFly measures a side-view platformer’s walking speed, jump and gravity from these recordings, and works out where each recorded jump can be pressed and still land safely (allowing for how much later than the press the game takes it). Timed as recorded presses them when the recording did; Pressed where it’s safe waits for the player to get there instead, and moves what comes after with it. Jumps that change keys in the air, or land on a rope, stay timed; those with nowhere safe to press are marked unsafe, and the map goes another way when there is one.</p>
+    <label className="map-field">Ground lines<select aria-label="Ground lines" value={replay.ground ?? ''} onChange={e => onChange({ ...replay, ground: e.target.value || undefined })}>
+      <option value="">None: jumps aren’t measured</option>
+      {shapes.map(n => <option key={n} value={n}>{labels[n] ?? n}</option>)}
+      {replay.ground && !shapes.includes(replay.ground) && <option value={replay.ground}>{replay.ground} (not observed)</option>}
+    </select></label>
+    {replay.ground && <label className="map-field">Press jumps<select aria-label="Press jumps" value={replay.takeoff ?? 'timed'}
+      onChange={e => onChange({ ...replay, takeoff: e.target.value as 'timed' | 'adaptive' })}>
+      <option value="timed">Timed as recorded</option><option value="adaptive">Where it’s safe (adaptive takeoff)</option>
+    </select></label>}
+    <div className="pg-section-hd">Line up with taps</div>
+    <p className="pg-hint">Off a recorded start by more than Start within, it taps toward it, standing still between taps, and learns how far a tap moves the player. Without keys, it doesn’t, and says how far off it was.</p>
+    <KeysChoice label="Keys moving it left (smaller x)" add="Add a key moving it left" keys={axis('x').less} onChange={k => setAxis('x', { ...axis('x'), less: k })} />
+    <KeysChoice label="Keys moving it right (larger x)" add="Add a key moving it right" keys={axis('x').more} onChange={k => setAxis('x', { ...axis('x'), more: k })} />
+    <KeysChoice label="Keys moving it up (smaller y), if any" add="Add a key moving it up" keys={axis('y').less} onChange={k => setAxis('y', { ...axis('y'), less: k })} />
+    <KeysChoice label="Keys moving it down (larger y), if any" add="Add a key moving it down" keys={axis('y').more} onChange={k => setAxis('y', { ...axis('y'), more: k })} />
+    <NumberField label="First tap" value={lu?.tapMs ?? r.tapMs} min={5} max={400} unit=" ms" title="How long the first tap holds its key; each one after is worked out from how far the last moved" onChange={v => setLineUp({ tapMs: v })} />
+    <NumberField label="Up to" value={lu?.tries ?? r.tries} min={1} max={50} unit=" taps" onChange={v => setLineUp({ tries: v })} />
+    <NumberField label="From within" value={lu?.range ?? r.range} min={1} max={500} unit=" px" title="Further from a recorded start than this, it doesn't try to line up" onChange={v => setLineUp({ range: v })} />
+  </>;
 }
 
 // A tree and the formulas for its inputs, but those a map gives (from and to)
@@ -65,14 +148,19 @@ export default function MapGraph(props: MapGraphProps) {
   const trees = props.graphs.filter(g => g.kind === 'behavior');
   // recordings, and what formulas read: what FireFly observes now, and what the recordings hold
   const [recordings, setRecordings] = useState<Recording[]>([]);
+  // read again every 5 s while it's open, as the Policy Graph's Recordings node is: a recording made with the map
+  // open was missing from its lists (and couldn't be ticked) until the editor was opened again
   useEffect(() => {
     if (!props.online) return;
     let alive = true;
-    void (async () => {
+    const read = async () => {
       try { const r = (await window.bridge.invoke('dataset.list')) as { recordings: Recording[] };
-        if (alive) setRecordings(r.recordings.filter(x => x.status === 'complete' && !x.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started)); } catch { /* none */ }
-    })();
-    return () => { alive = false; };
+        const next = r.recordings.filter(x => x.status === 'complete' && !x.metadata.correction).sort((a, b) => b.metadata.started - a.metadata.started);
+        if (alive) setRecordings(was => was.map(x => x.id).join() === next.map(x => x.id).join() ? was : next); } catch { /* none */ }
+    };
+    void read();
+    const timer = setInterval(() => void read(), 5000);
+    return () => { alive = false; clearInterval(timer); };
   }, [props.online]);
   const fields = useMemo(() => {
     const out = new Map(Object.entries(props.observed));
@@ -115,10 +203,29 @@ export default function MapGraph(props: MapGraphProps) {
     return () => { alive = false; clearTimeout(timer); };
   }, [props.capturing, drawnOver, frameSpec, props.online]);
 
+  // the places and moves it learns on a grid from recordings (the worker's map.grid, kept on disk by what they're from)
+  const [grid, setGrid] = useState<LearnedGrid | { error: string } | null>(null), [learning, setLearning] = useState(false);
+  const gridKey = JSON.stringify([doc.grid, doc.position, doc.level, doc.grounded]);
+  useEffect(() => {
+    if (!doc.grid || !doc.position.trim() || !props.online) { setGrid(null); return; }
+    let alive = true;
+    const timer = setTimeout(() => {
+      setLearning(true);
+      window.bridge.policy.invoke('map.grid', { map: compileMap(doc), id: props.graphId })
+        .then(r => { if (alive) setGrid(r as LearnedGrid); })
+        .catch(e => { if (alive) setGrid({ error: cleanError(e) }); })
+        .finally(() => { if (alive) setLearning(false); });
+    }, 600);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [gridKey, props.online]); // eslint-disable-line react-hooks/exhaustive-deps
+  const learned = grid && 'places' in grid ? grid : null;
+
   // a tree going over it: where it is, the way, the link running
-  const [status, setStatus] = useState<PlayStatus | null>(null);
-  useEffect(() => window.bridge.on('play:status', s => setStatus(s as PlayStatus)), []);
+  const status = props.status;
+  const [starting, setStarting] = useState(false), [driveDestination, setDriveDestination] = useState('');
   const live = status?.playing ? status.tree?.maps?.[props.graphId] ?? null : null;
+  // a policy heading along it: the way it plans, and where it aims
+  const policyWay = status?.playing && status.heading?.map === props.graphId ? status.heading : null;
   // what its links did, kept from run to run
   const [stats, setStats] = useState<LinkStats>({});
   const readStats = useCallback(async () => {
@@ -148,13 +255,34 @@ export default function MapGraph(props: MapGraphProps) {
   const toWorld = useCallback((sx: number, sy: number): [number, number] => [sx / view.scale + view.x, sy / view.scale + view.y], [view]);
   const fit = useCallback(() => {
     const pts: [number, number][] = [...doc.places.filter(shown).map(p => [p.x, p.y] as [number, number]),
-      ...Object.values(frame?.shapes ?? {}).flat().flat(), ...(frame?.position ? [frame.position] : [])];
+      ...Object.values(frame?.shapes ?? {}).flat().flat(), ...(frame?.position ? [frame.position] : []),
+      ...(learned?.places ?? []).filter(p => level === 'all' || p[0] === level).map(p => [p[1], p[2]] as [number, number])];
     if (!pts.length) { setView({ x: 0, y: 0, scale: 1 }); return; }
     const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
     const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
     const scale = Math.min(4, Math.max(0.05, Math.min(size.width / Math.max(40, x1 - x0 + 80), size.height / Math.max(40, y1 - y0 + 80))));
     setView({ x: (x0 + x1) / 2 - size.width / 2 / scale, y: (y0 + y1) / 2 - size.height / 2 / scale, scale });
-  }, [doc.places, frame, size, level]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [doc.places, frame, size, level, grid]); // eslint-disable-line react-hooks/exhaustive-deps
+  // its runs, under the canvas: an attempt chosen is drawn over the map, and the view fitted to it
+  const [runsOpen, setRunsOpen] = useState(false), [shownAttempt, setShownAttempt] = useState<ShownAttempt | null>(null);
+  const [openRun, setOpenRun] = useState<{ file: string; at: number } | null>(null);
+  // fitted again when the panel opening shrinks the canvas; a key event chosen: close in on it, 160 px of the map
+  // across, so a few px between the recording and the replay can be seen
+  useEffect(() => {
+    const a = shownAttempt?.attempt;
+    const k = a?.events?.find(e => e.index === shownAttempt?.event);
+    if (k?.recorded) {
+      const scale = Math.min(8, Math.min(size.width, size.height) / 160);
+      setView({ x: k.recorded.x - size.width / 2 / scale, y: k.recorded.y - size.height / 2 / scale, scale });
+      return;
+    }
+    const pts = [...(a?.recordedPath ?? []), ...(a?.livePath ?? [])];
+    if (!pts.length) return;
+    const xs = pts.map(p => p[1]), ys = pts.map(p => p[2]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const scale = Math.min(4, Math.max(0.05, Math.min(size.width / Math.max(40, x1 - x0 + 80), size.height / Math.max(40, y1 - y0 + 80))));
+    setView({ x: (x0 + x1) / 2 - size.width / 2 / scale, y: (y0 + y1) / 2 - size.height / 2 / scale, scale });
+  }, [shownAttempt?.attempt, shownAttempt?.event, size.width, size.height]); // eslint-disable-line react-hooks/exhaustive-deps
   const fitted = useRef(false);
   useEffect(() => { if (!fitted.current && (doc.places.length || frame) && !localStorage.getItem(props.storageKey + '-view')) { fitted.current = true; fit(); } }, [doc.places.length, frame, fit, props.storageKey]);
 
@@ -260,6 +388,43 @@ export default function MapGraph(props: MapGraphProps) {
       }
     });
     c.globalAlpha = 1;
+    // what it learned on a grid: its moves faint, its places small
+    if (learned) {
+      const on = (p: LearnedGrid['places'][number]) => level === 'all' || p[0] === level;
+      for (const [i, [a, b]] of learned.moves.entries()) {
+        const p = learned.places[a], q = learned.places[b];
+        if (!p || !q || !on(p) || !on(q)) continue;
+        const id = learned.linkIds?.[i] ?? `g${a}>${b}`;
+        const active = live?.link === id, planned = live?.way?.includes(id), unsafe = learned.unsafe?.[i] && doc.grid?.replay?.takeoff === 'adaptive';
+        c.strokeStyle = active ? '#4c8ef7' : planned ? '#9cc2ff' : unsafe ? 'rgba(230,90,90,.6)' : 'rgba(255,255,255,.22)';
+        c.lineWidth = active ? 3 : planned ? 2 : 1; c.setLineDash(unsafe && !active ? [4, 3] : []); c.beginPath();
+        // a recorded movement along the path it took, not a straight line from its start to its end
+        const path = learned.paths?.[i];
+        if (path && path.length > 1) path.forEach(([x, y], k) => { const [sx, sy] = toScreen(x, y); if (k) c.lineTo(sx, sy); else c.moveTo(sx, sy); });
+        else { const [x0, y0] = toScreen(p[1], p[2]), [x1, y1] = toScreen(q[1], q[2]); c.moveTo(x0, y0); c.lineTo(x1, y1); }
+        c.stroke();
+      }
+      c.setLineDash([]);
+      c.fillStyle = 'rgba(255,255,255,.4)';
+      for (const p of learned.places) if (on(p)) { const [x, y] = toScreen(p[1], p[2]); const size = learned.execution === 'sequences' ? 6 : 2; c.fillRect(x - size / 2, y - size / 2, size, size); }
+      // where a failed movement could be resumed: small diamonds, filled when stable, outlined when it needs a run-up,
+      // faint when it can't be reproduced
+      for (const [lv, px, py, kind, resumable] of learned.checkpoints ?? []) {
+        if (level !== 'all' && lv !== level) continue;
+        const [x, y] = toScreen(px, py), r = 3.5;
+        c.beginPath(); c.moveTo(x, y - r); c.lineTo(x + r, y); c.lineTo(x, y + r); c.lineTo(x - r, y); c.closePath();
+        c.strokeStyle = resumable ? 'rgba(120,220,160,.85)' : 'rgba(255,255,255,.25)'; c.lineWidth = 1;
+        if (resumable && kind === 'stable') { c.fillStyle = 'rgba(120,220,160,.7)'; c.fill(); }
+        c.stroke();
+      }
+    }
+    if (policyWay?.way?.length) {
+      c.strokeStyle = '#5aa9e6'; c.lineWidth = 2.5; c.beginPath();
+      [...(policyWay.at ? [policyWay.at] : []), ...policyWay.way].forEach(([x, y], k) => { const [sx, sy] = toScreen(x, y); if (k) c.lineTo(sx, sy); else c.moveTo(sx, sy); });
+      c.stroke();
+      const [tx, ty] = toScreen(policyWay.x, policyWay.y);
+      c.strokeStyle = '#f0a020'; c.lineWidth = 2; c.beginPath(); c.arc(tx, ty, 6, 0, Math.PI * 2); c.stroke();
+    }
     const by = new Map(doc.places.map(p => [p.id, p]));
     const way = new Set(live?.way ?? []);
     // the links, as arrows (two ways apart side by side)
@@ -292,6 +457,38 @@ export default function MapGraph(props: MapGraphProps) {
       c.beginPath(); c.arc(sx, sy, on || at || dest ? 6 : 4.5, 0, Math.PI * 2); c.fill();
       c.font = '11px sans-serif'; c.fillStyle = '#e8eaee'; c.fillText(p.name + (level === 'all' && p.level != null ? ` (${p.level})` : ''), sx + 8, sy - 6);
     }
+    // an attempt chosen in Runs: the recorded path dashed, the path it took orange, each key event joined where it was
+    // in both (red when they're further apart than the threshold), the event chosen labelled, and where they parted
+    if (shownAttempt?.attempt.recordedPath) {
+      const a = shownAttempt.attempt;
+      const line = (path: [number, number, number][], color: string, dash: number[], width: number) => {
+        c.strokeStyle = color; c.lineWidth = width; c.setLineDash(dash); c.beginPath();
+        path.forEach(([, x, y], k) => { const [sx, sy] = toScreen(x, y); if (k) c.lineTo(sx, sy); else c.moveTo(sx, sy); });
+        c.stroke(); c.setLineDash([]);
+      };
+      line(a.recordedPath!, 'rgba(255,255,255,.85)', [6, 4], 2);
+      line(a.livePath ?? [], '#f0a020', [], 2);
+      for (const k of a.events ?? []) {
+        if (!k.recorded) continue;
+        const [rx, ry] = toScreen(k.recorded.x, k.recorded.y), on = shownAttempt.event === k.index;
+        if (k.live) {
+          const [lx, ly] = toScreen(k.live.x, k.live.y);
+          c.strokeStyle = k.errorPx != null && k.errorPx > (a.thresholdPx ?? 8) ? '#e65a5a' : 'rgba(200,200,200,.6)'; c.lineWidth = on ? 2 : 1;
+          c.beginPath(); c.moveTo(rx, ry); c.lineTo(lx, ly); c.stroke();
+          c.fillStyle = '#f0a020'; c.beginPath(); c.arc(lx, ly, on ? 4.5 : 2.5, 0, Math.PI * 2); c.fill();
+        }
+        c.strokeStyle = '#ffffff'; c.lineWidth = on ? 2 : 1; c.beginPath(); c.arc(rx, ry, on ? 6 : 3.5, 0, Math.PI * 2); c.stroke();
+        if (on) {
+          c.font = '11px sans-serif'; c.fillStyle = '#ffffff';
+          c.fillText(`#${k.index} ${k.down ? '↓' : '↑'}${buttonLabel(k.button)} at ${(k.at / 1000).toFixed(2)} s${k.errorPx != null ? ` · ${k.errorPx.toFixed(1)} px apart` : ''}`, rx + 9, ry - 9);
+        }
+      }
+      if (a.lastOnsetMs != null && a.livePath?.length) {
+        const p = a.livePath.reduce((b, q) => Math.abs(q[0] - a.lastOnsetMs!) < Math.abs(b[0] - a.lastOnsetMs!) ? q : b);
+        const [sx, sy] = toScreen(p[1], p[2]);
+        c.strokeStyle = '#e65a5a'; c.lineWidth = 2; c.beginPath(); c.arc(sx, sy, 8, 0, Math.PI * 2); c.stroke();
+      }
+    }
     // the player
     if (frame?.position && (level === 'all' || frame.level === level)) {
       const [sx, sy] = toScreen(frame.position[0], frame.position[1]);
@@ -304,6 +501,29 @@ export default function MapGraph(props: MapGraphProps) {
   // the link chosen: its clip found in a recording, from near its place to near the other
   const selectedPlace = selection?.kind === 'place' ? doc.places.find(p => p.id === selection.id) ?? null : null;
   const selectedLink = selection?.kind === 'link' ? doc.links.find(l => l.id === selection.id) ?? null : null;
+  useEffect(() => { if (selectedPlace) setDriveDestination(selectedPlace.id); }, [selectedPlace?.id]);
+  const destinations = [...doc.places.map(p => ({ id: p.id, name: p.name })),
+    ...(learned?.places ?? []).map((p, i) => ({ id: `g${i}`, name: `(${Math.round(p[1])}, ${Math.round(p[2])})${p[0] == null ? '' : ` · ${p[0]}`}` }))];
+  const destination = destinations.some(p => p.id === driveDestination) ? driveDestination : destinations[0]?.id ?? '';
+  const mine = status?.treeId === props.graphId;
+  const running = !!status?.playing && mine;
+  const nearestStop = learned?.execution === 'sequences' && frame?.position
+    ? learned.places.filter(p => p[0] === frame.level).map(p => ({ x: p[1], y: p[2], distance: Math.hypot(p[1] - frame.position![0], p[2] - frame.position![1]) }))
+      .sort((a, b) => a.distance - b.distance)[0] : null;
+  const runBlocked = !props.online ? 'Wait for the runtime' : !props.capturing || !props.windowId ? 'Start a capture session first'
+    : props.recording ? 'Stop recording before replaying inputs' : starting ? 'Starting…' : status?.playing ? 'Stop the current run first' : '';
+  const runMap = async (clip?: MapLink) => {
+    if (runBlocked || !props.windowId || (!clip && !destination)) return;
+    setStarting(true); setError('');
+    try {
+      const bundle = mapRun(doc, props.graphId, read, clip ? { clip } : { destination });
+      const res = await window.bridge.policy.play({ windowId: props.windowId, graphId: props.graphId, treeId: props.graphId,
+        name: `${props.name} · ${clip ? 'Replay clip' : 'Drive'}`,
+        behavior: { tree: bundle.tree, trees: bundle.trees, maps: bundle.maps, treeId: props.graphId, name: props.name,
+          fields: fieldList, buttons: BUTTONS.map(b => ({ id: b.id, vk: b.vk })) } });
+      if (!res.ok) setError(`Can’t start: ${res.error ?? 'the run did not start'}`);
+    } catch (e) { setError(cleanError(e)); } finally { setStarting(false); }
+  };
   const setLink = (id: string, patch: Partial<MapLink>) => change(d => ({ links: d.links.map(l => l.id === id ? { ...l, ...patch } : l) }));
   const setPlace = (id: string, patch: Partial<MapPlace>) => change(d => ({ places: d.places.map(p => p.id === id ? { ...p, ...patch } : p) }));
   const [clipRec, setClipRec] = useState(''), [clips, setClips] = useState<{ clips: Clip[]; start: number | null; note: string | null } | { error: string } | null>(null), [finding, setFinding] = useState(false);
@@ -329,12 +549,26 @@ export default function MapGraph(props: MapGraphProps) {
     } catch (e) { setSuggested({ error: cleanError(e) }); } finally { setSuggesting(false); }
   };
   const has = (from: string, to: string) => doc.links.some(l => l.from === from && l.to === to);
-  const problemOf = (l: MapLink) => l.kind === 'clip' ? !l.clip : !l.tree || read(l.tree) == null;
+  const problemOf = (l: MapLink) => l.kind === 'clip' ? !l.clip : l.kind === 'keys' ? false : !l.tree || read(l.tree) == null;
   const problems = mapProblems(doc, id => read(id) != null);
   const name = (id: string) => doc.places.find(p => p.id === id)?.name ?? '?';
   const recName = (id: string) => recordings.find(r => r.id === id)?.name ?? '(deleted recording)';
 
   return <div className="collection-editor map-editor" aria-label="Map editor">
+    <div className="collection-toolbar map-execution" aria-label="Map execution">
+      <label>Destination <select aria-label="Drive destination" value={destination} disabled={starting || !!status?.playing} onChange={e => setDriveDestination(e.target.value)}>
+        {!destinations.length && <option value="">Add a place or learn a grid</option>}
+        {destinations.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+      </select></label>
+      {running ? <button className="modal-btn" aria-label="Stop map" onClick={e => void window.bridge.policy.stop(stopHow(e))}>Stop</button>
+        : <button className="modal-btn primary" aria-label="Drive map" disabled={!!runBlocked || !destination || !doc.position.trim()}
+          title={runBlocked || (!destination ? 'Choose a destination' : 'Navigate using this map’s links; your keys or mouse take over')} onClick={() => void runMap()}>{starting ? 'Starting…' : 'Drive'}</button>}
+      <span className="bt-status">{running ? playingText(status!) : mine && status?.reason ? `Stopped: ${status.reason}` : runBlocked || 'Choose a destination, or select a clip link to replay its inputs once.'}</span>
+      {!running && mine && status?.reason && <button className="modal-btn" title="Open its run: each link it tried, and a recorded movement against its recording"
+        onClick={() => { setRunsOpen(true); setOpenRun({ file: '', at: Date.now() }); }}>What happened</button>}
+      <button className={`modal-btn ${runsOpen ? 'primary' : ''}`} aria-pressed={runsOpen} aria-label="Map runs panel"
+        title="Its runs: each link it tried and how it went, and a recorded movement drawn against its recording" onClick={() => setRunsOpen(o => !o)}>Runs</button>
+    </div>
     <div className="collection-toolbar">
       {(['select', 'place', 'link'] as Mode[]).map(m => <button key={m} className={`modal-btn ${mode === m ? 'primary' : ''}`} aria-pressed={mode === m}
         title={m === 'select' ? 'Choose a place or link; drag a place to move it, or the map to look around' : m === 'place' ? 'Click to put a place there' : 'Click a place, then the place it leads to'}
@@ -345,7 +579,7 @@ export default function MapGraph(props: MapGraphProps) {
         <option value={'\u0000all'}>All levels</option>
         {levels.map(l => <option key={String(l)} value={l ?? '\u0000none'}>{l ?? '(none)'}{frame?.level === l ? ' · the player’s' : ''}</option>)}</select></label>}
       <button className="modal-btn" onClick={fit}>Fit</button>
-      <span className="bt-status">{live ? `● ${live.text}` : linkFrom ? `From ${name(linkFrom)}: click the place it leads to` : mode === 'place' ? 'Click where a place is' : problems[0] ?? `${doc.places.length} places · ${doc.links.length} links`}</span>
+      <span className="bt-status">{live ? `● ${live.text}` : policyWay ? `● ${status?.name ?? 'A policy'} heading for (${Math.round(policyWay.x)}, ${Math.round(policyWay.y)}), ${Math.round(policyWay.distance)} px away` : linkFrom ? `From ${name(linkFrom)}: click the place it leads to` : mode === 'place' ? 'Click where a place is' : problems[0] ?? `${doc.places.length} places · ${doc.links.length} links`}</span>
     </div>
     {error && <div className="collection-error">{error}</div>}
     <div className="collection-body">
@@ -366,6 +600,32 @@ export default function MapGraph(props: MapGraphProps) {
         {!props.capturing && <label className="map-field">Drawn over<select aria-label="Recording drawn over" value={drawnOver} onChange={e => change({ recording: e.target.value })}>
           {!recordings.length && <option value="">No recordings</option>}
           {recordings.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}</select></label>}
+        <div className="pg-section-hd">Learned from recordings</div>
+        <label className="pg-check" title="Learn recorded movement sequences for Drive and a spatial grid for policy planning, beside your own places and links">
+          <input type="checkbox" aria-label="Learn a grid" checked={!!doc.grid} onChange={e => change({ grid: e.target.checked ? { cell: GRID_CELL, recordings: null } : null })} />Learn from recordings</label>
+        {doc.grid && <>
+          <label className="map-field">Drive learned movements<select aria-label="Learned movement execution" value={doc.grid.execution ?? 'sequences'}
+            onChange={e => { setDriveDestination(''); change(d => ({ grid: { ...d.grid!, execution: e.target.value as 'sequences' | 'keys' } })); }}>
+            <option value="sequences">Recorded sequences</option><option value="keys">Grid held keys (legacy)</option>
+          </select></label>
+          {(doc.grid.execution ?? 'sequences') === 'sequences' && <>
+            <p className="pg-hint">Replays the original key timing between recorded stops, from a standstill near each stop, and waits to arrive before going on. A movement runs blind from its start to its end, so record a pause (keys released, standing still) before anything that needs precision; movements can last up to 30 seconds.</p>
+            <ReplaySettings replay={doc.grid.replay ?? {}} fields={fields} labels={props.stateLabels} shapes={shapeStates} onChange={replay => change(d => ({ grid: { ...d.grid!, replay } }))} />
+          </>}
+          {nearestStop && <p className="pg-hint" aria-label="Nearest recorded stop">Nearest recorded stop: ({Math.round(nearestStop.x)}, {Math.round(nearestStop.y)}), {Math.round(nearestStop.distance)} px away.</p>}
+          <NumberField label="Planning grid size" value={doc.grid.cell} min={8} max={400} unit=" px" onChange={v => change(d => ({ grid: { ...d.grid!, cell: v } }))} />
+          <label className="map-field">From<select aria-label="Grid recordings" value={doc.grid.recordings ? 'chosen' : 'all'}
+            onChange={e => change(d => ({ grid: { ...d.grid!, recordings: e.target.value === 'all' ? null : recordings.slice(0, 1).map(r => r.id) } }))}>
+            <option value="all">Every recording (not corrections)</option><option value="chosen">The recordings ticked</option></select></label>
+          {doc.grid.recordings && <div className="pg-list map-recordings" aria-label="Grid recordings ticked">
+            {recordings.map(r => <label key={r.id} className="pg-check"><input type="checkbox" checked={doc.grid!.recordings!.includes(r.id)}
+              onChange={e => change(d => ({ grid: { ...d.grid!, recordings: e.target.checked ? [...d.grid!.recordings!, r.id] : d.grid!.recordings!.filter(x => x !== r.id) } }))} />{r.name}</label>)}
+          </div>}
+          <div className="pg-hint">{learning ? 'Learning…' : grid && 'error' in grid ? '' : learned ? `${(learned.count?.places ?? learned.places.length).toLocaleString()} places and ${(learned.count?.moves ?? learned.moves.length).toLocaleString()} moves learned from ${learned.recordings} recording${learned.recordings === 1 ? '' : 's'}: the small dots.` : ''}{learned?.execution === 'sequences' && (doc.grid.replay?.sync ?? '').trim() ? ` ${learned.synced ?? 0} of ${learned.count?.moves ?? learned.moves.length} movements wait for ${doc.grid.replay!.sync!.trim()} (${learned.waits ?? 0} waits in all).` : ''}</div>
+          {learned?.takeoff && <div className={learned.takeoff.error ? 'pg-warn' : 'pg-hint'} aria-label="Jumps measured">{takeoffText(learned.takeoff, doc.grid.replay?.takeoff ?? 'timed')}</div>}
+          {learned?.notes?.map((note, i) => <div className="pg-hint" key={i}>{note}</div>)}
+          {grid && 'error' in grid && <div className="pg-warn">{grid.error}</div>}
+        </>}
         <div className="pg-section-hd">Going over it</div>
         <NumberField label="At a place within" value={doc.reach} min={1} max={5000} unit=" px" onChange={v => change({ reach: v })} title="How near a place the player has to be to be at it" />
         <NumberField label="A link fails after" value={doc.linkMs} min={100} max={600000} unit=" ms" onChange={v => change({ linkMs: v })} />
@@ -380,7 +640,7 @@ export default function MapGraph(props: MapGraphProps) {
         <canvas ref={canvas} tabIndex={0} aria-label="Map" style={{ width: size.width, height: size.height, cursor: mode === 'select' ? 'grab' : 'crosshair' }}
           onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}
           onKeyDown={e => { if ((e.key === 'Delete' || e.key === 'Backspace') && selection) { e.preventDefault(); removeSelected(); } if (e.key === 'Escape') { setLinkFrom(null); setSelection(null); } }} />
-        {!doc.places.length && <div className="map-empty">{doc.position.trim() ? 'Put places where the player goes: + Place, Place at player, or Suggest from recordings.' : 'Say where the player is first, a position State, in Position.'}</div>}
+        {!doc.places.length && !learned?.places.length && !shownAttempt && <div className="map-empty">{doc.position.trim() ? 'Put places where the player goes: + Place, Place at player, or Suggest from recordings.' : 'Say where the player is first, a position State, in Position.'}</div>}
       </div>
       <aside className="map-inspector" aria-label="Map inspector">
         {selectedPlace && <>
@@ -398,9 +658,15 @@ export default function MapGraph(props: MapGraphProps) {
         </>}
         {selectedLink && <>
           <div className="pg-section-hd">Link: {name(selectedLink.from)} → {name(selectedLink.to)}</div>
+          {selectedLink.kind === 'clip' && <>
+            <button className="modal-btn primary" aria-label="Replay selected clip" disabled={!!runBlocked || !selectedLink.clip}
+              title={runBlocked || 'Play this recording’s key presses once, starting from your current position'} onClick={() => void runMap(selectedLink)}>Replay clip</button>
+            <div className="pg-hint">Position the player at the clip’s starting point first. This plays only its recorded inputs, then releases the keys.</div>
+          </>}
           <div className="map-row">
             <label className="pg-check"><input type="radio" name="link-kind" checked={selectedLink.kind === 'clip'} onChange={() => setLink(selectedLink.id, { kind: 'clip' })} />A clip</label>
             <label className="pg-check"><input type="radio" name="link-kind" checked={selectedLink.kind === 'tree'} onChange={() => setLink(selectedLink.id, { kind: 'tree' })} />A tree</label>
+            <label className="pg-check"><input type="radio" name="link-kind" checked={selectedLink.kind === 'keys'} onChange={() => setLink(selectedLink.id, { kind: 'keys', keys: selectedLink.keys ?? [] })} />Keys</label>
           </div>
           {selectedLink.kind === 'clip' && <>
             {selectedLink.clip ? <div className="bt-chosen">{recName(selectedLink.clip.recording)} · {((selectedLink.clip.to - selectedLink.clip.from) / 1000).toFixed(2)} s</div>
@@ -420,10 +686,12 @@ export default function MapGraph(props: MapGraphProps) {
               })}
             </div>}
           </>}
+          {selectedLink.kind === 'keys' && <><KeysChoice keys={selectedLink.keys ?? []} onChange={keys => setLink(selectedLink.id, { keys })} />
+            {!selectedLink.keys?.length && <p className="muted">Release keys and wait until the player reaches the next place.</p>}</>}
           {selectedLink.kind === 'tree' && <TreeChoice label="Tree" tree={selectedLink.tree ?? ''} args={selectedLink.args ?? {}} given={['from', 'to']} trees={trees} read={read} fields={fields} labels={props.stateLabels}
             onChange={(tree, args) => setLink(selectedLink.id, { tree, args })} />}
           {(() => { const s = stats[selectedLink.id]; return <div className="pg-hint">{s?.runs ? `Run ${s.runs} time${s.runs === 1 ? '' : 's'}, worked ${s.runs - s.fails}${s.ms ? `, taking ${(s.ms / 1000).toFixed(2)} s` : ''}` : 'Not run yet'}{live?.fails?.[selectedLink.id] ? ` · failed ${live.fails[selectedLink.id]} this run` : ''}</div>; })()}
-          {!has(selectedLink.to, selectedLink.from) && <button className="modal-btn" onClick={() => newLink(selectedLink.to, selectedLink.from, { kind: selectedLink.kind, tree: selectedLink.tree, args: selectedLink.args })}>Add the way back</button>}
+          {!has(selectedLink.to, selectedLink.from) && <button className="modal-btn" onClick={() => newLink(selectedLink.to, selectedLink.from, { kind: selectedLink.kind === 'clip' ? 'tree' : selectedLink.kind, tree: selectedLink.tree, args: selectedLink.args })}>Add the way back</button>}
           <button className="modal-btn" aria-label="Delete link" onClick={removeSelected}>Delete link</button>
         </>}
         {!selection && <>
@@ -441,12 +709,14 @@ export default function MapGraph(props: MapGraphProps) {
             {!suggested.links.length && !suggested.places.length && <div className="pg-hint">Nothing to suggest: add places where you stood, then suggest again for the links between them.</div>}
           </div>}
           <div className="pg-section-hd">Learned</div>
-          <div className="pg-hint">{Object.keys(stats).length ? `${Object.keys(stats).length} links run ${Object.values(stats).reduce((n, s) => n + s.runs, 0)} times` : 'Nothing yet: it learns how each link goes as trees go over it.'}</div>
-          <button className="modal-btn" disabled={!Object.keys(stats).length || !!live} onClick={() => void window.bridge.policy.invoke('map.stats', { map: props.graphId, forget: true }).then(() => setStats({}))}>Forget what it learned</button>
+          {(() => { const links = Object.entries(stats).filter(([k]) => !k.startsWith('_')); return <>
+          <div className="pg-hint">{links.length ? `${links.length} links run ${links.reduce((n, [, s]) => n + (s.runs ?? 0), 0)} times` : 'Nothing yet: it learns how each of your links goes as trees and policies go over it.'}{stats._taps ? ' It also keeps what taps of each length moved the player, for lining up.' : ''}</div>
+          <button className="modal-btn" disabled={!links.length && !stats._taps || !!live} onClick={() => void window.bridge.policy.invoke('map.stats', { map: props.graphId, forget: true }).then(() => setStats({}))}>Forget what it learned</button></>; })()}
           {problems.length > 0 && <><div className="pg-section-hd">To put right</div>{problems.map((p, k) => <div key={k} className="pg-warn">{p}</div>)}</>}
         </>}
       </aside>
     </div>
+    {runsOpen && <MapRuns graphId={props.graphId} map={compileMap(doc)} playing={!!status?.playing} openRun={openRun} onShow={setShownAttempt} />}
   </div>;
 }
 

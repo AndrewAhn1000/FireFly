@@ -1,5 +1,6 @@
 #include "command_reader.hpp"
 #include "session.hpp"
+#include "timed_sequence.hpp"
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -187,106 +188,58 @@ static bool emit(int vk, bool down) {
   }
   return SendInput(1, &input, sizeof(input)) == 1;
 }
-// A run of presses played on the guard's own clock, to the millisecond: a hop done as the player did it, from where
-// they stood still, every press and let-go at its time. Pressed once a frame (every 30-60 ms), a press was up to half
-// a frame off its time, a few px at walking speed, and a jump with a few px of room missed. Its thread waits on a
-// high-resolution timer to about a millisecond before each press and then spins to it.
-struct Playback {
-  struct Press {
-    double at; // ms from the start
-    int vk;
-    bool down;
-  };
-  std::thread thread;
-  HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  std::atomic<bool> running = false;
-  std::atomic<double> lateMs = 0; // the latest any press went, for `apply`'s reply
-  double started = 0;
-  void stop() {
-    if (thread.joinable()) {
-      SetEvent(cancel);
-      thread.join();
-    }
-    ResetEvent(cancel);
-    running = false;
-  }
-  ~Playback() {
-    stop();
-    CloseHandle(cancel);
-  }
-};
-static std::mutex keysLock; // the guard's held keys, between the main loop and a playback's thread
+// Only the executor thread and the guard main loop touch the held set.
+static std::mutex keysLock;
 struct Guard {
   std::set<int> held;
-  Playback playback;
-  // Presses played from now, on the playback's thread (any playing before stops first)
-  void play(std::vector<Playback::Press> presses) {
-    playback.stop();
-    playback.started = firefly::monotonicMs();
-    playback.lateMs = 0;
-    playback.running = true;
-    playback.thread = std::thread([this, presses = std::move(presses)] {
-      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-      HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-      if (!timer) // before Windows 10 1803: a timer of the system's own tick, the spin making up the rest
-        timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
-      const double start = playback.started;
-      const auto cancelled = [&] { return WaitForSingleObject(playback.cancel, 0) == WAIT_OBJECT_0; };
-      for (const auto &p : presses) {
-        const double due = start + p.at;
-        const double wait = due - firefly::monotonicMs();
-        if (wait > 1.5 && timer) {
-          LARGE_INTEGER when;
-          when.QuadPart = -static_cast<LONGLONG>((wait - 1.0) * 10000); // relative, in 100 ns
-          SetWaitableTimer(timer, &when, 0, nullptr, nullptr, FALSE);
-          HANDLE both[] = {playback.cancel, timer};
-          if (WaitForMultipleObjects(2, both, FALSE, INFINITE) == WAIT_OBJECT_0)
-            break;
-        }
-        bool stopped = false;
-        while (firefly::monotonicMs() < due)
-          if ((stopped = cancelled()))
-            break;
-          else
-            YieldProcessor();
+  firefly::TimedSequence playback{
+      firefly::monotonicMs,
+      [this](const firefly::TimedSequence::Press &p) {
+        using Sent = firefly::TimedSequence::Sent;
         std::lock_guard lock(keysLock);
-        if (stopped || cancelled())
-          break;
-        if (p.down != held.contains(p.vk)) {
-          emit(p.vk, p.down);
-          if (p.down) held.insert(p.vk);
-          else held.erase(p.vk);
-        }
-        const double late = firefly::monotonicMs() - due;
-        if (late > playback.lateMs) playback.lateMs = late;
-      }
-      if (timer)
-        CloseHandle(timer);
-      playback.running = false;
-    });
-  }
-  // Every key up, the guard still in charge: while the game is out of front for a moment
-  void letGo() {
-    playback.stop();
+        if (!active || takeover || GetForegroundWindow() != guardedWindow) return Sent::failed;
+        auto desired = held;
+        if (p.down) desired.insert(p.vk); else desired.erase(p.vk);
+        if (firefly::withoutShortcuts(desired) != desired) return Sent::failed;
+        if (p.down == held.contains(p.vk)) return Sent::unchanged;
+        if (p.down) held.insert(p.vk);
+        if (!emit(p.vk, p.down)) return Sent::failed;
+        if (!p.down) held.erase(p.vk);
+        return Sent::emitted;
+      },
+      [this](const std::set<int> &keep) { releaseKeys(keep); }};
+  // Every key up but those in `keep`: the other keys first, then Shift, Ctrl and Alt, so letting go makes no combination
+  void releaseKeys(const std::set<int> &keep = {}) {
     std::lock_guard lock(keysLock);
     for (bool modifiers : {false, true})
       for (int vk : held)
-        if ((vk >= VK_SHIFT && vk <= VK_MENU) == modifiers)
-          emit(vk, false);
-    held.clear();
+        if ((vk >= VK_SHIFT && vk <= VK_MENU) == modifiers && !keep.contains(vk)) emit(vk, false);
+    std::erase_if(held, [&](int vk) { return !keep.contains(vk); });
   }
-  void release() {
-    playback.stop();
+  Json execution() const {
+    const auto s = playback.status();
     std::lock_guard lock(keysLock);
-    // The other keys first, then Shift, Ctrl and Alt (16-18), so letting go makes no combination either
-    for (bool modifiers : {false, true})
-      for (int vk : held)
-        if ((vk >= VK_SHIFT && vk <= VK_MENU) == modifiers)
-          emit(vk, false);
-    held.clear();
-    active = false;
+    return {{"id", s.id}, {"state", s.state}, {"startedAt", s.started}, {"finishedAt", s.finished},
+            {"durationMs", s.duration}, {"elapsedMs", s.id ? (s.finished ? s.finished : firefly::monotonicMs()) - s.started : 0},
+            {"lateMs", s.lateMs}, {"executed", s.executed}, {"error", s.error}, {"cause", s.cause},
+            {"clock", "monotonic-ms"}, {"held", held}};
   }
-  ~Guard() { release(); }
+  // Every press of an action as it went (the `dispatch` op): [index, due, sent, returned, outcome], ms from its start
+  Json dispatch(uint64_t id) const {
+    const auto r = playback.record(id);
+    if (!r) return nullptr;
+    static const char *outcomes[] = {"emitted", "unchanged", "failed"};
+    Json events = Json::array();
+    for (const auto &d : r->dispatched)
+      events.push_back({d.index, d.at, d.sent, d.done, outcomes[static_cast<int>(d.outcome)]});
+    const auto &s = r->status;
+    return {{"id", s.id}, {"state", s.state}, {"startedAt", s.started}, {"finishedAt", s.finished}, {"durationMs", s.duration},
+            {"error", s.error}, {"cause", s.cause}, {"clock", "monotonic-ms"}, {"events", events}};
+  }
+  // cause: why a running action is cancelled, kept on its record (focus, takeover, window, watchdog, request...)
+  void letGo(const std::string &cause) { playback.stop(cause); releaseKeys(); }
+  void release(const std::string &cause) { letGo(cause); active = false; }
+  ~Guard() { release("shutdown"); }
 };
 // The guard's own keys in a row are one line ("the policy: 12 keys"), as it presses many
 static Json traceLines(HWND target) {
@@ -371,7 +324,7 @@ int main() {
   Json schema;
   std::string observation;
   double last = 0;
-  bool configured = false;
+  bool configured = false, managedSequences = false;
   constexpr double kFocusGraceMs = 250;
   double lostSince = 0; // when the game went out of front, while the guard is in charge; 0 while it's in front
   HWND lostTo = nullptr;
@@ -388,12 +341,12 @@ int main() {
     else if (!lostSince) {
       lostSince = firefly::monotonicMs();
       lostTo = front;
-      guard.letGo();
+      guard.letGo("focus");
       see({lostSince, Seen::Note, 0, false, 0, false, "the guard saw the game out of front and let go of every key"});
     }
     const bool lost = lostSince && firefly::monotonicMs() - lostSince > kFocusGraceMs;
     if (active && (takeover || lost || !IsWindow(target) || currentPid != pid || quiet > 300)) {
-      guard.release();
+      guard.release(takeover ? "takeover" : !IsWindow(target) || currentPid != pid ? "window" : lost ? "focus" : "watchdog");
       configured = false;
       // Which of them it was: they need different fixes (the window in front says what took focus; a watchdog
       // says FireFly stopped sending actions, so detection or the policy fell behind)
@@ -425,7 +378,10 @@ int main() {
       auto op = request.at("op").get<std::string>();
       auto response = Json{{"v", 1}, {"id", id}, {"ok", true}};
       if (op == "configure") {
-        guard.release();
+        guard.release("configure");
+        guard.playback.reset();
+        managedSequences = request.value("sequenceProtocol", 0) == 1;
+        response["sequenceProtocol"] = 1;
         if (!hooksReady)
           throw std::runtime_error("Takeover hooks unavailable");
         auto handle = std::stoull(request.at("windowId").get<std::string>());
@@ -439,6 +395,16 @@ int main() {
         configured = true;
         takeover = false;
         response["actionSchema"] = schema["identity"]; // what `apply` must carry
+      } else if (op == "heartbeat") {
+        if (!configured) throw std::runtime_error("Input guardian is not configured");
+        if (!managedSequences || request.at("actionSchema") != schema["identity"] || request.at("observationSchema") != observation)
+          throw std::runtime_error("Action heartbeat schema mismatch");
+        const auto s = guard.playback.status();
+        // Renew only the bounded action, never ordinary held keys or new work.
+        if (s.state == "running" && request.at("actionId").get<uint64_t>() == s.id &&
+            GetForegroundWindow() == target && !takeover && currentPid == pid && IsWindow(target))
+          last = firefly::monotonicMs();
+        response["execution"] = guard.execution();
       } else if (op == "apply") {
         if (!configured)
           throw std::runtime_error("Input guardian is not configured");
@@ -450,7 +416,7 @@ int main() {
                 "Focus the selected window before agent play (foreground=" +
                 std::to_string(reinterpret_cast<uintptr_t>(GetForegroundWindow())) +
                 ", target=" + std::to_string(reinterpret_cast<uintptr_t>(target)) + ")");
-          guard.letGo();
+          guard.letGo("focus");
           last = firefly::monotonicMs();
           response["held"] = 0;
           response["outOfFront"] = true;
@@ -462,6 +428,17 @@ int main() {
         if (request.at("actionSchema") != schema["identity"] ||
             request.at("observationSchema") != observation)
           throw std::runtime_error("Action or observation schema mismatch");
+        if (managedSequences && request.contains("actionId") && !request.contains("sequence"))
+          throw std::runtime_error("An action ID requires its complete sequence");
+        if (managedSequences && request.contains("sequence") && !request.at("sequence").empty() && !request.contains("actionId"))
+          throw std::runtime_error("A timed sequence requires an action ID");
+        if (managedSequences && request.contains("actionId") &&
+            request.at("actionId").get<uint64_t>() <= guard.playback.status().id) {
+          response["execution"] = guard.execution();
+          response["duplicate"] = true;
+          reply(response);
+          continue;
+        }
         double timestamp = request.at("timestamp");
         double age = firefly::monotonicMs() - timestamp;
         // A frame's time is when Windows composed it, for the next refresh of the screen, which can be a few ms
@@ -500,7 +477,7 @@ int main() {
         // Presses to play on the guard's own clock (see Playback), [[ms from now, button, down]], once the buttons
         // are as `buttons` says: while they play, `apply` keeps the guard going but leaves the keys to them. An empty
         // one stops what plays, and the buttons are as `buttons` says
-        std::vector<Playback::Press> presses;
+        std::vector<firefly::TimedSequence::Press> presses;
         if (request.contains("sequence")) {
           const auto &sequence = request.at("sequence");
           if (!sequence.is_array() || sequence.size() > 512)
@@ -511,26 +488,47 @@ int main() {
               throw std::runtime_error("Invalid key sequence");
             const int i = e[1].get<int>();
             const double t = e[0].get<double>();
-            if (i < 0 || i >= static_cast<int>(schema["buttons"].size()) || !std::isfinite(t) || t < at || t > 10000)
-              throw std::runtime_error("Invalid key sequence: buttons in its order, times in order from 0 to 10 s");
+            if (i < 0 || i >= static_cast<int>(schema["buttons"].size()) || !std::isfinite(t) || t < at || t > firefly::TimedSequence::maxDurationMs)
+              throw std::runtime_error("Invalid key sequence: buttons in its order, times in order from 0 to 30 s");
             at = t;
             presses.push_back({t, schema["buttons"][i]["vk"].get<int>(), e[2].get<bool>()});
           }
-        } else if (guard.playback.running) {
+        } else if (guard.playback.running()) {
           last = firefly::monotonicMs();
           active = true;
           response["playing"] = true;
-          response["lateMs"] = guard.playback.lateMs.load();
+          response["lateMs"] = guard.playback.status().lateMs;
+          response["execution"] = guard.execution();
           reply(response);
           continue;
         }
-        guard.playback.stop(); // one that ended (or before a new one): its thread is done with the keys
+        guard.playback.stop("request"); // one that ended (or before a new one): its thread is done with the keys
         std::set<int> desired;
         for (size_t i = 0; i < states.size(); ++i) {
           if (!states[i].is_boolean())
             throw std::runtime_error("Predictions must be Boolean");
           if (states[i].get<bool>())
             desired.insert(schema["buttons"][i]["vk"].get<int>());
+        }
+        // Managed actions carry their first keys in their time-zero presses: those, and no others, are down as it starts.
+        // A key already held for it (kept from the action before, through a pause) stays down rather than being let go
+        // and pressed again, which a game would take for a new press
+        if (managedSequences && request.contains("actionId")) {
+          desired.clear();
+          for (const auto &p : presses)
+            if (p.at == 0 && p.down) desired.insert(p.vk);
+        }
+        // Keys a managed action leaves held when it completes (`keep`, its buttons by index)
+        std::set<int> keep;
+        if (managedSequences && request.contains("keep")) {
+          const auto &k = request.at("keep");
+          if (!k.is_array() || k.size() > schema["buttons"].size())
+            throw std::runtime_error("Invalid keys to keep held");
+          for (const auto &i : k) {
+            if (!i.is_number_integer() || i.get<int>() < 0 || i.get<int>() >= static_cast<int>(schema["buttons"].size()))
+              throw std::runtime_error("Invalid keys to keep held");
+            keep.insert(schema["buttons"][i.get<int>()]["vk"].get<int>());
+          }
         }
         desired = firefly::withoutShortcuts(std::move(desired));
         std::unique_lock keys(keysLock);
@@ -557,13 +555,16 @@ int main() {
         last = firefly::monotonicMs();
         active = true;
         response["held"] = desired.size();
-        if (!presses.empty()) {
+        if (!presses.empty() || (managedSequences && request.contains("actionId"))) {
           char note[96];
-          snprintf(note, sizeof(note), "the guard began playing %zu presses over %.0f ms", presses.size(), presses.back().at);
+          snprintf(note, sizeof(note), "the guard began playing %zu presses over %.0f ms", presses.size(), presses.empty() ? 0 : presses.back().at);
           see({firefly::monotonicMs(), Seen::Note, 0, false, 0, false, note});
-          guard.play(std::move(presses));
+          const double duration = managedSequences ? request.at("durationMs").get<double>() : presses.back().at;
+          const uint64_t actionId = managedSequences ? request.at("actionId").get<uint64_t>() : guard.playback.status().id + 1;
+          guard.playback.start(actionId, std::move(presses), duration, firefly::withoutShortcuts(std::move(keep)));
           response["playing"] = true;
         }
+        response["execution"] = guard.execution();
       } else if (op == "idle") {
         // How long since the player last used the keyboard or mouse, and whether they still hold
         // any of the configured buttons; changes nothing
@@ -611,18 +612,21 @@ int main() {
       } else if (op == "focused") {
         // Whether the target is in front, to wait for the player to switch to it; changes nothing
         response["focused"] = configured && GetForegroundWindow() == target;
+      } else if (op == "dispatch") {
+        // How each press of an action went, once it has ended (or so far); null for one no longer kept
+        response["dispatch"] = guard.dispatch(request.at("actionId").get<uint64_t>());
       } else if (op == "stop") {
-        guard.release();
+        guard.release("stop");
         configured = false;
       } else if (op == "shutdown") {
-        guard.release();
+        guard.release("shutdown");
         reply(response);
         break;
       } else if (op != "health")
         throw std::runtime_error("Unsupported guard operation");
       reply(response);
     } catch (const std::exception &e) {
-      guard.release();
+      guard.release("error");
       configured = false;
       reply({{"v", 1},
              {"id", id},
@@ -630,7 +634,7 @@ int main() {
              {"error", {{"code", "INPUT_REJECTED"}, {"message", e.what()}}}});
     }
   }
-  guard.release();
+  guard.release("shutdown");
   PostThreadMessageW(hookThread, WM_QUIT, 0, 0);
   hooks.join();
   return 0;

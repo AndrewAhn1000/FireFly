@@ -728,12 +728,14 @@ int main() {
   firefly::TrackedObservations tracked;
   HWND target = nullptr; // the captured window
   // States read from the game's memory or by Lua scripts ("probes"), recorded like the tracked ones.
-  // They're read when a frame is sent for detection, at most every kProbeGapMs, so their values are
-  // of that frame's time; the game's process is opened once per capture target.
+  // They're read when a frame is sent for detection, at most every probeGapMs (the `probes.gap` op), so their values
+  // are of about that frame's time; the game's process is opened once per capture target. Each value says when its
+  // read began (`readAt`, monotonicMs), and a frame sent sooner than the gap gets the last reads again marked
+  // `reused`, so nothing downstream takes a repeated read for a new one.
   struct Probe { std::string name, kind, type, address, byteType, script; Json offsets; double width = 0, height = 0; };
   Json scriptRegionSnapshot = Json::array();
   auto scriptStateSnapshot = std::make_shared<const std::vector<ScriptState>>();
-  constexpr double kProbeGapMs = 30;
+  double probeGapMs = 30;
   std::vector<Probe> probes;
   Json probeDefinitions = Json::array(), probeFields = Json::array(), lastProbes = Json::array(), probeMs = Json::object();
   double lastProbeAt = -1e9;
@@ -742,7 +744,11 @@ int main() {
   auto readProbes = [&](const CapturedFrame *frame) -> Json {
     if (probes.empty()) return Json::array();
     const double now = firefly::monotonicMs();
-    if (now - lastProbeAt < kProbeGapMs) return lastProbes;
+    if (now - lastProbeAt < probeGapMs) {
+      Json again = lastProbes;
+      for (auto &o : again) o["reused"] = true;
+      return again;
+    }
     lastProbeAt = now;
     DWORD pid = 0;
     if (target) GetWindowThreadProcessId(target, &pid);
@@ -760,7 +766,7 @@ int main() {
     const Json geometry = target ? scriptGeometry(target, frame) : Json::object();
     for (const auto &p : probes) {
       const double begin = firefly::monotonicMs();
-      Json o = {{"name", p.name}, {"type", p.type}};
+      Json o = {{"name", p.name}, {"type", p.type}, {"readAt", begin}};
       try {
         if (!probeProcess) throw std::runtime_error("Cannot open the game's process for reading");
         Json value = p.kind == "memory" ? readMemory(probeProcess, p.address, p.offsets, p.byteType)
@@ -1112,6 +1118,14 @@ int main() {
         r["devices"] = firefly::inferenceDevices();
         r["cpuThreads"] = firefly::cpuThreads();
         r["maxThreads"] = std::max(1u, std::thread::hardware_concurrency());
+      } else if (op == "probes.gap") {
+        // The least time between two reads of the memory and Lua States (each read runs every probe, Lua included);
+        // while recording, reads still come only with the samples
+        const double gap = request.at("ms").get<double>();
+        if (!std::isfinite(gap) || gap < 0 || gap > 1000)
+          throw std::runtime_error("The probe gap must be 0..1000 ms");
+        probeGapMs = gap;
+        r["ms"] = probeGapMs;
       } else if (op == "inference.threads") {
         // How many threads the CPU runs models on; the graph and its schema are left as they are
         const int max = (int)std::max(1u, std::thread::hardware_concurrency());

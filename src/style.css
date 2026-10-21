@@ -2944,7 +2944,6 @@ html, body, #root {
 .pg-grid { width: 250px; }
 .pg-spatial { width: 330px; }
 .pg-goal { width: 270px; }
-.pg-planner { width: 260px; }
 .pg-plan-on { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center; margin: 2px 0; }
 .pg-plan-on label { display: flex; align-items: center; gap: 3px; }
 .pg-check { display: flex; align-items: center; gap: 4px; margin: 2px 0; }
@@ -3082,8 +3081,31 @@ html, body, #root {
 .bt-replay-nodes { display: flex; flex-wrap: wrap; gap: 3px; }
 .bt-replay-values td { padding: 1px 8px 1px 0; }
 .bt-replay-values td:last-child { color: var(--text-bright); font-variant-numeric: tabular-nums; }
+.rr { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+.rr-attempt { border-top: 1px solid var(--divider); padding-top: 6px; }
+.rr-facts { display: flex; flex-direction: column; gap: 2px; margin: 4px 0; }
+.rr-chart { width: 100%; height: 90px; display: block; background: var(--bg-dark); }
+.rr-line { fill: none; stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke; opacity: 0.6; }
+.rr-dot { fill: var(--accent); }
+.rr-faint { opacity: 0.25; }
+.rr-threshold { stroke: var(--danger); stroke-dasharray: 4 3; vector-effect: non-scaling-stroke; }
+.rr-diverged { fill: var(--danger); opacity: 0.12; }
+.rr-events { border-collapse: collapse; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.rr-events th { text-align: left; color: var(--text-dim); font-weight: normal; padding: 1px 8px 1px 0; }
+.rr-events td { padding: 1px 8px 1px 0; white-space: nowrap; }
+.rr-events tbody tr { cursor: pointer; }
+.rr-events tbody tr:hover { background: var(--bg-hover); }
+.rr-jumps { border-collapse: collapse; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.rr-jumps th { text-align: left; color: var(--text-dim); font-weight: normal; padding: 1px 8px 1px 0; }
+.rr-jumps td { padding: 1px 8px 1px 0; vertical-align: top; }
+.rr-jumps td:not(:nth-child(2)) { white-space: nowrap; }
+.rr-jumps tr.rr-failed td { color: var(--danger, #e65a5a); }
+.rr-first td { color: var(--danger); }
 .map-settings, .map-inspector { width: 230px; flex: none; overflow-y: auto; padding: 8px; background: var(--bg-panel); font-size: 11px; display: flex; flex-direction: column; gap: 4px; }
 .map-settings { border-right: 1px solid var(--divider); }
+/* the column scrolls instead of squeezing what's in it: a list that scrolls (the recordings ticked) shrank to nothing
+   once the column was taller than the window */
+.map-settings > *, .map-inspector > * { flex-shrink: 0; }
 .map-inspector { border-left: 1px solid var(--divider); width: 260px; }
 .map-canvas { position: relative; flex: 1; min-width: 0; overflow: hidden; }
 .map-canvas canvas { display: block; outline: none; touch-action: none; }
@@ -3094,6 +3116,19 @@ html, body, #root {
 .map-number input { width: 80px; }
 .map-row { display: flex; gap: 8px; align-items: center; }
 .map-level { display: flex; gap: 4px; align-items: center; color: var(--text-dim); font-size: 11px; }
+.map-execution select { max-width: 240px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 4px; font: inherit; }
 .map-suggested { max-height: 300px; }
+.map-recordings { max-height: 140px; overflow-y: auto; }
 .map-suggestion { display: flex; gap: 6px; align-items: center; justify-content: space-between; padding: 2px 0; }
 .map-suggestion small { color: var(--text-dim); }
+.map-runs { flex: none; max-height: 45%; overflow: auto; border-top: 1px solid var(--divider); background: var(--bg-panel); padding: 6px 8px; font-size: 11px; }
+.map-runs-body { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; gap: 10px; margin-top: 6px; }
+.map-runs-list { display: flex; flex-direction: column; gap: 2px; }
+.map-run-attempt { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; text-align: left; background: none; border: 1px solid transparent;
+  border-radius: 3px; padding: 3px 6px; color: var(--text); font: inherit; cursor: pointer; }
+.map-run-attempt small { color: var(--text-dim); }
+.map-run-attempt:hover { background: var(--bg-hover); }
+.map-run-attempt.on { border-color: var(--accent); background: var(--bg-select); }
+.map-run-attempt.failed small { color: var(--danger); }
+.map-runs-detail { min-width: 0; }
+.rr-selected td { background: var(--bg-select); }

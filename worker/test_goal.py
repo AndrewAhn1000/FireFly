@@ -176,52 +176,80 @@ class RouteTests(TwoRuns):
             Featurizer(SCHEMA, goal={**self.goal, 'target': 'spot'})
 
 
+GRID_MAP = {'id': 'm', 'name': 'Floor and rope', 'position': 'player', 'level': '', 'places': [], 'links': [], 'grid': {'cell': 40, 'recordings': ['run'], 'execution': 'keys'}}
+# the same, as places and links of your own: along the floor, up the rope, and a jump straight there no one made
+OWN_MAP = {'id': 'm', 'name': 'Floor and rope', 'position': 'player', 'level': '', 'grid': None,
+           'places': [{'id': 'a', 'name': 'Start', 'level': None, 'x': 0, 'y': 0}, {'id': 'b', 'name': 'Rope', 'level': None, 'x': 600, 'y': 0},
+                      {'id': 'c', 'name': 'Top', 'level': None, 'x': 600, 'y': -500}],
+           'links': [{'id': 'ab', 'from': 'a', 'to': 'b', 'kind': 'keys', 'keys': ['right'], 'ms': 3000},
+                     {'id': 'bc', 'from': 'b', 'to': 'c', 'kind': 'keys', 'keys': ['up'], 'ms': 2500},
+                     {'id': 'ac', 'from': 'a', 'to': 'c', 'kind': 'keys', 'keys': ['up'], 'ms': 4000}]}
+
+
 class PlanTests(TwoRuns):
-    """Play planned from what the player has done (planner.py), here from the same recordings as the route's."""
-    def plan(self, **dest):
+    """Play planned over a map (planner.py): places and moves it learns on a grid from the recordings, and places and
+    links of its own."""
+    def plan(self, map_=None, **dest):
         return {'name': 'goal', 'position': 'player', 'lookAhead': [0.5, 1.5], 'targets': 2, 'minMove': 20,
-                'plan': {'cell': 40, 'aheadS': 1, 'destination': dest or {'kind': 'end', 'recording': 'run'}, 'recordings': ['run']}}
+                'plan': {'map': map_ or GRID_MAP, 'aheadS': 1, 'destination': dest or {'kind': 'end', 'recording': 'run'}}}
 
     def train(self, goal):
         return Worker(self.root).train({'recordingIds': ['again'], 'columns': ['goal.dx', 'goal.dy', 'goal.dist'], 'goal': goal,
                                          'buttons': ['right', 'up'], 'stepMs': 50, 'history': 0, 'epochs': 1})
 
-    def test_it_learns_the_places_and_moves_and_heads_for_where_the_recording_ended(self):
+    def test_it_learns_the_grid_and_heads_for_where_the_recording_ended(self):
         goal = self.train(self.plan())['features']['goal']
         self.assertGreater(len(goal['plan']['graph']['places']), 20)
         self.assertEqual((goal['plan']['destination']['x'], goal['plan']['destination']['y']), (600, -490))
         f = Featurizer(SCHEMA, columns=['goal.dx', 'goal.dy', 'goal.dist'], goal=goal)
         dx, dy, _ = f(sample_of(100, 0))
         self.assertGreater(dx, 100); self.assertEqual(dy, 0)          # along the floor first, the way it was done
+        self.assertEqual(f.heading['map'], 'm')
+        self.assertGreater(len(f.heading['way']), 2)                 # the way, for the map's editor
         dx, dy, _ = f(sample_of(600, -100))
         self.assertEqual(dx, 0); self.assertLess(dy, -100)            # then up the rope
 
-    def test_a_clicked_point_and_the_preview(self):
-        goal = self.plan(kind='point', x=600, y=-300)
+    def test_its_own_places_and_links_by_what_they_did(self):
         w = Worker(self.root)
-        pic = w.planner_preview({'goal': goal, 'recordingIds': ['again'], 'fields': SCHEMA['fields'], 'formulas': [],
-                                 'observations': sample_of(200, 0)})
-        self.assertIsNone(pic['error'])
-        self.assertEqual(pic['path'][0][1], 0); self.assertEqual(pic['path'][-1][0], 600)
-        self.assertEqual(pic['next']['keys'], ['right'])
-        self.assertGreater(pic['target'][0], 200)
-        self.assertEqual(pic['count']['places'], len(pic['places']))
+        goal = self.plan(OWN_MAP, kind='place', place='c')
+        f = Featurizer(SCHEMA, columns=['goal.dx', 'goal.dy', 'goal.dist'], goal=goal)
+        w._learn_plan(f, goal, [])
+        dx, dy, _ = f(sample_of(20, 0))
+        self.assertLess(dy, -400); self.assertAlmostEqual(dx, 580)     # 4 s straight there is quicker than 3 + 2.5
+        # it failed 3 times in 4 (a tree going over the map, or play): along the floor and up the rope instead
+        w._map_keep({'m': {'ac': {'runs': 4, 'fails': 3, 'ms': 4000}}})
+        f = Featurizer(SCHEMA, columns=['goal.dx', 'goal.dy', 'goal.dist'], goal=goal)
+        w._learn_plan(f, goal, [])
+        dx, dy, _ = f(sample_of(20, 0))
+        self.assertEqual((dx, dy), (580, 0))
+
+    def test_how_its_links_went_in_play_is_kept(self):
+        import time
+        w = Worker(self.root)
+        own = {**OWN_MAP, 'links': OWN_MAP['links'][:2]}
+        goal = self.plan(own, kind='place', place='c')
+        f = Featurizer(SCHEMA, columns=['goal.dx', 'goal.dy', 'goal.dist'], goal=goal)
+        w._learn_plan(f, goal, [])
+        f(sample_of(0, 0))
+        time.sleep(0.02)
+        f(sample_of(600, 0))                                           # at the rope: the floor's link worked
+        self.assertEqual([(m, l, ok) for m, l, ok, _ in f.map_outcomes], [('m', 'ab', True)])
+        w._map_outcomes(f.map_outcomes)
+        self.assertEqual(w._map_stats(['m'])['m']['ab']['runs'], 1)
 
     def test_nowhere_its_moves_lead_says_so(self):
-        w = Worker(self.root)
-        pic = w.planner_preview({'goal': self.plan(kind='point', x=0, y=0), 'recordingIds': ['again'], 'fields': SCHEMA['fields'],
-                                 'formulas': [], 'observations': sample_of(600, -400)})
-        self.assertIn('No move', pic['error'])                         # only ever went up the rope, never down it
-        self.assertRegex(pic['error'], r"you're at \(600, -400\).*its moves reach \d+ place.*px short")
-        self.assertEqual(pic['stuck']['at'][0], 600)
+        goal = self.train(self.plan(kind='point', x=0, y=0))['features']['goal']
+        f = Featurizer(SCHEMA, columns=['goal.dx', 'goal.dy', 'goal.dist'], goal=goal)
+        with self.assertRaisesRegex(Missing, 'no move'):              # only ever went up the rope, never down it
+            f(sample_of(600, -400))
 
     def test_play_heads_where_the_graph_says_now_not_where_it_trained_to(self):
-        # Trained following the route; played with the graph's plan (changed since), learned as it loads
+        # Trained following the route; played over the graph's map (chosen since), learned as it loads
         w = Worker(self.root)
         made = w.train({'recordingIds': ['again'], 'columns': ['goal.dx', 'goal.dy', 'goal.dist'], 'goal': self.goal_route(),
                         'buttons': ['right', 'up'], 'stepMs': 50, 'history': 0, 'epochs': 1})
         w.load({'modelId': made['id'], 'observationSchema': 'obs', 'actionSchema': 'act',
-                'goal': {'plan': {'cell': 40, 'aheadS': 1, 'destination': {'kind': 'point', 'x': 600, 'y': -300}, 'recordings': ['run']}}})
+                'goal': {'plan': {'map': GRID_MAP, 'aheadS': 1, 'destination': {'kind': 'point', 'x': 600, 'y': -300}}}})
         f = w.loaded[4]
         self.assertNotIn('route', f.goal); self.assertIn('graph', f.goal['plan'])
         dx, dy, _ = f(sample_of(600, -100))
@@ -233,9 +261,110 @@ class PlanTests(TwoRuns):
         return {'name': 'goal', 'position': 'player', 'lookAhead': [0.5, 1.5], 'targets': 2, 'minMove': 20,
                 'route': {'recording': 'run', 'aheadS': 1}}
 
-    def test_a_destination_wired_in_must_be_a_position(self):
+    def test_what_a_map_plan_needs(self):
         with self.assertRaisesRegex(ValueError, 'Destination'):
             Featurizer(SCHEMA, goal=self.plan(kind='input', name='hp'))
+        with self.assertRaisesRegex(ValueError, 'taken off the map'):
+            Featurizer(SCHEMA, goal=self.plan(OWN_MAP, kind='place', place='gone'))
+        with self.assertRaisesRegex(ValueError, 'no places'):
+            Featurizer(SCHEMA, goal=self.plan({**OWN_MAP, 'places': []}, kind='point', x=0, y=0))
+
+    def test_the_grid_drawn_and_a_tree_going_over_it(self):
+        w = Worker(self.root)
+        drawn = w.map_grid({'map': GRID_MAP})
+        self.assertEqual(drawn['count']['places'], len(drawn['places']))
+        self.assertEqual(drawn['recordings'], 1)
+        tree = w._behavior({'tree': {'root': 'r', 'nodes': {'r': {'kind': 'root', 'params': {}, 'children': ['g']},
+                                                              'g': {'kind': 'go', 'params': {'map': 'm', 'target': 'vec(600, -480)'}, 'children': []}}},
+                            'fields': SCHEMA['fields'], 'maps': {'m': {**GRID_MAP, 'reach': 30}}}, learned=True)
+        self.assertEqual(tree.buttons, ['right', 'up'])               # the keys held for each move learned
+        out = tree.tick(0, {o['name']: o for o in sample_of(0, 0)})
+        self.assertEqual(out['keys'], {'right'})
+
+    def test_migrated_destination_routes_through_its_learned_cell(self):
+        w = Worker(self.root)
+        point = {'id': 'destination', 'name': 'Destination', 'level': None, 'x': 600, 'y': -490}
+        map_ = {**GRID_MAP, 'places': [point], 'reach': 30}
+        expanded = w._with_grid(map_)
+        self.assertIn('destination', expanded['aliases'])
+        behavior = w._behavior({'tree': {'root': 'r', 'nodes': {
+            'r': {'kind': 'root', 'params': {'loop': False}, 'children': ['g']},
+            'g': {'kind': 'go', 'params': {'map': 'm', 'place': 'destination'}, 'children': []}}},
+            'fields': SCHEMA['fields'], 'maps': {'m': map_}}, learned=True)
+        out = behavior.tick(0, {o['name']: o for o in sample_of(0, 0)})
+        self.assertEqual(out['keys'], {'right'})
+        self.assertNotEqual(out['done'], 'failure')
+        # Existing linked places and markers on a different level are not snapped.
+        linked = {**map_, 'links': [{'id': 'out', 'from': 'destination', 'to': 'other', 'kind': 'keys', 'keys': ['right']}]}
+        self.assertNotIn('destination', w._with_grid(linked)['aliases'])
+        other_level = {**map_, 'places': [{**point, 'level': 'elsewhere'}]}
+        self.assertNotIn('destination', w._with_grid(other_level)['aliases'])
+
+    def test_destination_above_recorded_route_uses_the_planners_recorded_point(self):
+        from unittest.mock import patch
+        from behavior import Behavior
+        grid = {'cell': 40, 'places': [[None, -698, 266, 5], [None, -1689, -1594, 78]],
+                'moves': [[0, 1, 1000, 3, ['left']]]}
+        point = {'id': 'destination', 'name': 'Destination', 'level': None, 'x': -1693, 'y': -1652}
+        w = Worker(self.root)
+        with patch.object(w, '_map_grid', return_value=(grid, {})):
+            expanded = w._with_grid({**GRID_MAP, 'places': [point]})
+        self.assertEqual(expanded['aliases'], {'destination': 'g1'})
+        self.assertEqual(expanded['places'][0], point)  # the saved marker is not moved
+        tree = {'root': 'r', 'nodes': {
+            'r': {'kind': 'root', 'params': {'loop': False}, 'children': ['g']},
+            'g': {'kind': 'go', 'params': {'map': 'm', 'place': 'destination'}, 'children': []}}}
+        behavior = Behavior(tree, SCHEMA['fields'], maps={'m': expanded})
+        tick = lambda t, x, y: behavior.tick(t, {o['name']: o for o in sample_of(x, y)})
+        out = tick(0, -698, 266)
+        self.assertEqual(out['keys'], {'left'})
+        self.assertNotEqual(out['done'], 'failure')
+        tick(1000, -1689, -1594)
+        out = tick(1050, -1689, -1594)
+        self.assertEqual(out['done'], 'success')
+        self.assertIn('Destination (recorded point (-1689, -1594))', out['text'])
+        # Resolving a marker does not invent reverse links or an off-route approach.
+        behavior = Behavior(tree, SCHEMA['fields'], maps={'m': expanded})
+        out = behavior.tick(0, {o['name']: o for o in sample_of(0, 0)})
+        self.assertEqual(out['done'], 'failure')
+        self.assertIn('not at a place', out['text'])
+        reverse = {**expanded, 'aliases': {'destination': 'g0'}}
+        behavior = Behavior(tree, SCHEMA['fields'], maps={'m': reverse})
+        out = behavior.tick(0, {o['name']: o for o in sample_of(-1689, -1594)})
+        self.assertEqual(out['done'], 'failure')
+        self.assertIn('no way', out['text'])
+
+    def test_learned_moves_without_keys_release_and_wait_with_a_timeout(self):
+        from unittest.mock import patch
+        from behavior import Behavior
+        grid = {'cell': 40, 'places': [[None, 0, 0, 1], [None, 50, 0, 1], [None, 100, 0, 1]],
+                'moves': [[0, 1, 100, 1, ['right']], [1, 2, 100, 1, []]]}
+        w = Worker(self.root)
+        with patch.object(w, '_map_grid', return_value=(grid, {})):
+            expanded = w._with_grid({**GRID_MAP, 'giveUp': 1})
+        self.assertEqual(len(expanded['links']), 2)
+        tree = {'root': 'r', 'nodes': {
+            'r': {'kind': 'root', 'params': {'loop': False}, 'children': ['g']},
+            'g': {'kind': 'go', 'params': {'map': 'm', 'place': 'g2'}, 'children': []}}}
+        for arrives in (True, False):
+            with self.subTest(arrives=arrives):
+                behavior = Behavior(tree, SCHEMA['fields'], maps={'m': expanded})
+                tick = lambda t, x: behavior.tick(t, {o['name']: o for o in sample_of(x, 0)})
+                self.assertEqual(tick(0, 0)['keys'], {'right'})
+                tick(100, 50)
+                out = tick(150, 50)
+                self.assertEqual(out['keys'], set())
+                self.assertEqual(out['maps']['m']['link'], 'g1>2')
+                self.assertIn('waiting with keys released', out['text'])
+                if arrives:
+                    tick(250, 100)
+                    self.assertEqual(tick(300, 100)['done'], 'success')
+                else:
+                    out = tick(1000, 50)
+                    self.assertIn('not there after', out['text'])
+                    out = tick(1050, 50)
+                    self.assertEqual(out['done'], 'failure')
+                    self.assertEqual(out['keys'], set())
 
 
 def sample_of(x, y):

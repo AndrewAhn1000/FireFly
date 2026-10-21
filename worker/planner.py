@@ -1,5 +1,5 @@
-"""The Planner node's "Plan from what I've done": where play heads, from the places and moves of the player's own
-recordings, with nothing known about any game.
+"""Where play heads over a map (src/mapModel.ts): its places and links, and the places and moves learned on a grid from
+the player's own recordings (a map's Learn a grid), with nothing known about any game.
 
 Places are cells of the world, `cell` px a side (per level, when a Level observation tells levels apart), each at
 where the player actually was in it (the mean of their positions there). A move is the player going from one cell to
@@ -10,7 +10,10 @@ that place is its target, so play's targets are like training's: where to get to
 
 Off every known place (a fall, a start somewhere new), the player is at the nearest place not above them (a player
 walks or drops to one but can't rise to it), else the nearest. Moves are only those made: a place reached by a move
-no recording made can't be planned to."""
+no recording made can't be planned to.
+
+A map's own places and links (`merge`) join the grid's: a link costs what it took when it last worked (else its own
+time, else its clip's length, else LINK_MS) over how often it has worked, as a behaviour tree's Go to weighs it."""
 import heapq
 import math
 from collections import Counter, defaultdict
@@ -24,6 +27,7 @@ HINT_CAP = 400      # px: how far along the way the plan's next keys are looked 
 FAILED_COST = 4     # a move that didn't happen in play costs this many times as much from then on
 KEEP_AWAY_PX = 60   # a move ending this near something to keep away from costs AWAY_MS more
 AWAY_MS = 1500
+LINK_MS = 1000      # ms a link of a map costs before anything is known of it
 
 
 def learn(recordings, cell=CELL):
@@ -68,25 +72,35 @@ class Planner:
     """Paths over what `learn` found. One per graph: it keeps the times to the last destination asked for."""
 
     def __init__(self, graph):
-        self.cell = graph['cell']
-        self.places = graph['places']
-        self.moves = graph['moves']
+        self.cell = graph.get('cell')
+        self.places = graph['places']   # [level, x, y, n] learned, [level, x, y, n, place id] a map's own
+        self.moves = graph['moves']     # [from, to, ms, n, keys] learned, [..., link id] a map's own
         self.out, self.into = defaultdict(list), defaultdict(list)
-        for a, b, ms, n, keys in self.moves:
+        for a, b, ms, n, keys, *_ in self.moves:
             self.out[a].append((b, ms))
             self.into[b].append((a, ms))
-        self.by_cell = {(p[0], math.floor(p[1] / self.cell), math.floor(p[2] / self.cell)): i for i, p in enumerate(self.places)}
+        self.by_cell = {(p[0], math.floor(p[1] / self.cell), math.floor(p[2] / self.cell)): i
+                        for i, p in enumerate(self.places) if self.cell and len(p) < 5}
         self.on_level = defaultdict(list)
         for i, p in enumerate(self.places):
             self.on_level[p[0]].append(i)
-        self.edges = {(a, b): (ms, keys) for a, b, ms, n, keys in self.moves}
+        self.edges = {}
+        self.link_of = {}  # (from, to): the map's link id, for a map's own links
+        for a, b, ms, n, keys, *rest in self.moves:
+            if (a, b) not in self.edges or ms < self.edges[(a, b)][0]:
+                self.edges[(a, b)] = (ms, keys)
+                if rest:
+                    self.link_of[(a, b)] = rest[0]
+                else:
+                    self.link_of.pop((a, b), None)
+        self.ids = {p[4]: i for i, p in enumerate(self.places) if len(p) >= 5}  # a map place's id: its index
         self.penalty = {}  # (a, b): how many times as much a move costs, after it didn't happen in play
         self._fields = {}
 
     def place_at(self, level, x, y):
         """The place the player is at: their own cell's, else the nearest not above them, else the nearest (None on a
         level with no places)."""
-        exact = self.by_cell.get((level, math.floor(x / self.cell), math.floor(y / self.cell)))
+        exact = self.by_cell.get((level, math.floor(x / self.cell), math.floor(y / self.cell))) if self.cell else None
         if exact is not None:
             return exact
         candidates = self.on_level.get(level) or []
@@ -209,7 +223,7 @@ class Planner:
     def _next_move(self, route):
         if not route or len(route) < 2:
             return None
-        for a, b, ms, n, keys in self.moves:
+        for a, b, ms, n, keys, *_ in self.moves:
             if a == route[0] and b == route[1]:
                 return {'keys': keys, 'ms': ms, 'seen': n}
         return None
@@ -219,3 +233,43 @@ class Planner:
             return None
         ms = {(a, b): t for a, b, t, *_ in self.moves}
         return round(sum(ms[(a, b)] for a, b in zip(route, route[1:])) / 1000, 1)
+
+
+def merge(grid, doc, stats=None, clips=None):
+    """A planner's graph for a map (`doc`, as src/mapModel.ts compiles it): its own places and links, beside the places
+    and moves of `grid` (learn's, or None). A link's time is what it took when it last worked (`stats`, {link id:
+    {runs, fails, ms}}), else its own `ms`, else its clip's length (`clips`, {link:<id>: {keys, timeline, end}}), else
+    LINK_MS, over its chance of working ((worked + 1) / (runs + 2)); its keys are those it holds (a keys link), or its
+    clip presses."""
+    grid = grid or {'cell': None, 'places': [], 'moves': []}
+    places = [list(p) for p in grid['places']]
+    moves = [list(m) for m in grid['moves']]
+    index = {}
+    for p in doc.get('places') or []:
+        if isinstance(p, dict) and all(isinstance(p.get(k), (int, float)) for k in ('x', 'y')):
+            index[p['id']] = len(places)
+            places.append([p.get('level'), float(p['x']), float(p['y']), 0, p['id']])
+    for link in doc.get('links') or []:
+        if not isinstance(link, dict) or link.get('from') not in index or link.get('to') not in index:
+            continue
+        s, clip = (stats or {}).get(link.get('id')) or {}, (clips or {}).get(f'link:{link.get("id")}')
+        ms = s.get('ms') or link.get('ms') or (clip or {}).get('end') or LINK_MS
+        chance = (s.get('runs', 0) - s.get('fails', 0) + 1) / (s.get('runs', 0) + 2)
+        if link.get('kind') == 'keys':
+            keys = sorted(link.get('keys') or [])
+        elif clip:
+            keys = sorted(set(clip['keys']) | {k for _, k, down in clip['timeline'] if down})
+        else:
+            keys = []
+        moves.append([index[link['from']], index[link['to']], round(float(ms) / max(0.05, chance), 1), s.get('runs', 0), keys, link['id']])
+    return {'cell': grid.get('cell'), 'places': places, 'moves': moves}
+
+
+def learn_stat(s, worked, ms):
+    """A link's stats ({runs, fails, ms}) once it ran: worked (taking `ms`, averaged in) or not."""
+    s['runs'] = s.get('runs', 0) + 1
+    if worked:
+        s['ms'] = round(ms if not s.get('ms') else 0.7 * s['ms'] + 0.3 * ms, 1)
+    else:
+        s['fails'] = s.get('fails', 0) + 1
+    return s

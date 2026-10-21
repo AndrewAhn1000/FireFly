@@ -547,6 +547,9 @@ export default function App() {
   // How many threads the CPU runs models on: a runtime setting, so it doesn't change the observation schema
   const [cpuThreads, setCpuThreads] = useState(() => Number(localStorage.getItem('firefly-cpu-threads')) || 2);
   const [maxThreads, setMaxThreads] = useState(0);
+  // How often memory and Lua States are read (the runtime's `probes.gap`): at most once per this many ms, 0 for every
+  // frame sent for detection. Each read runs every one of them, Lua scripts included
+  const [probeGapMs, setProbeGapMs] = useState(() => { const v = Number(localStorage.getItem('firefly-probe-gap-ms')); return Number.isFinite(v) && localStorage.getItem('firefly-probe-gap-ms') !== null ? v : 30; });
   const [inferenceError, setInferenceError] = useState('');
   const detectionAt = useRef<number | null>(null);
   const [rates, setRates] = useState<Rates | null>(null);
@@ -954,6 +957,19 @@ export default function App() {
     return () => { alive = false; };
   }, [status]);
 
+  // the saved read gap, sent each time the runtime is ready (it starts at 30 ms)
+  useEffect(() => {
+    if (status !== 'ready') return;
+    window.bridge.invoke('probes.gap', { ms: probeGapMs }).catch(e => setInferenceError(String(e)));
+  }, [status]); // eslint-disable-line react-hooks/exhaustive-deps
+  const changeProbeGap = async (ms: number) => {
+    setInferenceError('');
+    try {
+      await window.bridge.invoke('probes.gap', { ms });
+      setProbeGapMs(ms);
+      localStorage.setItem('firefly-probe-gap-ms', String(ms));
+    } catch (e) { setInferenceError(String(e)); }
+  };
   const changeThreads = async (threads: number) => {
     setInferenceError('');
     try {
@@ -3068,6 +3084,16 @@ export default function App() {
                   Threads
                   <select aria-label="CPU threads for the model" value={cpuThreads} onChange={e => { void changeThreads(Number(e.target.value)); }}>
                     {Array.from({ length: maxThreads }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n}{n === 2 ? ' (default)' : ''}</option>)}
+                  </select>
+                </label>
+              )}
+              {gameStates.some(needsProcess) && (
+                <label className="inference-control" title="How often memory and Lua States are read. Every frame gives positions as often as frames come (play, and a map's Runs, see more of the path), but runs every one of those States, Lua scripts included, each time. While recording they're read with each sample, so Samples per second still limits recordings.">
+                  State reads
+                  <select aria-label="How often memory and Lua States are read" value={probeGapMs} disabled={status !== 'ready'} onChange={e => { void changeProbeGap(Number(e.target.value)); }}>
+                    {[[0, 'Every frame'], [15, 'At most every 15 ms'], [30, 'At most every 30 ms (default)'], [60, 'At most every 60 ms'], [100, 'At most every 100 ms']].map(([ms, label]) =>
+                      <option key={ms} value={ms}>{label}</option>)}
+                    {![0, 15, 30, 60, 100].includes(probeGapMs) && <option value={probeGapMs}>At most every {probeGapMs} ms</option>}
                   </select>
                 </label>
               )}

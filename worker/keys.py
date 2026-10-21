@@ -15,9 +15,10 @@ class Keys:
     then (the recorder notes it when the game comes to the front)."""
 
     def __init__(self, events):
+        self.events = sorted(events, key=lambda e: e[0])
         self.times, self.states, self.presses = [], [], []
         held = set()
-        for t, key, down in sorted(events, key=lambda e: e[0]):
+        for t, key, down in self.events:
             if key is None:
                 held = set(down)
             else:
@@ -57,6 +58,7 @@ def stands(track, keys, grounded=None):
             continue
         j = k
         while (j + 1 < len(track) and abs(track[j + 1][1] - track[k][1]) <= REST_PX and abs(track[j + 1][2] - track[k][2]) <= REST_PX
+               and track[j + 1][0] - track[j][0] <= 250
                and not keys.held(track[j + 1][0]) and (grounded is None or grounded[j + 1] is not False)):
             j += 1
         if j > k and track[j][0] - track[k][0] >= REST_MS:
